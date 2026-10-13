@@ -85,8 +85,27 @@ struct StudioCameraLayoutPicker: View {
                     .opacity(layout.shape == .circle ? 0.4 : 1)
                 }
 
-                InspectorToggleRow("Shrink during zooms", isOn: $model.style.camera.shrinksDuringZoom)
-                    .help("The camera steps back while the screen is zoomed in, and returns when it zooms out")
+                InspectorToggleRow(
+                    "Shrink during zooms",
+                    isOn: Binding(
+                        get: { model.style.camera.shrinksDuringZoom },
+                        set: { isOn in
+                            withAnimation(.fold) { model.style.camera.shrinksDuringZoom = isOn }
+                        }
+                    )
+                )
+                .help("The camera steps back while the screen is zoomed in, and returns when it zooms out")
+
+                if model.style.camera.shrinksDuringZoom {
+                    InspectorSlider(
+                        "Shrink",
+                        value: $model.style.camera.zoomShrinkAmount,
+                        range: RecordingCameraBubbleSettings.zoomShrinkAmountRange,
+                        format: .percent()
+                    )
+                    .help("How much smaller the camera gets once a zoom lands")
+                    .transition(.opacity)
+                }
             }
         case .split:
             VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {

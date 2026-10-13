@@ -847,7 +847,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         if abs(scale - 1) < 0.0001 {
             return (layout, SettledLayout(layout: settled, isShrunk: false))
         }
-        if abs(scale - RecordingCameraLayoutResolver.zoomedCameraScale) < 0.0001 {
+        if abs(scale - layoutResolver.zoomedCameraScale) < 0.0001 {
             return (layout, SettledLayout(layout: settled, isShrunk: true))
         }
         return (layout, nil)

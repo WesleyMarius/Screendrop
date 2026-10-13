@@ -338,7 +338,8 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
     private let minDimension: CGFloat
     private let roundness: CGFloat
     private let margin: CGFloat
-    private let shrinksDuringZoom: Bool
+    /// The corner camera's scale once a zoom lands; 1 when it doesn't shrink.
+    let zoomedCameraScale: CGFloat
 
     init(base: RecordingStudioLayout, style: RecordingStudioStyle, showsCamera: Bool) {
         self.base = base
@@ -349,20 +350,16 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
         contentArea = CGRect(origin: .zero, size: canvas).insetBy(dx: inset, dy: inset)
         roundness = min(max(style.camera.roundness, 0), 0.5)
         margin = RecordingStudioLayout.bubbleMargin(forMinDimension: minDimension)
-        shrinksDuringZoom = style.camera.shrinksDuringZoom
+        zoomedCameraScale = style.camera.shrinksDuringZoom ? 1 - style.camera.zoomShrinkAmount : 1
     }
-
-    /// How much smaller a corner camera gets while the screen is zoomed.
-    static let zoomedCameraScale: CGFloat = 0.9
 
     /// A corner camera's scale for how far the screen has zoomed: full
     /// size unzoomed, `zoomedCameraScale` once the zoom lands, and in
     /// between on the zoom's own spring, so the two arrive together. The
     /// talking head has the floor until something happens on screen.
     func cameraScale(forZoomProgress progress: Double) -> CGFloat {
-        guard shrinksDuringZoom else { return 1 }
         let t = CGFloat(min(max(progress, 0), 1))
-        return 1 - (1 - Self.zoomedCameraScale) * t
+        return 1 - (1 - zoomedCameraScale) * t
     }
 
     /// `zoomProgress` is how far the screen has zoomed at that moment

@@ -21,6 +21,11 @@ struct RecordingCameraBubbleSettings: Equatable {
     /// A corner camera steps back a little while the screen is zoomed, so
     /// the eye goes where the action is.
     var shrinksDuringZoom = true
+    /// How much smaller it gets once a zoom lands, as a fraction of its size.
+    var zoomShrinkAmount: CGFloat = RecordingCameraBubbleSettings.defaultZoomShrinkAmount
+
+    static let defaultZoomShrinkAmount: CGFloat = 0.1
+    static let zoomShrinkAmountRange: ClosedRange<CGFloat> = 0.05...0.4
 }
 
 struct RecordingEditDocument: Codable, Equatable {
@@ -320,6 +325,7 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
     var cameraLayout: RecordingCameraLayout?
     /// Optional so projects saved before it decode with it on.
     var cameraShrinksDuringZoom: Bool?
+    var cameraZoomShrinkAmount: Double?
 
     init(_ style: RecordingStudioStyle) {
         switch style.background {
@@ -345,6 +351,9 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
         cameraRoundness = Double(style.camera.roundness)
         cameraLayout = style.camera.layout
         cameraShrinksDuringZoom = style.camera.shrinksDuringZoom ? nil : false
+        cameraZoomShrinkAmount = style.camera.zoomShrinkAmount == RecordingCameraBubbleSettings.defaultZoomShrinkAmount
+            ? nil
+            : Double(style.camera.zoomShrinkAmount)
     }
 
     var value: RecordingStudioStyle {
@@ -377,7 +386,11 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
                     size: cameraSize,
                     roundness: cameraRoundness
                 ),
-                shrinksDuringZoom: cameraShrinksDuringZoom ?? true
+                shrinksDuringZoom: cameraShrinksDuringZoom ?? true,
+                zoomShrinkAmount: cameraZoomShrinkAmount.map {
+                    min(max(CGFloat($0), RecordingCameraBubbleSettings.zoomShrinkAmountRange.lowerBound),
+                        RecordingCameraBubbleSettings.zoomShrinkAmountRange.upperBound)
+                } ?? RecordingCameraBubbleSettings.defaultZoomShrinkAmount
             )
         )
     }
