@@ -138,20 +138,46 @@ enum RecordingSessionRenderer {
 
         let aspect = document?.exportAspectPreset ?? .original
         let aspectMode = document?.exportAspectContentMode ?? .fill
+        let focus = ReframeTrack.focus(
+            cues: zoomEnabled ? zoomCues : [],
+            clipTimeline: clipTimeline
+        ) { editorTime in
+            pointerTimeline?.location(at: editorTime)
+        }
         let reframe: ReframeTrack? = aspectMode == .fill
             ? ReframeTrack.build(
                 preset: aspect,
                 sourceSize: canvasSize,
                 viewportTimeline: viewportTimeline,
-                duration: clipTimeline.duration
-            ) { editorTime in
-                pointerTimeline?.location(at: editorTime)
-            }
+                duration: clipTimeline.duration,
+                focus: focus
+            )
             : nil
         let fitContentAspect: CGFloat? =
             (aspect == .original || aspectMode == .fit) && canvasSize.height > 0
                 ? canvasSize.width / canvasSize.height
                 : nil
+        let exportCanvasSize = aspect == .original
+            ? RecordingStudioLayout.originalCanvasSize(
+                sourceSize: canvasSize,
+                style: style,
+                contentCropRect: document?.normalizedVideoCropRect ?? RecordingVideoCropGeometry.unit
+            )
+            : aspect.canvasSize(for: canvasSize)
+        let videoCropRect = document?.normalizedVideoCropRect ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        let layoutFollow = RecordingCameraLayoutFollow.build(
+            canvasSize: exportCanvasSize,
+            style: style,
+            usesUniformPadding: aspect == .original,
+            contentAspect: reframe?.sourceAspect ?? fitContentAspect,
+            contentMode: fitContentAspect != nil && reframe == nil ? .fit : .fill,
+            contentCropRect: videoCropRect,
+            showsCamera: style.camera.isVisible,
+            layoutTimeline: cameraLayoutTimeline,
+            viewportTimeline: viewportTimeline,
+            duration: clipTimeline.duration,
+            focus: focus
+        )
 
         return RecordingStudioExporter.Configuration(
             screenURL: session.screenURL,
@@ -177,21 +203,15 @@ enum RecordingSessionRenderer {
             karaokeTimeline: showsSubtitles && !cues.isEmpty && !words.isEmpty
                 ? KaraokeTimeline(cues: cues, words: words)
                 : nil,
-            canvasSize: aspect == .original
-                ? RecordingStudioLayout.originalCanvasSize(
-                    sourceSize: canvasSize,
-                    style: style,
-                    contentCropRect: document?.normalizedVideoCropRect ?? RecordingVideoCropGeometry.unit
-                )
-                : aspect.canvasSize(for: canvasSize),
-            videoCropRect: document?.normalizedVideoCropRect
-                ?? CGRect(x: 0, y: 0, width: 1, height: 1),
+            canvasSize: exportCanvasSize,
+            videoCropRect: videoCropRect,
             clipTimeline: clipTimeline,
             exportSettings: document?.exportSettings ?? VideoCompressionSettings(),
             audioVolume: document?.audioVolume ?? 1,
             reframe: reframe,
             fitContentAspect: fitContentAspect,
-            usesUniformPadding: aspect == .original
+            usesUniformPadding: aspect == .original,
+            layoutFollow: layoutFollow
         )
     }
 

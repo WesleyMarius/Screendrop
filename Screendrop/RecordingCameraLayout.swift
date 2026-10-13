@@ -715,3 +715,96 @@ private extension CGRect {
         )
     }
 }
+
+// MARK: - Following the action in a cropped card
+
+/// A fill split shows only part of the screen recording, so it needs its
+/// own crop-and-follow camera (ReframeTrack) to keep the action - the
+/// pointer, or a Fixed zoom's target - in view. One is built per fill
+/// split on the timeline; everywhere else the ordinary viewport applies,
+/// and morphs blend from one camera to the other with the layout.
+nonisolated struct RecordingCameraLayoutFollow: Sendable {
+    private let tracks: [RecordingCameraLayout: ReframeTrack]
+
+    static let none = RecordingCameraLayoutFollow(tracks: [:])
+
+    var isEmpty: Bool { tracks.isEmpty }
+
+    /// `canvasSize` through `contentCropRect` must describe the resting
+    /// layout exactly as the compositor builds it.
+    static func build(
+        canvasSize: CGSize,
+        style: RecordingStudioStyle,
+        usesUniformPadding: Bool,
+        contentAspect: CGFloat?,
+        contentMode: RecordingStudioLayout.ContentMode,
+        contentCropRect: CGRect,
+        showsCamera: Bool,
+        layoutTimeline: RecordingCameraLayoutTimeline,
+        viewportTimeline: ViewportTimeline,
+        duration: TimeInterval,
+        focus: (TimeInterval) -> CGPoint?
+    ) -> RecordingCameraLayoutFollow {
+        let fills = Set(layoutTimeline.layouts.filter { $0.kind == .split && $0.screenFit == .fill })
+        guard showsCamera, !fills.isEmpty, canvasSize.width > 0, canvasSize.height > 0 else { return .none }
+        let base = RecordingStudioLayout.make(
+            canvasSize: canvasSize,
+            style: style,
+            usesUniformPadding: usesUniformPadding,
+            contentAspect: contentAspect,
+            contentMode: contentMode,
+            contentCropRect: contentCropRect
+        )
+        let resolver = RecordingCameraLayoutResolver(base: base, style: style, showsCamera: true)
+        var tracks: [RecordingCameraLayout: ReframeTrack] = [:]
+        for layout in fills {
+            let applied = base.applying(resolver.frame(for: layout))
+            guard applied.contentFillSize.width > 0, applied.contentFillSize.height > 0 else { continue }
+            let visible = CGSize(
+                width: applied.cardRect.width / applied.contentFillSize.width,
+                height: applied.cardRect.height / applied.contentFillSize.height
+            )
+            // A card that still shows the whole recording needs no follow.
+            guard visible.width < 0.999 || visible.height < 0.999 else { continue }
+            tracks[layout] = ReframeTrack.follow(
+                visibleFraction: visible,
+                sourceAspect: base.contentFillSize.height > 0
+                    ? base.contentFillSize.width / base.contentFillSize.height
+                    : 1,
+                viewportTimeline: viewportTimeline,
+                duration: duration,
+                focus: focus
+            )
+        }
+        return RecordingCameraLayoutFollow(tracks: tracks)
+    }
+
+    /// The virtual camera at an editor time: the follow camera of a fill
+    /// split, `base` elsewhere, blended across a morph.
+    func viewport(
+        at time: TimeInterval,
+        state: RecordingCameraLayoutTimeline.State,
+        base: (TimeInterval) -> ViewportFrame
+    ) -> ViewportFrame {
+        guard !tracks.isEmpty else { return base(time) }
+        func camera(for layout: RecordingCameraLayout) -> ViewportFrame {
+            tracks[layout]?.frame(at: time) ?? base(time)
+        }
+        switch state {
+        case .settled(let layout):
+            return camera(for: layout)
+        case .transition(let from, let to, let progress):
+            guard tracks[from] != nil || tracks[to] != nil else { return base(time) }
+            let a = camera(for: from)
+            let b = camera(for: to)
+            let t = RecordingCameraLayoutTimeline.ease(progress)
+            return ViewportFrame(
+                magnification: a.magnification + (b.magnification - a.magnification) * t,
+                anchor: CGPoint(
+                    x: a.anchor.x + (b.anchor.x - a.anchor.x) * t,
+                    y: a.anchor.y + (b.anchor.y - a.anchor.y) * t
+                )
+            )
+        }
+    }
+}

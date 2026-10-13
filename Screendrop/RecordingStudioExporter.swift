@@ -71,6 +71,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         /// `reframe`.
         let fitContentAspect: CGFloat?
         let usesUniformPadding: Bool
+        /// Follow cameras for fill splits, which crop the screen.
+        let layoutFollow: RecordingCameraLayoutFollow
 
         init(
             screenURL: URL,
@@ -96,7 +98,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             audioVolume: Double = 1,
             reframe: ReframeTrack? = nil,
             fitContentAspect: CGFloat? = nil,
-            usesUniformPadding: Bool = false
+            usesUniformPadding: Bool = false,
+            layoutFollow: RecordingCameraLayoutFollow = .none
         ) {
             self.screenURL = screenURL
             self.cameraURL = cameraURL
@@ -122,6 +125,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             self.reframe = reframe
             self.fitContentAspect = fitContentAspect
             self.usesUniformPadding = usesUniformPadding
+            self.layoutFollow = layoutFollow
         }
     }
 
@@ -357,7 +361,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             timing: timing,
             reframe: configuration.reframe,
             fitContentAspect: configuration.fitContentAspect,
-            usesUniformPadding: configuration.usesUniformPadding
+            usesUniformPadding: configuration.usesUniformPadding,
+            layoutFollow: configuration.layoutFollow
         )
 
         let screenAudioOutput = audioOutput
@@ -746,6 +751,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let subtitleStyle: SubtitleBarStyle
     private let karaokeTimeline: KaraokeTimeline?
     private let reframe: ReframeTrack?
+    private let layoutFollow: RecordingCameraLayoutFollow
     private var artworkImageCache: [String: CGImage] = [:]
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
@@ -785,7 +791,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         timing: RecordingExportTiming,
         reframe: ReframeTrack? = nil,
         fitContentAspect: CGFloat? = nil,
-        usesUniformPadding: Bool = false
+        usesUniformPadding: Bool = false,
+        layoutFollow: RecordingCameraLayoutFollow = .none
     ) {
         self.canvasSize = canvasSize
         self.videoCropRect = RecordingVideoCropGeometry.normalized(videoCropRect)
@@ -817,6 +824,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         self.subtitleStyle = subtitleStyle
         self.karaokeTimeline = karaokeTimeline
         self.reframe = reframe
+        // Without a camera every layout resolves to the bare screen.
+        self.layoutFollow = includeBubble ? layoutFollow : .none
         self.timing = timing
         self.pointerScale = style.cursorScale
         self.colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -881,10 +890,13 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         return resources
     }
 
-    /// The virtual camera for a frame: the reframe crop-and-follow track
-    /// when exporting into a different aspect, the zoom viewport otherwise.
+    /// The virtual camera for a frame: a fill split's follow camera while
+    /// one shows, otherwise the reframe crop-and-follow track when exporting
+    /// into a different aspect, or the zoom viewport.
     private func viewportFrame(at editorTime: TimeInterval) -> ViewportFrame {
-        let base = reframe?.frame(at: editorTime) ?? viewportTimeline.frame(at: editorTime)
+        let base = layoutFollow.viewport(at: editorTime, state: layoutTimeline.state(at: editorTime)) { time in
+            reframe?.frame(at: time) ?? viewportTimeline.frame(at: time)
+        }
         return RecordingVideoCropGeometry.viewport(base, crop: videoCropRect)
     }
 
