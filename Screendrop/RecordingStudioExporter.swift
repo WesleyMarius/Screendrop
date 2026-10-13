@@ -664,6 +664,13 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
     }
 }
 
+/// A layout holding still: settled on the timeline, with a corner camera
+/// either full size or fully shrunk for a zoom.
+nonisolated private struct SettledLayout: Hashable, Sendable {
+    let layout: RecordingCameraLayout
+    let isShrunk: Bool
+}
+
 // MARK: - Frame compositor
 
 /// Draws one output frame: cached backdrop, then the zoom-transformed screen
@@ -706,7 +713,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// Settled layouts' resources, most recent last. Two cover the common
     /// back-and-forth between a talking head and the screen without holding
     /// a full-canvas backdrop per layout the export ever used.
-    private var layoutResources: [(key: RecordingCameraLayout, resources: LayoutResources)] = []
+    private var layoutResources: [(key: SettledLayout, resources: LayoutResources)] = []
     private static let maxLayoutResources = 2
     /// Morph frames redraw their renderer's backdrop and clip, so two take
     /// turns: one frame's pass can still be running while the next is drawn.
@@ -753,7 +760,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let screenLayerCache = StudioScreenLayerCache()
     /// The layer the cache will hold once every begun frame finishes. The
     /// layout is part of the key: the cached layer includes its backdrop.
-    private var plannedCacheKey: (source: CVPixelBuffer, rect: CGRect, layout: RecordingCameraLayout)?
+    private var plannedCacheKey: (source: CVPixelBuffer, rect: CGRect, layout: SettledLayout)?
     private(set) var reusedScreenFrameCount = 0
     private let bypassScreenCache = ProcessInfo.processInfo.environment["SCREENDROP_EXPORT_BYPASS_SCREEN_CACHE"] == "1"
     // Developer comparison switch; export settings and saved projects do not change.
@@ -821,13 +828,29 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         )
     }
 
-    /// The layout state and resolved layout at an editor time.
+    /// The layout state and resolved layout at an editor time. The zoom
+    /// at that moment sizes a corner camera.
     private func frameLayout(at editorTime: TimeInterval) -> (
         layout: RecordingStudioLayout,
-        settled: RecordingCameraLayout?
+        settled: SettledLayout?
     ) {
         let state = layoutTimeline.state(at: editorTime)
-        return (layoutResolver.layout(for: state), state.settledLayout)
+        let magnification = viewportTimeline.frame(at: editorTime).magnification
+        let layout = layoutResolver.layout(for: state, magnification: magnification)
+        guard let settled = state.settledLayout else { return (layout, nil) }
+        guard settled.kind == .pictureInPicture else {
+            return (layout, SettledLayout(layout: settled, isShrunk: false))
+        }
+        // A corner camera mid-shrink is moving, so it isn't settled; full
+        // size and shrunk are two steady states with their own resources.
+        let scale = layoutResolver.cameraScale(forZoom: magnification)
+        if abs(scale - 1) < 0.0001 {
+            return (layout, SettledLayout(layout: settled, isShrunk: false))
+        }
+        if abs(scale - RecordingCameraLayoutResolver.zoomedCameraScale) < 0.0001 {
+            return (layout, SettledLayout(layout: settled, isShrunk: true))
+        }
+        return (layout, nil)
     }
 
     /// Where the screen draws at an editor time, with the layout at that
@@ -836,7 +859,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         frameLayout(at: editorTime).layout.frameRect(for: viewportFrame(at: editorTime))
     }
 
-    private func resources(for key: RecordingCameraLayout, layout: RecordingStudioLayout) -> LayoutResources {
+    private func resources(for key: SettledLayout, layout: RecordingStudioLayout) -> LayoutResources {
         if let index = layoutResources.firstIndex(where: { $0.key == key }) {
             let entry = layoutResources.remove(at: index)
             layoutResources.append(entry)
@@ -873,7 +896,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         fileprivate let sourceTime: TimeInterval
         fileprivate let layout: RecordingStudioLayout
         /// Nil while the frame is inside a layout morph.
-        fileprivate let settledLayout: RecordingCameraLayout?
+        fileprivate let settledLayout: SettledLayout?
         fileprivate let sampleRects: [CGRect]
         fileprivate let shouldCacheScreen: Bool
         /// Set when the previous frame leaves this exact screen layer in the
@@ -908,7 +931,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         // Moving frames and continuously changing video avoid the extra copy.
         let shouldCacheScreen = !bypassScreenCache && sourceRepeatsOnNextFrame && sampleCount == 1
             && settled != nil
-            && layoutTimeline.state(at: editorTime + timing.frameInterval).settledLayout == settled
+            && self.frameLayout(at: editorTime + timing.frameInterval).settled == settled
             && sampleRects[0] == screenDrawRect(at: editorTime + timing.frameInterval)
             && StudioScreenLayerCache.canCapture(width: Int(canvasSize.width), height: Int(canvasSize.height))
         // Mirrors the cache transitions finish(_:) applies in order: a
@@ -1261,7 +1284,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private func submitMetal(
         screenFrame: CVPixelBuffer,
         sampleRects: [CGRect],
-        settled: RecordingCameraLayout?,
+        settled: SettledLayout?,
         layout: RecordingStudioLayout,
         into destination: CVPixelBuffer
     ) -> StudioMetalScreenRenderer.Submission? {

@@ -49,8 +49,17 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         case trailing
     }
 
+    /// How the screen takes the space a split gives it.
+    enum ScreenFit: String, Codable, CaseIterable, Sendable {
+        /// The whole recording, letterboxed by the camera card's height.
+        case fit
+        /// Both cards fill the frame's height; the recording is cropped.
+        case fill
+    }
+
     static let sizeRange: ClosedRange<Double> = 0.12...0.45
     static let splitRatioRange: ClosedRange<Double> = 0.45...1.2
+    static let spacingRange: ClosedRange<Double> = 0...0.12
 
     var kind: Kind
     var corner: Corner
@@ -62,6 +71,10 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
     /// Split camera width over its height (landscape), or height over width
     /// (portrait canvas).
     var splitRatio: Double
+    var screenFit: ScreenFit
+    /// Split: one gap, as a fraction of the canvas's smaller dimension,
+    /// around the frame and between the two cards.
+    var spacing: Double
 
     init(
         kind: Kind = .pictureInPicture,
@@ -69,7 +82,9 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         shape: Shape = .square,
         size: Double = 0.26,
         side: Side = .trailing,
-        splitRatio: Double = 0.75
+        splitRatio: Double = 0.75,
+        screenFit: ScreenFit = .fill,
+        spacing: Double = 0.04
     ) {
         self.kind = kind
         self.corner = corner
@@ -77,6 +92,8 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         self.size = Self.clamped(size, to: Self.sizeRange, fallback: 0.26)
         self.side = side
         self.splitRatio = Self.clamped(splitRatio, to: Self.splitRatioRange, fallback: 0.75)
+        self.screenFit = screenFit
+        self.spacing = Self.clamped(spacing, to: Self.spacingRange, fallback: 0.04)
     }
 
     static let screenOnly = RecordingCameraLayout(kind: .screen)
@@ -86,31 +103,25 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
     var showsScreen: Bool { kind != .camera }
 
     /// The arrangement only: two layouts with the same preset differ only in
-    /// options the preset doesn't fix (size, a split's width).
+    /// options the preset doesn't fix (corner, size, a split's side).
     func matches(preset: RecordingCameraLayout) -> Bool {
         guard kind == preset.kind else { return false }
-        switch kind {
-        case .screen, .camera: return true
-        case .pictureInPicture: return shape == preset.shape
-        case .split: return side == preset.side
-        }
+        return kind != .pictureInPicture || shape == preset.shape
     }
 
     /// Applies a preset picked from the grid while keeping the options the
-    /// user already tuned (corner, size, split width).
+    /// user already tuned (corner, size, split side and width).
     func adopting(_ preset: RecordingCameraLayout) -> RecordingCameraLayout {
         var next = self
         next.kind = preset.kind
-        switch preset.kind {
-        case .pictureInPicture: next.shape = preset.shape
-        case .split: next.side = preset.side
-        case .screen, .camera: break
+        if preset.kind == .pictureInPicture {
+            next.shape = preset.shape
         }
         return next
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, corner, shape, size, side, splitRatio
+        case kind, corner, shape, size, side, splitRatio, screenFit, spacing
     }
 
     init(from decoder: any Decoder) throws {
@@ -125,13 +136,16 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         let corner: Corner? = value(.corner)
         let shape: Shape? = value(.shape)
         let side: Side? = value(.side)
+        let screenFit: ScreenFit? = value(.screenFit)
         self.init(
             kind: kind ?? .pictureInPicture,
             corner: corner ?? .bottomTrailing,
             shape: shape ?? .square,
             size: try container.decodeIfPresent(Double.self, forKey: .size) ?? 0.26,
             side: side ?? .trailing,
-            splitRatio: try container.decodeIfPresent(Double.self, forKey: .splitRatio) ?? 0.75
+            splitRatio: try container.decodeIfPresent(Double.self, forKey: .splitRatio) ?? 0.75,
+            screenFit: screenFit ?? .fill,
+            spacing: try container.decodeIfPresent(Double.self, forKey: .spacing) ?? 0.04
         )
     }
 
@@ -143,6 +157,8 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         try container.encode(size, forKey: .size)
         try container.encode(side.rawValue, forKey: .side)
         try container.encode(splitRatio, forKey: .splitRatio)
+        try container.encode(screenFit.rawValue, forKey: .screenFit)
+        try container.encode(spacing, forKey: .spacing)
     }
 
     private static func clamped(_ value: Double, to range: ClosedRange<Double>, fallback: Double) -> Double {
@@ -159,8 +175,7 @@ extension RecordingCameraLayout {
         RecordingCameraLayout(kind: .pictureInPicture, shape: .square),
         RecordingCameraLayout(kind: .pictureInPicture, shape: .circle),
         RecordingCameraLayout(kind: .pictureInPicture, shape: .portrait),
-        RecordingCameraLayout(kind: .split, side: .trailing),
-        RecordingCameraLayout(kind: .split, side: .leading)
+        RecordingCameraLayout(kind: .split)
     ]
 
     var title: String {
@@ -173,7 +188,7 @@ extension RecordingCameraLayout {
             case .square: "Bubble"
             case .portrait: "Portrait"
             }
-        case .split: side == .trailing ? "Split Right" : "Split Left"
+        case .split: "Split"
         }
     }
 
@@ -271,7 +286,8 @@ nonisolated struct RecordingCameraLayoutTimelineBlock: Identifiable, Equatable, 
 
 /// Where everything sits at one moment, in top-left canvas points.
 nonisolated struct RecordingCameraLayoutFrame: Equatable, Sendable {
-    /// Always the resting card's aspect, so the screen scales uniformly.
+    /// The resting card's aspect, except in a fill split, where the
+    /// content covers it and is cropped.
     var screenRect: CGRect
     var screenOpacity: CGFloat
     var cameraRect: CGRect
@@ -321,8 +337,8 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
     private let contentArea: CGRect
     private let minDimension: CGFloat
     private let roundness: CGFloat
-    private let gap: CGFloat
     private let margin: CGFloat
+    private let shrinksDuringZoom: Bool
 
     init(base: RecordingStudioLayout, style: RecordingStudioStyle, showsCamera: Bool) {
         self.base = base
@@ -332,11 +348,27 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
         let inset = min(max(style.padding, 0), 0.475) * minDimension
         contentArea = CGRect(origin: .zero, size: canvas).insetBy(dx: inset, dy: inset)
         roundness = min(max(style.camera.roundness, 0), 0.5)
-        gap = max(minDimension * 0.02, inset * 0.5)
         margin = RecordingStudioLayout.bubbleMargin(forMinDimension: minDimension)
+        shrinksDuringZoom = style.camera.shrinksDuringZoom
     }
 
-    func frame(for layout: RecordingCameraLayout) -> RecordingCameraLayoutFrame {
+    /// How much smaller a corner camera gets while the screen is zoomed.
+    static let zoomedCameraScale: CGFloat = 0.9
+
+    /// A corner camera's scale for the zoom at that moment: full size on
+    /// the unzoomed screen, `zoomedCameraScale` once a zoom reaches 1.25×,
+    /// riding the zoom's own spring in between. The talking head has the
+    /// floor until something happens on screen.
+    func cameraScale(forZoom magnification: Double) -> CGFloat {
+        guard shrinksDuringZoom else { return 1 }
+        let t = CGFloat(min(max((magnification - 1) / 0.25, 0), 1))
+        let eased = t * t * (3 - 2 * t)
+        return 1 - (1 - Self.zoomedCameraScale) * eased
+    }
+
+    /// `magnification` is the zoom at that moment, which a corner camera
+    /// shrinks against.
+    func frame(for layout: RecordingCameraLayout, magnification: Double = 1) -> RecordingCameraLayoutFrame {
         let card = base.cardRect
         let layout = showsCamera ? layout : .screenOnly
         switch layout.kind {
@@ -360,7 +392,7 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
                 cameraOpacity: 1
             )
         case .pictureInPicture:
-            let camera = pipCamera(for: layout, in: card)
+            let camera = pipCamera(for: layout, in: card, scale: cameraScale(forZoom: magnification))
             return RecordingCameraLayoutFrame(
                 screenRect: card,
                 screenOpacity: 1,
@@ -380,34 +412,42 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
         }
     }
 
-    func frame(for state: RecordingCameraLayoutTimeline.State) -> RecordingCameraLayoutFrame {
+    func frame(
+        for state: RecordingCameraLayoutTimeline.State,
+        magnification: Double = 1
+    ) -> RecordingCameraLayoutFrame {
         switch state {
         case .settled(let layout):
-            return frame(for: layout)
+            return frame(for: layout, magnification: magnification)
         case .transition(let from, let to, let progress):
             return .interpolate(
-                frame(for: from),
-                frame(for: to),
+                frame(for: from, magnification: magnification),
+                frame(for: to, magnification: magnification),
                 progress: CGFloat(RecordingCameraLayoutTimeline.ease(progress))
             )
         }
     }
 
     /// The resting layout moved into a frame.
-    func layout(for state: RecordingCameraLayoutTimeline.State) -> RecordingStudioLayout {
-        base.applying(frame(for: state))
+    func layout(
+        for state: RecordingCameraLayoutTimeline.State,
+        magnification: Double = 1
+    ) -> RecordingStudioLayout {
+        base.applying(frame(for: state, magnification: magnification))
     }
 
     /// The camera tucked into a corner of the screen card.
     private func pipCamera(
         for layout: RecordingCameraLayout,
-        in card: CGRect
+        in card: CGRect,
+        scale: CGFloat = 1
     ) -> (rect: CGRect, radius: CGFloat) {
         let requested = CGFloat(layout.size) * minDimension
         let aspect: CGFloat = layout.shape == .portrait ? 3 / 4 : 1
         // Never let the camera outgrow the card it sits in.
         let maxWidth = max(24, min(card.width - margin * 2, (card.height - margin * 2) * aspect) * 0.62)
-        let width = max(24, min(requested, maxWidth))
+        // Shrinks toward its corner: the margins stay put.
+        let width = max(24, min(requested, maxWidth)) * scale
         let size = CGSize(width: width, height: width / aspect)
         let x: CGFloat = switch layout.corner {
         case .topLeading, .bottomLeading: card.minX + margin
@@ -422,22 +462,37 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
         return (CGRect(origin: CGPoint(x: x, y: y), size: size), radius)
     }
 
-    /// The screen card and a camera card of equal height (width when
-    /// stacked), centered together in the padded area.
+    /// The screen card and a camera card side by side (stacked on a
+    /// portrait canvas), with one spacing around the pair and between
+    /// them. Fill gives both cards the frame's full height and lets the
+    /// screen take the rest of the width, cropping the recording; Fit keeps
+    /// the whole recording and matches the camera's height to it.
     private func splitRects(for layout: RecordingCameraLayout) -> (screen: CGRect, camera: CGRect) {
-        let area = contentArea
+        let canvas = CGRect(origin: .zero, size: base.canvasSize)
+        let gap = CGFloat(layout.spacing) * minDimension
+        let area = canvas.insetBy(dx: min(gap, canvas.width / 4), dy: min(gap, canvas.height / 4))
         let card = base.cardRect
         let aspect = card.height > 0 ? max(0.1, card.width / card.height) : 16 / 9
         let ratio = CGFloat(layout.splitRatio)
         let cameraFirst = layout.side == .leading
+        let fills = layout.screenFit == .fill
 
         if area.width >= area.height {
-            let height = max(1, min(area.height, (area.width - gap) / (aspect + ratio)))
-            let screenSize = CGSize(width: height * aspect, height: height)
-            let cameraSize = CGSize(width: height * ratio, height: height)
+            let screenSize: CGSize
+            let cameraSize: CGSize
+            if fills {
+                let height = area.height
+                let cameraWidth = min(height * ratio, area.width * 0.6)
+                cameraSize = CGSize(width: cameraWidth, height: height)
+                screenSize = CGSize(width: max(1, area.width - gap - cameraWidth), height: height)
+            } else {
+                let height = max(1, min(area.height, (area.width - gap) / (aspect + ratio)))
+                screenSize = CGSize(width: height * aspect, height: height)
+                cameraSize = CGSize(width: height * ratio, height: height)
+            }
             let total = screenSize.width + gap + cameraSize.width
             let x = area.midX - total / 2
-            let y = area.midY - height / 2
+            let y = area.midY - screenSize.height / 2
             let screenX = cameraFirst ? x + cameraSize.width + gap : x
             let cameraX = cameraFirst ? x : x + screenSize.width + gap
             return (
@@ -446,11 +501,20 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
             )
         }
 
-        let width = max(1, min(area.width, (area.height - gap) / (1 / aspect + ratio)))
-        let screenSize = CGSize(width: width, height: width / aspect)
-        let cameraSize = CGSize(width: width, height: width * ratio)
+        let screenSize: CGSize
+        let cameraSize: CGSize
+        if fills {
+            let width = area.width
+            let cameraHeight = min(width * ratio, area.height * 0.6)
+            cameraSize = CGSize(width: width, height: cameraHeight)
+            screenSize = CGSize(width: width, height: max(1, area.height - gap - cameraHeight))
+        } else {
+            let width = max(1, min(area.width, (area.height - gap) / (1 / aspect + ratio)))
+            screenSize = CGSize(width: width, height: width / aspect)
+            cameraSize = CGSize(width: width, height: width * ratio)
+        }
         let total = screenSize.height + gap + cameraSize.height
-        let x = area.midX - width / 2
+        let x = area.midX - screenSize.width / 2
         let y = area.midY - total / 2
         let screenY = cameraFirst ? y + cameraSize.height + gap : y
         let cameraY = cameraFirst ? y : y + screenSize.height + gap
@@ -462,10 +526,14 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
 }
 
 extension RecordingStudioLayout {
-    /// This layout with its card and camera moved into `frame`. The card
-    /// scales uniformly, so zoom and cursor math carry over unchanged.
+    /// This layout with its card and camera moved into `frame`. The content
+    /// scales uniformly to cover the new card - exactly when the card keeps
+    /// its shape, cropping the overflow when a fill split reshapes it - so
+    /// zoom and cursor math carry over unchanged.
     nonisolated func applying(_ frame: RecordingCameraLayoutFrame) -> RecordingStudioLayout {
-        let scale = cardRect.width > 0 ? frame.screenRect.width / cardRect.width : 1
+        let scale = cardRect.width > 0 && cardRect.height > 0
+            ? max(frame.screenRect.width / cardRect.width, frame.screenRect.height / cardRect.height)
+            : 1
         return RecordingStudioLayout(
             canvasSize: canvasSize,
             cardRect: frame.screenRect,

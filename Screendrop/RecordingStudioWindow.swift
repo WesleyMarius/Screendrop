@@ -476,7 +476,10 @@ private struct StudioCanvasComposition: View {
     ) -> RecordingCameraLayoutFrame {
         isEditingVideoCrop
             ? resolver.frame(for: .screenOnly)
-            : resolver.frame(for: timeline.state(at: model.displayTime))
+            : resolver.frame(
+                for: timeline.state(at: model.displayTime),
+                magnification: model.viewportFrame(at: model.displayTime).magnification
+            )
     }
 
     var body: some View {
@@ -519,7 +522,10 @@ private struct StudioCanvasComposition: View {
                         destination: { corner in
                             var moved = settled ?? model.style.camera.layout
                             moved.corner = corner
-                            let destination = resolver.frame(for: moved)
+                            let destination = resolver.frame(
+                                for: moved,
+                                magnification: model.viewportFrame(at: model.displayTime).magnification
+                            )
                             return (destination.cameraRect, destination.cameraCornerRadius)
                         },
                         onDrop: { dropped, corner in

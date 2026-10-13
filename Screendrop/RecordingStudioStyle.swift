@@ -18,6 +18,9 @@ struct RecordingCameraBubbleSettings: Equatable {
     var roundness: CGFloat = 0.25
     /// The arrangement outside any layout cue on the timeline.
     var layout = RecordingCameraLayout()
+    /// A corner camera steps back a little while the screen is zoomed, so
+    /// the eye goes where the action is.
+    var shrinksDuringZoom = true
 }
 
 struct RecordingEditDocument: Codable, Equatable {
@@ -315,6 +318,8 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
     /// free-form bubble. The legacy center and size are still written for
     /// older builds.
     var cameraLayout: RecordingCameraLayout?
+    /// Optional so projects saved before it decode with it on.
+    var cameraShrinksDuringZoom: Bool?
 
     init(_ style: RecordingStudioStyle) {
         switch style.background {
@@ -339,6 +344,7 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
         cameraSize = style.camera.layout.size
         cameraRoundness = Double(style.camera.roundness)
         cameraLayout = style.camera.layout
+        cameraShrinksDuringZoom = style.camera.shrinksDuringZoom ? nil : false
     }
 
     var value: RecordingStudioStyle {
@@ -370,7 +376,8 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
                     center: CGPoint(x: cameraCenterX, y: cameraCenterY),
                     size: cameraSize,
                     roundness: cameraRoundness
-                )
+                ),
+                shrinksDuringZoom: cameraShrinksDuringZoom ?? true
             )
         )
     }
