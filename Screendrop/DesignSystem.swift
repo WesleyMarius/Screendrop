@@ -47,6 +47,10 @@ enum Palette {
     /// word being spoken. The same system accent today, kept as its own role
     /// so marks over pixels can be retuned apart from chrome.
     static let highlight = Color.accentColor
+    /// Camera layout cues on the timeline, apart from the accent zooms they
+    /// sit under, with `onLayoutCue` marks.
+    static let layoutCue = Color(nsColor: .systemYellow)
+    static let onLayoutCue = Color.black.opacity(0.78)
     /// Recording, and actions that remove something.
     static let record = Color(nsColor: .systemRed)
     static let success = Color(nsColor: .systemGreen)

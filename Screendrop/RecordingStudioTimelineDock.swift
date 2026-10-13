@@ -280,7 +280,7 @@ struct StudioTimelineDock: View {
                 clampZoom()
             }
         }
-        .frame(height: StudioTimelineMetrics.lanesHeight)
+        .frame(height: StudioTimelineMetrics.lanesHeight(showsLayoutLane: showsLayoutLane))
         .onChange(of: model.duration) { _, _ in clampZoom() }
         .onChange(of: model.currentTime) { _, time in followPlayhead(to: time) }
     }
@@ -299,6 +299,10 @@ struct StudioTimelineDock: View {
                     showsHint: model.zoomEnabled && model.zoomTimelineBlocks.isEmpty
                 )
                     .frame(height: StudioTimelineMetrics.zoomLaneHeight)
+                if showsLayoutLane {
+                    StudioLayoutLaneBackground(showsHint: model.cameraLayoutCues.isEmpty)
+                        .frame(height: StudioTimelineMetrics.layoutLaneHeight)
+                }
                 Color.clear
                     .frame(height: StudioTimelineMetrics.scrollerGutter)
             }
@@ -321,6 +325,18 @@ struct StudioTimelineDock: View {
                         height: StudioTimelineMetrics.zoomLaneHeight
                     )
 
+                    if showsLayoutLane {
+                        StudioLayoutLane(
+                            model: model,
+                            scale: scale,
+                            visibleRange: scale.visibleRange(scrollX: scrollX)
+                        )
+                        .frame(
+                            width: scale.contentWidth,
+                            height: StudioTimelineMetrics.layoutLaneHeight
+                        )
+                    }
+
                     Color.clear
                         .frame(height: StudioTimelineMetrics.scrollerGutter)
                 }
@@ -336,7 +352,12 @@ struct StudioTimelineDock: View {
                 }
             }
         }
-        .frame(height: StudioTimelineMetrics.scrollingLanesHeight)
+        .frame(height: StudioTimelineMetrics.scrollingLanesHeight(showsLayoutLane: showsLayoutLane))
+    }
+
+    /// Layouts arrange the camera, so a recording without one has no lane.
+    private var showsLayoutLane: Bool {
+        model.hasCameraVideo
     }
 
     private var clipLane: some View {
@@ -442,13 +463,15 @@ struct StudioTimelineDock: View {
     }
 
     private var canDeleteSelection: Bool {
-        model.selectedCueID != nil || model.canDeleteSelectedClip
+        model.selectedCueID != nil || model.selectedLayoutCueID != nil || model.canDeleteSelectedClip
     }
 
     private func deleteSelection() {
         withAnimation(.morphIfAllowed) {
             if let cueID = model.selectedCueID {
                 model.removeZoomCue(id: cueID)
+            } else if let cueID = model.selectedLayoutCueID {
+                model.removeLayoutCue(id: cueID)
             } else if model.selectedClipID != nil {
                 model.deleteSelectedClip()
             }
@@ -462,14 +485,20 @@ private enum StudioTimelineMetrics {
     static let rulerHeight: CGFloat = 16
     static let clipLaneHeight: CGFloat = 52
     static let zoomLaneHeight: CGFloat = 32
+    static let layoutLaneHeight: CGFloat = 32
     /// Room under the lanes for the horizontal scroller, so it never sits on
     /// top of a zoom block.
     static let scrollerGutter: CGFloat = 8
 
-    static let scrollingLanesHeight = clipLaneHeight + zoomLaneHeight
-        + scrollerGutter + rowSpacing * 2
-    static let lanesHeight = playheadLaneHeight + rulerHeight
-        + scrollingLanesHeight + rowSpacing * 2
+    static func scrollingLanesHeight(showsLayoutLane: Bool) -> CGFloat {
+        clipLaneHeight + zoomLaneHeight + scrollerGutter + rowSpacing * 2
+            + (showsLayoutLane ? layoutLaneHeight + rowSpacing : 0)
+    }
+
+    static func lanesHeight(showsLayoutLane: Bool) -> CGFloat {
+        playheadLaneHeight + rulerHeight
+            + scrollingLanesHeight(showsLayoutLane: showsLayoutLane) + rowSpacing * 2
+    }
 }
 
 /// Shared horizontal scale for every lane in the Studio timeline. `zoom` is a
@@ -915,6 +944,7 @@ private struct StudioZoomLane: View {
                                 // was selected, like clicking empty canvas.
                                 model.selectedCueID = nil
                                 model.selectedClipID = nil
+                                model.selectedLayoutCueID = nil
                             }
                             guard let startTime = dragStartTime else { return }
 
@@ -1371,5 +1401,347 @@ private extension ZoomAnchorMode {
         case .smartAnchor: "Smart"
         case .pinnedAnchor: "Fixed"
         }
+    }
+}
+
+// MARK: - Layout lane
+
+/// Frame around the layout lane, pinned to the viewport like the zoom lane's.
+private struct StudioLayoutLaneBackground: View {
+    var showsHint = false
+
+    var body: some View {
+        RoundedRectangle(
+            cornerRadius: StudioZoomLaneMetrics.laneCornerRadius,
+            style: .continuous
+        )
+            .fill(Color.primary.opacity(0.055))
+            .overlay {
+                if showsHint {
+                    Label("Drag across this lane to change the camera layout", systemImage: "rectangle.inset.bottomright.filled")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                        .transition(AnyTransition(.blurReplace))
+                }
+            }
+            .motion(.morph, value: showsHint)
+            .allowsHitTesting(false)
+    }
+}
+
+/// Camera layout cues. Dragging across empty lane creates one over the
+/// dragged range; a click scrubs, as on the zoom lane.
+private struct StudioLayoutLane: View {
+    @Bindable var model: RecordingStudioModel
+    let scale: StudioTimelineScale
+    let visibleRange: ClosedRange<TimeInterval>
+
+    private static let dragCreateThreshold: CGFloat = 4
+
+    @State private var dragStartTime: TimeInterval?
+    @State private var pendingRange: ClosedRange<TimeInterval>?
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            guard scale.pointsPerSecond > 0 else { return }
+                            let time = scale.time(forX: value.location.x)
+                            if dragStartTime == nil {
+                                model.pause()
+                                dragStartTime = time
+                                model.selectedCueID = nil
+                                model.selectedClipID = nil
+                                model.selectedLayoutCueID = nil
+                            }
+                            guard let startTime = dragStartTime else { return }
+                            if pendingRange == nil,
+                               abs(value.location.x - scale.x(for: startTime)) < Self.dragCreateThreshold {
+                                model.seek(to: time)
+                                return
+                            }
+                            pendingRange = clampedRange(from: startTime, to: time)
+                        }
+                        .onEnded { _ in
+                            if let range = pendingRange, range.upperBound - range.lowerBound > 0.001 {
+                                withAnimation(.morphIfAllowed) {
+                                    model.addLayoutCue(fromEditorTime: range.lowerBound, toEditorTime: range.upperBound)
+                                }
+                            }
+                            dragStartTime = nil
+                            pendingRange = nil
+                        }
+                )
+
+            if let pendingRange {
+                let lowX = scale.x(for: pendingRange.lowerBound)
+                let highX = scale.x(for: pendingRange.upperBound)
+                RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+                    .fill(Palette.layoutCue.opacity(0.22))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+                            .strokeBorder(Palette.layoutCue.opacity(0.9), style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                    }
+                    .frame(width: max(2, highX - lowX), height: StudioZoomLaneMetrics.blockHeight)
+                    .offset(x: lowX, y: StudioZoomLaneMetrics.blockInset)
+                    .allowsHitTesting(false)
+            }
+
+            ForEach(visibleBlocks) { block in
+                StudioLayoutCueBlock(model: model, block: block, scale: scale)
+                    .transition(.blurPop)
+            }
+        }
+        .opacity(model.showsCameraLayer ? 1 : 0.45)
+        .contextMenu {
+            Menu("Add Layout at Playhead") {
+                ForEach(RecordingCameraLayout.presets, id: \.self) { preset in
+                    Button(preset.detailedTitle, systemImage: preset.systemImage) {
+                        withAnimation(.morphIfAllowed) {
+                            model.addLayoutCue(
+                                at: model.currentTime,
+                                layout: model.style.camera.layout.adopting(preset)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func clampedRange(from startTime: TimeInterval, to currentTime: TimeInterval) -> ClosedRange<TimeInterval> {
+        let blocks = model.cameraLayoutTimelineBlocks
+        let lowerLimit = blocks.filter { $0.editorEnd <= startTime }.map(\.editorEnd).max() ?? 0
+        let upperLimit = blocks.filter { $0.editorStart >= startTime }.map(\.editorStart).min() ?? model.duration
+        let low = max(min(startTime, currentTime), lowerLimit)
+        let high = min(max(startTime, currentTime), upperLimit)
+        return low...max(low, high)
+    }
+
+    private var visibleBlocks: [RecordingCameraLayoutTimelineBlock] {
+        model.cameraLayoutTimelineBlocks.filter {
+            $0.editorEnd >= visibleRange.lowerBound && $0.editorStart <= visibleRange.upperBound
+        }
+    }
+}
+
+/// One layout cue: a capsule naming its layout, with the morph-in drawn as
+/// a soft ramp at its leading edge. Moves and resizes like a zoom block.
+private struct StudioLayoutCueBlock: View {
+    @Bindable var model: RecordingStudioModel
+    let block: RecordingCameraLayoutTimelineBlock
+    let scale: StudioTimelineScale
+
+    private struct DragBase {
+        let cue: RecordingCameraLayoutCue
+        let editorStart: TimeInterval
+        let editorEnd: TimeInterval
+    }
+
+    @State private var dragBase: DragBase?
+    @State private var isHovering = false
+
+    private var isSelected: Bool {
+        model.selectedLayoutCueID == block.cue.id
+    }
+
+    private var showsHandles: Bool {
+        isSelected || isHovering || dragBase != nil
+    }
+
+    var body: some View {
+        if scale.pointsPerSecond > 0 {
+            content
+        }
+    }
+
+    private var content: some View {
+        let cue = block.cue
+        let width = min(
+            scale.contentWidth,
+            max(24, CGFloat(block.editorEnd - block.editorStart) * scale.pointsPerSecond)
+        )
+        let x = min(max(scale.x(for: block.editorStart), 0), max(0, scale.contentWidth - width))
+        let shape = RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+        let rampWidth = min(width / 2, CGFloat(RecordingCameraLayoutTimeline.transitionDuration) * scale.pointsPerSecond)
+
+        return label(for: cue, width: width)
+            .frame(width: width, height: StudioZoomLaneMetrics.blockHeight)
+            .background {
+                shape.fill(
+                    LinearGradient(
+                        colors: [
+                            Palette.layoutCue.opacity(isSelected ? 1 : 0.9),
+                            Palette.layoutCue.opacity(isSelected ? 0.86 : 0.76)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .overlay(alignment: .leading) {
+                    // Where the layout is still morphing in.
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.45), Color.white.opacity(0)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: rampWidth)
+                    .clipShape(shape)
+                    .allowsHitTesting(false)
+                }
+            }
+            .overlay {
+                shape
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [.white.opacity(0.4), .white.opacity(0.05)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1
+                    )
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .leading) {
+                if showsHandles { resizeHandle(edge: .leading).transition(.opacity) }
+            }
+            .overlay(alignment: .trailing) {
+                if showsHandles { resizeHandle(edge: .trailing).transition(.opacity) }
+            }
+            .overlay {
+                if isSelected {
+                    shape
+                        .strokeBorder(Color.white.opacity(0.95), lineWidth: 2)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .contentShape(shape)
+            .brightness(isHovering && !isSelected ? 0.04 : 0)
+            .onHover { isHovering = $0 }
+            .motion(.morphQuick, value: showsHandles)
+            .motion(.morphQuick, value: isSelected)
+            .offset(x: x, y: StudioZoomLaneMetrics.blockInset)
+            .gesture(moveGesture(cue: cue))
+            .onTapGesture {
+                model.selectLayoutCue(id: cue.id)
+            }
+            .contextMenu { menu(for: cue) }
+            .help("\(cue.layout.detailedTitle). Drag to move, drag an edge to resize, right-click to change.")
+    }
+
+    @ViewBuilder
+    private func label(for cue: RecordingCameraLayoutCue, width: CGFloat) -> some View {
+        if width >= StudioZoomLaneMetrics.minimumLabelledBlockWidth {
+            HStack(spacing: 4) {
+                Image(systemName: cue.layout.systemImage)
+                    .font(.system(size: 9, weight: .bold))
+                if width >= StudioZoomLaneMetrics.minimumLabelledBlockWidth + 30 {
+                    Text(cue.layout.title)
+                        .font(.system(size: 10, weight: .semibold))
+                }
+            }
+            .foregroundStyle(Palette.onLayoutCue)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, StudioZoomLaneMetrics.handleWidth)
+            .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder
+    private func menu(for cue: RecordingCameraLayoutCue) -> some View {
+        Menu("Layout") {
+            ForEach(RecordingCameraLayout.presets, id: \.self) { preset in
+                Toggle(
+                    preset.detailedTitle,
+                    isOn: Binding(
+                        get: { cue.layout.matches(preset: preset) },
+                        set: { _ in
+                            var updated = cue
+                            updated.layout = cue.layout.adopting(preset)
+                            model.updateLayoutCue(updated, actionName: "Change Layout")
+                        }
+                    )
+                )
+            }
+        }
+
+        Divider()
+
+        Button("Remove Layout", systemImage: "trash", role: .destructive) {
+            withAnimation(.morphIfAllowed) {
+                model.removeLayoutCue(id: cue.id)
+            }
+        }
+    }
+
+    private func beginDrag() {
+        guard dragBase == nil else { return }
+        dragBase = DragBase(cue: block.cue, editorStart: block.editorStart, editorEnd: block.editorEnd)
+        model.beginLayoutCueEdit()
+        model.selectLayoutCue(id: block.cue.id)
+    }
+
+    private func moveGesture(cue: RecordingCameraLayoutCue) -> some Gesture {
+        DragGesture(coordinateSpace: .global)
+            .onChanged { value in
+                beginDrag()
+                guard let dragBase else { return }
+                let delta = Double(value.translation.width) * scale.secondsPerPoint
+                let length = dragBase.cue.duration
+                let blockDuration = dragBase.editorEnd - dragBase.editorStart
+                let editorStart = min(max(0, dragBase.editorStart + delta), max(0, model.duration - blockDuration))
+                var moved = dragBase.cue
+                moved.start = min(
+                    max(0, model.sourceTime(atEditorTime: editorStart)),
+                    max(0, model.sourceDuration - length)
+                )
+                moved.end = min(model.sourceDuration, moved.start + length)
+                model.moveLayoutCue(moved)
+            }
+            .onEnded { _ in
+                dragBase = nil
+                model.endLayoutCueEdit(actionName: "Move Layout")
+            }
+    }
+
+    private func resizeHandle(edge: HorizontalEdge) -> some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.001))
+            .frame(width: StudioZoomLaneMetrics.handleWidth, height: StudioZoomLaneMetrics.blockHeight)
+            .overlay {
+                Capsule()
+                    .fill(Palette.onLayoutCue)
+                    .frame(width: 3, height: 12)
+            }
+            .contentShape(Rectangle())
+            .pointerStyle(.frameResize(position: edge == .leading ? .leading : .trailing))
+            .gesture(
+                DragGesture(coordinateSpace: .global)
+                    .onChanged { value in
+                        beginDrag()
+                        guard let dragBase else { return }
+                        let delta = Double(value.translation.width) * scale.secondsPerPoint
+                        var resized = dragBase.cue
+                        let minimum = RecordingCameraLayoutCue.minimumDuration
+                        switch edge {
+                        case .leading:
+                            let source = model.sourceTime(atEditorTime: dragBase.editorStart + delta)
+                            resized.start = min(max(0, source), dragBase.cue.end - minimum)
+                        case .trailing:
+                            let source = model.sourceTime(atEditorTime: dragBase.editorEnd + delta)
+                            resized.end = max(dragBase.cue.start + minimum, min(model.sourceDuration, source))
+                        }
+                        model.resizeLayoutCue(resized)
+                    }
+                    .onEnded { _ in
+                        dragBase = nil
+                        model.endLayoutCueEdit(actionName: "Resize Layout")
+                    }
+            )
     }
 }
