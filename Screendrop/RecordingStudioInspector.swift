@@ -532,11 +532,9 @@ struct StudioInspector: View {
                 }
             }
 
-            InspectorHint(
-                model.cameraLayoutCues.isEmpty
-                    ? "Drag across the Layout lane to switch layouts for part of the video."
-                    : "Used wherever the Layout lane has no layout of its own."
-            )
+            if model.cameraLayoutCues.isEmpty {
+                InspectorHint("Drag across the Layout lane to change the layout for part of the video.")
+            }
         }
     }
 
