@@ -16,15 +16,14 @@ struct StudioCameraLayoutPicker: View {
     /// `isContinuous` is true while a slider is being dragged.
     let onChange: (RecordingCameraLayout, _ isContinuous: Bool) -> Void
 
-    /// Whole-frame layouts on the first row, corner cameras on the second.
     private let columns = Array(
-        repeating: GridItem(.flexible(), spacing: 8, alignment: .top),
-        count: 4
+        repeating: GridItem(.flexible(), spacing: 10, alignment: .top),
+        count: 3
     )
 
     var body: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
-            LazyVGrid(columns: columns, spacing: 10) {
+            LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(RecordingCameraLayout.presets, id: \.self) { preset in
                     let candidate = layout.adopting(preset)
                     StudioCameraLayoutTile(
@@ -241,7 +240,6 @@ private struct StudioCameraLayoutTile: View {
                     .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
                     .foregroundStyle(isSelected ? Palette.label : Palette.secondaryLabel)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.85)
             }
             .contentShape(Rectangle())
         }

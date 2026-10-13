@@ -192,16 +192,15 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
 }
 
 extension RecordingCameraLayout {
-    /// The layout grid, in reading order: the whole-frame arrangements,
-    /// then the corner cameras.
+    /// The layout grid, in reading order.
     static let presets: [RecordingCameraLayout] = [
         .screenOnly,
         .cameraOnly,
-        RecordingCameraLayout(kind: .split),
-        RecordingCameraLayout(kind: .cutout),
         RecordingCameraLayout(kind: .pictureInPicture, shape: .square),
         RecordingCameraLayout(kind: .pictureInPicture, shape: .circle),
-        RecordingCameraLayout(kind: .pictureInPicture, shape: .portrait)
+        RecordingCameraLayout(kind: .pictureInPicture, shape: .portrait),
+        RecordingCameraLayout(kind: .split),
+        RecordingCameraLayout(kind: .cutout)
     ]
 
     var title: String {
