@@ -835,15 +835,15 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         settled: SettledLayout?
     ) {
         let state = layoutTimeline.state(at: editorTime)
-        let magnification = viewportTimeline.frame(at: editorTime).magnification
-        let layout = layoutResolver.layout(for: state, magnification: magnification)
+        let zoomProgress = viewportTimeline.zoomProgress(at: editorTime)
+        let layout = layoutResolver.layout(for: state, zoomProgress: zoomProgress)
         guard let settled = state.settledLayout else { return (layout, nil) }
         guard settled.kind == .pictureInPicture else {
             return (layout, SettledLayout(layout: settled, isShrunk: false))
         }
         // A corner camera mid-shrink is moving, so it isn't settled; full
         // size and shrunk are two steady states with their own resources.
-        let scale = layoutResolver.cameraScale(forZoom: magnification)
+        let scale = layoutResolver.cameraScale(forZoomProgress: zoomProgress)
         if abs(scale - 1) < 0.0001 {
             return (layout, SettledLayout(layout: settled, isShrunk: false))
         }

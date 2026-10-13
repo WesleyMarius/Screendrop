@@ -355,20 +355,19 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
     /// How much smaller a corner camera gets while the screen is zoomed.
     static let zoomedCameraScale: CGFloat = 0.9
 
-    /// A corner camera's scale for the zoom at that moment: full size on
-    /// the unzoomed screen, `zoomedCameraScale` once a zoom reaches 1.25×,
-    /// riding the zoom's own spring in between. The talking head has the
-    /// floor until something happens on screen.
-    func cameraScale(forZoom magnification: Double) -> CGFloat {
+    /// A corner camera's scale for how far the screen has zoomed: full
+    /// size unzoomed, `zoomedCameraScale` once the zoom lands, and in
+    /// between on the zoom's own spring, so the two arrive together. The
+    /// talking head has the floor until something happens on screen.
+    func cameraScale(forZoomProgress progress: Double) -> CGFloat {
         guard shrinksDuringZoom else { return 1 }
-        let t = CGFloat(min(max((magnification - 1) / 0.25, 0), 1))
-        let eased = t * t * (3 - 2 * t)
-        return 1 - (1 - Self.zoomedCameraScale) * eased
+        let t = CGFloat(min(max(progress, 0), 1))
+        return 1 - (1 - Self.zoomedCameraScale) * t
     }
 
-    /// `magnification` is the zoom at that moment, which a corner camera
-    /// shrinks against.
-    func frame(for layout: RecordingCameraLayout, magnification: Double = 1) -> RecordingCameraLayoutFrame {
+    /// `zoomProgress` is how far the screen has zoomed at that moment
+    /// (ViewportTimeline.zoomProgress), which a corner camera shrinks with.
+    func frame(for layout: RecordingCameraLayout, zoomProgress: Double = 0) -> RecordingCameraLayoutFrame {
         let card = base.cardRect
         let layout = showsCamera ? layout : .screenOnly
         switch layout.kind {
@@ -392,7 +391,7 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
                 cameraOpacity: 1
             )
         case .pictureInPicture:
-            let camera = pipCamera(for: layout, in: card, scale: cameraScale(forZoom: magnification))
+            let camera = pipCamera(for: layout, in: card, scale: cameraScale(forZoomProgress: zoomProgress))
             return RecordingCameraLayoutFrame(
                 screenRect: card,
                 screenOpacity: 1,
@@ -414,15 +413,15 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
 
     func frame(
         for state: RecordingCameraLayoutTimeline.State,
-        magnification: Double = 1
+        zoomProgress: Double = 0
     ) -> RecordingCameraLayoutFrame {
         switch state {
         case .settled(let layout):
-            return frame(for: layout, magnification: magnification)
+            return frame(for: layout, zoomProgress: zoomProgress)
         case .transition(let from, let to, let progress):
             return .interpolate(
-                frame(for: from, magnification: magnification),
-                frame(for: to, magnification: magnification),
+                frame(for: from, zoomProgress: zoomProgress),
+                frame(for: to, zoomProgress: zoomProgress),
                 progress: CGFloat(RecordingCameraLayoutTimeline.ease(progress))
             )
         }
@@ -431,9 +430,9 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
     /// The resting layout moved into a frame.
     func layout(
         for state: RecordingCameraLayoutTimeline.State,
-        magnification: Double = 1
+        zoomProgress: Double = 0
     ) -> RecordingStudioLayout {
-        base.applying(frame(for: state, magnification: magnification))
+        base.applying(frame(for: state, zoomProgress: zoomProgress))
     }
 
     /// The camera tucked into a corner of the screen card.

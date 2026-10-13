@@ -478,7 +478,7 @@ private struct StudioCanvasComposition: View {
             ? resolver.frame(for: .screenOnly)
             : resolver.frame(
                 for: timeline.state(at: model.displayTime),
-                magnification: model.viewportFrame(at: model.displayTime).magnification
+                zoomProgress: model.zoomProgress(at: model.displayTime)
             )
     }
 
@@ -524,7 +524,7 @@ private struct StudioCanvasComposition: View {
                             moved.corner = corner
                             let destination = resolver.frame(
                                 for: moved,
-                                magnification: model.viewportFrame(at: model.displayTime).magnification
+                                zoomProgress: model.zoomProgress(at: model.displayTime)
                             )
                             return (destination.cameraRect, destination.cameraCornerRadius)
                         },

@@ -1554,6 +1554,12 @@ final class RecordingStudioModel {
         return viewportTimeline.frame(at: time)
     }
 
+    /// How far the zoom has travelled toward its target, 0...1.
+    func zoomProgress(at time: TimeInterval) -> Double {
+        guard zoomEnabled else { return 0 }
+        return viewportTimeline.zoomProgress(at: time)
+    }
+
     /// True when this session was captured without the OS cursor, so the
     /// preview and export draw the synthetic pointer.
     var pointerIsSynthesized: Bool {

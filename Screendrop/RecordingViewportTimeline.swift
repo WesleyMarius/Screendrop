@@ -212,13 +212,30 @@ nonisolated struct ViewportTimeline: Sendable {
     private static let interiorMargin = 0.9
 
     private let frames: [ViewportFrame]
+    /// Per frame, how far the zoom has travelled toward the magnification
+    /// it is heading for (or, zooming out, the one it is leaving): 0 on the
+    /// unzoomed screen, 1 once it lands. Things that react to zooms, like
+    /// the corner camera stepping back, follow this so they arrive with the
+    /// zoom rather than ahead of it.
+    private let zoomProgress: [Double]
     private let duration: TimeInterval
 
-    static let identity = ViewportTimeline(frames: [.identity], duration: 0)
+    static let identity = ViewportTimeline(frames: [.identity], zoomProgress: [0], duration: 0)
 
-    private init(frames: [ViewportFrame], duration: TimeInterval) {
+    private init(frames: [ViewportFrame], zoomProgress: [Double], duration: TimeInterval) {
         self.frames = frames
+        self.zoomProgress = zoomProgress
         self.duration = duration
+    }
+
+    /// - Parameter time: Editor (edited-timeline) time, not raw source time.
+    func zoomProgress(at time: TimeInterval) -> Double {
+        guard zoomProgress.count > 1, duration > 0 else { return zoomProgress.first ?? 0 }
+        let position = min(max(time, 0), duration) * Self.stepRate
+        let index = Int(position)
+        guard index < zoomProgress.count - 1 else { return zoomProgress[zoomProgress.count - 1] }
+        let fraction = position - Double(index)
+        return zoomProgress[index] + (zoomProgress[index + 1] - zoomProgress[index]) * fraction
     }
 
     /// - Parameter time: Editor (edited-timeline) time, not raw source time.
@@ -289,6 +306,10 @@ nonisolated struct ViewportTimeline: Sendable {
 
         var frames: [ViewportFrame] = []
         frames.reserveCapacity(frameCount)
+        var zoomProgress: [Double] = []
+        zoomProgress.reserveCapacity(frameCount)
+        // The zoom the viewport is heading for, held through the zoom-out.
+        var progressReference = 1.0
 
         for frameIndex in 0..<frameCount {
             let editorTime = min(Double(frameIndex) * dt, duration)
@@ -373,10 +394,20 @@ nonisolated struct ViewportTimeline: Sendable {
                 }
             }
             frames.append(ViewportFrame(magnification: magnification, anchor: anchor))
+            if targetMagnification > 1 {
+                progressReference = targetMagnification
+            }
+            var progress = progressReference > 1
+                ? min(max((magnification - 1) / (progressReference - 1), 0), 1)
+                : 0
+            // The spring only approaches its target; within half a percent
+            // the zoom has landed, and reacting layers can hold still.
+            if progress > 0.995 { progress = 1 } else if progress < 0.005 { progress = 0 }
+            zoomProgress.append(progress)
             previousActive = active
         }
 
-        return ViewportTimeline(frames: frames, duration: duration)
+        return ViewportTimeline(frames: frames, zoomProgress: zoomProgress, duration: duration)
     }
 
     // MARK: Cue selection
