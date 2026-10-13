@@ -159,10 +159,18 @@ nonisolated final class StudioCameraMatteGenerator: @unchecked Sendable {
     }
 
     /// Segments `camera` and prepares its shadow, waiting for the GPU.
-    /// `time` is the frame's time in the camera recording; a jump back, or
-    /// forward past a few frames, starts a new sequence so Vision never
-    /// steadies one moment's matte with another's.
+    /// `time` is the frame's time in the camera recording.
     func matte(for camera: CVPixelBuffer, time: TimeInterval) -> StudioCameraMatte? {
+        guard let mask = mask(for: camera, time: time) else { return nil }
+        let aspect = CGFloat(CVPixelBufferGetWidth(camera)) / CGFloat(max(1, CVPixelBufferGetHeight(camera)))
+        return matte(fromMask: mask, aspect: aspect)
+    }
+
+    /// Vision's matte for `camera`: one 8-bit channel, 4:3 whatever the
+    /// camera's shape. A jump back, or forward past a few frames, starts a
+    /// new sequence so Vision never steadies one moment's matte with
+    /// another's.
+    func mask(for camera: CVPixelBuffer, time: TimeInterval) -> CVPixelBuffer? {
         if let lastTime, time < lastTime - 0.001 || time - lastTime > 0.25 {
             handler = VNSequenceRequestHandler()
         }
@@ -175,16 +183,24 @@ nonisolated final class StudioCameraMatteGenerator: @unchecked Sendable {
         guard let mask = request.results?.first?.pixelBuffer,
               CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent8
         else { return nil }
+        return mask
+    }
+
+    /// A matte from a mask - Vision's, or one read back from the matte
+    /// cache, whose first plane carries it - for a picture `aspect` wide.
+    func matte(fromMask mask: CVPixelBuffer, aspect: CGFloat) -> StudioCameraMatte? {
+        let isPlanar = CVPixelBufferIsPlanar(mask)
         var wrapper: CVMetalTexture?
         guard CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault, textureCache, mask, nil, .r8Unorm,
-            CVPixelBufferGetWidth(mask), CVPixelBufferGetHeight(mask), 0, &wrapper
+            isPlanar ? CVPixelBufferGetWidthOfPlane(mask, 0) : CVPixelBufferGetWidth(mask),
+            isPlanar ? CVPixelBufferGetHeightOfPlane(mask, 0) : CVPixelBufferGetHeight(mask),
+            0, &wrapper
         ) == kCVReturnSuccess,
               let wrapper,
               let matte = CVMetalTextureGetTexture(wrapper)
         else { return nil }
 
-        let aspect = CGFloat(CVPixelBufferGetWidth(camera)) / CGFloat(max(1, CVPixelBufferGetHeight(camera)))
         let height = Self.shadowHeight
         let width = min(max(Int((CGFloat(height) * aspect).rounded()), 32), 768)
         guard let source = shadowSourceTexture(width: width, height: height),
@@ -273,15 +289,19 @@ nonisolated final class StudioCameraMatteGenerator: @unchecked Sendable {
     }
 }
 
-/// An export's cutout mattes, made ahead of it on their own thread from a
+/// An export's cutout mattes, made ahead of it on their own thread: read
+/// from the matte cache when it's complete, otherwise segmented from a
 /// second decode of the camera movie that the decoder already scales to
-/// Vision's size. Only the frames the export will show cut out are
-/// segmented - including ahead through stretches where it isn't - and only
+/// Vision's size. Only the frames the export will show cut out are made -
+/// including ahead through stretches where it isn't cut out - and only
 /// their small mattes are kept, so Vision is busy for the whole export
 /// instead of only while a cutout is on screen.
 nonisolated final class StudioCameraMatteTrack: @unchecked Sendable {
     private let reader: AVAssetReader
     private let output: AVAssetReaderTrackOutput
+    /// Non-nil when reading the cache: the camera picture's aspect, for the
+    /// shadow, which the cache's 4:3 mattes don't carry.
+    private let cachedAspect: CGFloat?
     private let offset: TimeInterval
     /// Sorted screen-clock times the export shows the camera cut out at.
     private let neededTimes: [TimeInterval]
@@ -305,16 +325,34 @@ nonisolated final class StudioCameraMatteTrack: @unchecked Sendable {
         guard let generator = StudioCameraMatteGenerator(),
               let track = try? await asset.loadTracks(withMediaType: .video).first,
               let size = try? await track.load(.naturalSize),
-              size.width > 0, size.height > 0,
-              let reader = try? AVAssetReader(asset: asset)
+              size.width > 0, size.height > 0
         else { return nil }
-        let height = min(Int(size.height), StudioCameraMatteGenerator.visionInputHeight)
-        let width = max(2, Int((size.width * CGFloat(height) / size.height).rounded()) & ~1)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height
-        ])
+
+        let reader: AVAssetReader
+        let output: AVAssetReaderTrackOutput
+        let cache = AVURLAsset(url: StudioCameraMatteCache.url(forCamera: url))
+        if StudioCameraMatteCache.isComplete(forCamera: url),
+           let cacheTrack = try? await cache.loadTracks(withMediaType: .video).first,
+           let cacheReader = try? AVAssetReader(asset: cache) {
+            reader = cacheReader
+            output = AVAssetReaderTrackOutput(track: cacheTrack, outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: Int]()
+            ])
+            cachedAspect = size.width / size.height
+        } else {
+            guard let cameraReader = try? AVAssetReader(asset: asset) else { return nil }
+            reader = cameraReader
+            let height = min(Int(size.height), StudioCameraMatteGenerator.visionInputHeight)
+            let width = max(2, Int((size.width * CGFloat(height) / size.height).rounded()) & ~1)
+            output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height
+            ])
+            cachedAspect = nil
+        }
         output.alwaysCopiesSampleData = false
         guard reader.canAdd(output) else { return nil }
         reader.add(output)
@@ -376,7 +414,13 @@ nonisolated final class StudioCameraMatteTrack: @unchecked Sendable {
                 condition.lock()
                 while mattes.count >= Self.capacity, !isCancelled { condition.wait() }
                 condition.unlock()
-                let matte = autoreleasepool { generator.matte(for: current.buffer, time: current.time) }
+                let matte = autoreleasepool {
+                    if let cachedAspect {
+                        generator.matte(fromMask: current.buffer, aspect: cachedAspect)
+                    } else {
+                        generator.matte(for: current.buffer, time: current.time)
+                    }
+                }
                 if let matte {
                     condition.withLock { mattes.append((current.time, matte)) }
                 }

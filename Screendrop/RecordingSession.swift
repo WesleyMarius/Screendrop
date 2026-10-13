@@ -16,6 +16,9 @@ nonisolated struct RecordingSession: Sendable, Equatable {
     static let directoryExtension = "screendroprec"
     static let screenFileName = "screen.mov"
     static let cameraFileName = "camera.mov"
+    /// The person mattes a cutout draws through, made once from the camera
+    /// in the background; derived data, rebuilt whenever it's missing.
+    static let cameraMatteFileName = "camera-matte-v1.mov"
     static let pointerCaptureFileName = "input.json"
     static let captureManifestFileName = "capture.json"
     static let editDocumentFileName = "edit.json"

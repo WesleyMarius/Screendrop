@@ -70,6 +70,30 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc \
 /tmp/screendrop-export-reuse-benchmark
 ```
 
+## Camera cutout (October 14, 2026)
+
+The Cutout layout segments the person from the camera with Vision's `VNGeneratePersonSegmentationRequest` at **balanced** quality, and `studioCutoutCamera` composites the camera through that matte for both the preview and the export. Measured on an Apple M4 Pro with a 1920×1080, 30 fps camera:
+
+| Quality | Matte | Per frame |
+| --- | ---: | ---: |
+| fast | 256×192 | 2.7 ms |
+| balanced | 512×384 | 8.3 ms |
+| accurate | 2016×1512 | 30 ms |
+
+Accurate's finer matte only matters when a cutout is drawn taller than about 768 pixels. The kernel tightens balanced's soft edge (smoothstep 0.45–0.85) at the drawn size, which removes the room-coloured fringe. Vision runs its model on the Neural Engine but scales its input on the GPU. Handing it a frame already 384 rows tall (decoder-scaled for exports, vImage-scaled for the preview, 0.7 ms) cuts a frame from about 12.9 ms to 7.5–8.2 ms. The resulting matte is within 0.5/255 of the full-size one.
+
+During an export, Vision slows to about 11 ms a frame, because it competes with the screen pass for the GPU. A single stateful sequence is then the bottleneck: two parallel streams only reach 138 fps against 117, and they lose frame-to-frame matte coherence. Studio therefore segments the whole camera once in the background, as soon as a cutout appears on the timeline. It writes the mattes as the luma of a small HEVC movie (`camera-matte-v1.mov`, full-range 4:2:0 at quality 0.75), stamped with each camera frame's time. This is about 1.3 MB per minute of camera. Read back, the mattes average 0.06/255 off the originals, and their tightened alpha differs by 0.0001. The cache steps aside while an export or share runs and is valid only when it's newer than `camera.mov`. Without it, exports segment live on a second, decoder-scaled read of the camera. That read runs ahead of the frames being drawn and segments only the frames that will be shown cut out.
+
+The 51-second sample recording, exported at 1080p, 60 fps, with motion blur (Debug build), is 41 seconds Cutout and 10 seconds corner camera:
+
+| Export | Seconds |
+| --- | ---: |
+| Corner camera only (baseline) | 12.6 |
+| Cutout, segmenting live | 17.4 |
+| Cutout, reading the matte cache | 13.4 |
+
+Building the cache took 12.5 s (about 123 fps) and produced 1.2 MB. Exports from the cache and from live segmentation average 0.14/255 apart. To reproduce, run the Debug binary with `-benchmarkMatteCache <path to .screendroprec>`, then `-benchmarkExport` on the same package. Delete `camera-matte-v1.mov` to time the live path. The log's `cutoutWaitSeconds` is the time finishing frames spent waiting for mattes.
+
 ## Measured blur-pass timings
 
 Measured on an Apple M4 Pro, September 5, 2026. Synthetic zoom/pan, rounded clipping, text, one-pixel lines, and colored edges; **24 shutter samples**, four timed iterations after setup/warmup. Times include GPU completion and any reduction prepass.

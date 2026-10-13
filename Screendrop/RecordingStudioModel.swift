@@ -223,9 +223,15 @@ final class RecordingStudioModel {
             movePlayers(to: hoverPreviewTime ?? currentTime)
         }
     }
-    var exportState: RecordingStudioExportState = .idle
+    var exportState: RecordingStudioExportState = .idle {
+        didSet { updateCameraMatteCache() }
+    }
     var audioExportState: RecordingStudioExportState = .idle
-    var shareState: RecordingStudioShareState = .idle
+    var shareState: RecordingStudioShareState = .idle {
+        didSet { updateCameraMatteCache() }
+    }
+    /// Makes the cutout's mattes for the whole camera in the background.
+    private var cameraMatteTask: Task<Void, Never>?
     /// Upload identity while sharing, so the UI can read the uploader's
     /// live progress and the history card mirrors the state.
     private(set) var shareItemID: UUID?
@@ -453,6 +459,7 @@ final class RecordingStudioModel {
         rebuildViewportTimeline()
         installObservers()
         isLoaded = true
+        updateCameraMatteCache()
         rebuildPreviewReframe()
         loadTimelineThumbnails()
 
@@ -528,6 +535,8 @@ final class RecordingStudioModel {
         cancelShare()
         transcriptionTask?.cancel()
         projectSaveTask?.cancel()
+        cameraMatteTask?.cancel()
+        cameraMatteTask = nil
         exportTask = nil
         audioExportTask = nil
         replacementAudioTask = nil
@@ -1182,8 +1191,35 @@ final class RecordingStudioModel {
         )
         if next != cameraLayoutTimeline {
             cameraLayoutTimeline = next
+            updateCameraMatteCache()
         }
         if rebuildsZoom { rebuildMotionTimeline() }
+    }
+
+    /// Once a cutout appears anywhere on the timeline, the whole camera is
+    /// segmented in the background so exports can read the mattes instead
+    /// of running Vision. A render segments for itself, so the cache steps
+    /// aside while one runs - Vision shared between them would slow both -
+    /// and starts over after.
+    private func updateCameraMatteCache() {
+        let isRendering = exportState.isExporting || shareState.isBusy
+        guard isLoaded, !isTornDown, !isRendering, hasCameraVideo,
+              cameraLayoutTimeline.usesCutout, let session,
+              !StudioCameraMatteCache.isComplete(forCamera: session.cameraURL)
+        else {
+            if isRendering || isTornDown {
+                cameraMatteTask?.cancel()
+                cameraMatteTask = nil
+            }
+            return
+        }
+        guard cameraMatteTask == nil else { return }
+        let cameraURL = session.cameraURL
+        cameraMatteTask = Task(priority: .utility) { [weak self] in
+            await StudioCameraMatteCache.generate(cameraURL: cameraURL)
+            guard !Task.isCancelled else { return }
+            self?.cameraMatteTask = nil
+        }
     }
 
     private func replaceLayoutCues(_ cues: [RecordingCameraLayoutCue]) {
