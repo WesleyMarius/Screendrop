@@ -322,7 +322,11 @@ struct StudioCameraLayoutScene: View {
                 backdrop
 
                 if frame.screenOpacity > 0.001 {
-                    MiniatureWindow(radius: concentricRadius(for: frame.screenRect, in: size), isDark: isDark)
+                    MiniatureWindow(
+                        radius: concentricRadius(for: frame.screenRect, in: size),
+                        isDark: isDark,
+                        pointer: layout.kind == .cutout ? pointerClear(of: frame.cameraRect, in: frame.screenRect) : nil
+                    )
                         .frame(width: frame.screenRect.width, height: frame.screenRect.height)
                         .offset(x: frame.screenRect.minX, y: frame.screenRect.minY)
                 }
@@ -351,6 +355,14 @@ struct StudioCameraLayoutScene: View {
     }
 
     private var isDark: Bool { colorScheme == .dark }
+
+    /// Where in the window the pointer sits clear of a cutout standing in
+    /// front of it: the side away from the person, above their shoulders.
+    private func pointerClear(of camera: CGRect, in window: CGRect) -> CGPoint {
+        let offset = (camera.midX - window.midX) / max(window.width, 1)
+        let x: CGFloat = offset > 0.05 ? 0.32 : (offset < -0.05 ? 0.72 : 0.2)
+        return CGPoint(x: x, y: 0.5)
+    }
 
     /// Outer radius = inner radius + padding, so a shape inset from the
     /// tile's edge keeps the tile's curve.
@@ -387,6 +399,8 @@ private struct SelectionBounce: ViewModifier {
 private struct MiniatureWindow: View {
     let radius: CGFloat
     let isDark: Bool
+    /// The pointer's place as a fraction of the window, if not the middle.
+    var pointer: CGPoint?
 
     var body: some View {
         GeometryReader { proxy in
@@ -434,7 +448,10 @@ private struct MiniatureWindow: View {
                 Image(systemName: "cursorarrow")
                     .font(.system(size: max(6, unit * 0.17), weight: .semibold))
                     .foregroundStyle(isDark ? Color.white.opacity(0.9) : Color.black.opacity(0.75))
-                    .position(x: size.width * (showsSidebar ? 0.55 : 0.5), y: size.height * 0.66)
+                    .position(
+                        x: size.width * (pointer?.x ?? (showsSidebar ? 0.55 : 0.5)),
+                        y: size.height * (pointer?.y ?? 0.66)
+                    )
             }
             .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
             .overlay {
