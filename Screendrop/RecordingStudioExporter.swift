@@ -33,6 +33,9 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         let screenURL: URL
         let cameraURL: URL?
         let cameraOffset: TimeInterval
+        /// The camera picture's width over its height, which a cutout's
+        /// frame takes; nil assumes 16:9.
+        let cameraAspect: CGFloat?
         let style: RecordingStudioStyle
         /// Where the screen and camera sit over time.
         let cameraLayoutTimeline: RecordingCameraLayoutTimeline
@@ -78,6 +81,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             screenURL: URL,
             cameraURL: URL?,
             cameraOffset: TimeInterval,
+            cameraAspect: CGFloat? = nil,
             style: RecordingStudioStyle,
             cameraLayoutTimeline: RecordingCameraLayoutTimeline,
             viewportTimeline: ViewportTimeline,
@@ -104,6 +108,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             self.screenURL = screenURL
             self.cameraURL = cameraURL
             self.cameraOffset = cameraOffset
+            self.cameraAspect = cameraAspect
             self.style = style
             self.cameraLayoutTimeline = cameraLayoutTimeline
             self.viewportTimeline = viewportTimeline
@@ -358,12 +363,31 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             subtitleStyle: configuration.subtitleStyle,
             karaokeTimeline: configuration.karaokeTimeline,
             includeBubble: cameraFeed != nil,
+            cameraAspect: configuration.cameraAspect ?? RecordingCameraLayoutResolver.defaultCameraAspect,
             timing: timing,
             reframe: configuration.reframe,
             fitContentAspect: configuration.fitContentAspect,
             usesUniformPadding: configuration.usesUniformPadding,
             motionTimeline: configuration.motionTimeline
         )
+
+        // A cutout's mattes are made ahead of the frames that show them, on
+        // their own decode of the camera, for exactly those frames.
+        var cutoutMattes: StudioCameraMatteTrack?
+        if cameraFeed != nil, configuration.cameraLayoutTimeline.usesCutout, let cameraURL = configuration.cameraURL {
+            let frameCount = timing.frameCount(for: clipTimeline.duration)
+            let neededTimes = (0..<frameCount).compactMap { frame -> TimeInterval? in
+                let editorTime = timing.time(forFrame: frame)
+                guard compositor.showsCutout(at: editorTime) else { return nil }
+                return clipTimeline.location(at: editorTime)?.sourceTime
+            }
+            if !neededTimes.isEmpty {
+                cutoutMattes = await StudioCameraMatteTrack(
+                    url: cameraURL, offset: configuration.cameraOffset, neededTimes: neededTimes
+                )
+                compositor.cutoutMattes = cutoutMattes
+            }
+        }
 
         let screenAudioOutput = audioOutput
         let writerAudioInput = audioInput
@@ -390,12 +414,14 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             screenReader.cancelReading()
             replacementReader?.cancelReading()
             cameraFeed?.cancel()
+            cutoutMattes?.cancel()
             writer.cancelWriting()
             try? FileManager.default.removeItem(at: outputURL)
             throw error
         }
 
         cameraFeed?.cancel()
+        cutoutMattes?.cancel()
 
         await withCheckedContinuation { continuation in
             writer.finishWriting {
@@ -449,7 +475,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         var writerWaitSeconds = 0.0
         var renderedFrames = 0
         defer {
-            Self.logger.info("Export frames=\(renderedFrames) fps=\(timing.framesPerSecond) motionBlur=\(timing.motionBlurEnabled) Metal blur frames=\(compositor.metalFrameCount) reusedScreenFrames=\(compositor.reusedScreenFrameCount) reusedComposedFrames=\(compositor.reusedComposedFrameCount) renderSeconds=\(renderSeconds) metalSeconds=\(compositor.metalSeconds) decodeSeconds=\(decodeSeconds) writerWaitSeconds=\(writerWaitSeconds)")
+            Self.logger.info("Export frames=\(renderedFrames) fps=\(timing.framesPerSecond) motionBlur=\(timing.motionBlurEnabled) Metal blur frames=\(compositor.metalFrameCount) reusedScreenFrames=\(compositor.reusedScreenFrameCount) reusedComposedFrames=\(compositor.reusedComposedFrameCount) renderSeconds=\(renderSeconds) metalSeconds=\(compositor.metalSeconds) cutoutWaitSeconds=\(compositor.cutoutWaitSeconds) decodeSeconds=\(decodeSeconds) writerWaitSeconds=\(writerWaitSeconds)")
         }
 
         var inFlight: (frame: StudioFrameCompositor.PendingFrame, index: Int)?
@@ -504,7 +530,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             guard let pool = adaptor.pixelBufferPool else {
                 throw ExportError.writerFailed(nil)
             }
-            let cameraBuffer = cameraFeed?.latestFrame(at: sourceTime)
+            let camera = cameraFeed?.latestFrame(at: sourceTime)
             let nextTime = timing.time(forFrame: frame + 1)
             let sourceRepeats = (pending == nil || pending!.time > nextTime)
                 && clipTimeline.location(at: nextTime)?.segmentID == location.segmentID
@@ -512,7 +538,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             let begun = try autoreleasepool {
                 try compositor.begin(
                     screenFrame: sourceBuffer,
-                    cameraFrame: cameraBuffer,
+                    cameraFrame: camera?.buffer,
+                    cameraTime: camera?.time ?? 0,
                     editorTime: editorTime,
                     sourceTime: sourceTime,
                     sourceRepeatsOnNextFrame: sourceRepeats,
@@ -607,8 +634,9 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
     private let reader: AVAssetReader
     private let output: AVAssetReaderTrackOutput
     private let offset: TimeInterval
-    private var currentFrame: CVPixelBuffer?
-    private var pendingFrame: (buffer: CVPixelBuffer, time: TimeInterval)?
+    private var currentFrame: (buffer: CVPixelBuffer, time: TimeInterval)?
+    /// Decoded frames after the current one, oldest first.
+    private var ahead: [(buffer: CVPixelBuffer, time: TimeInterval)] = []
     private var isFinished = false
 
     init?(url: URL?, offset: TimeInterval) async throws {
@@ -639,25 +667,32 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
         self.offset = offset
     }
 
-    func latestFrame(at screenTime: TimeInterval) -> CVPixelBuffer? {
-        while !isFinished {
-            if let pending = pendingFrame {
+    /// `time` is the frame's own time on the screen's clock.
+    func latestFrame(at screenTime: TimeInterval) -> (buffer: CVPixelBuffer, time: TimeInterval)? {
+        while true {
+            if let next = ahead.first {
                 // Promote the very first frame unconditionally: the camera
                 // starts a beat after the screen (capture warmup), and holding
                 // its first frame from t=0 beats the bubble popping in late.
-                guard pending.time <= screenTime || currentFrame == nil else { break }
-                currentFrame = pending.buffer
-                pendingFrame = nil
-            }
-            guard let sample = output.copyNextSampleBuffer() else {
-                isFinished = true
+                guard next.time <= screenTime || currentFrame == nil else { break }
+                currentFrame = next
+                ahead.removeFirst()
+            } else if !decodeNext() {
                 break
             }
-            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
-            let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds + offset
-            pendingFrame = (buffer: buffer, time: time)
         }
         return currentFrame
+    }
+
+    private func decodeNext() -> Bool {
+        guard !isFinished else { return false }
+        while let sample = output.copyNextSampleBuffer() {
+            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+            ahead.append((buffer, CMSampleBufferGetPresentationTimeStamp(sample).seconds + offset))
+            return true
+        }
+        isFinished = true
+        return false
     }
 
     func cancel() {
@@ -725,6 +760,12 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// The camera inside a morph; nil until needed or if Metal can't.
     private var morphCameraRenderer: StudioMorphCameraRenderer?
     private var morphCameraRendererFailed = false
+    /// The cutout's mattes, made ahead; nil when no layout cuts it out.
+    var cutoutMattes: StudioCameraMatteTrack?
+    /// Segments a frame the matte track missed, which should be none.
+    private lazy var fallbackMattes = StudioCameraMatteGenerator()
+    /// Time finishing frames spent waiting for Vision.
+    private(set) var cutoutWaitSeconds = 0.0
     /// A quarter-size canvas for the moving card's shadow. A shadow is a
     /// blur, so its resolution doesn't show, and full size costs ten times
     /// as much every frame.
@@ -791,6 +832,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         subtitleStyle: SubtitleBarStyle = SubtitleBarStyle(),
         karaokeTimeline: KaraokeTimeline? = nil,
         includeBubble: Bool,
+        cameraAspect: CGFloat = RecordingCameraLayoutResolver.defaultCameraAspect,
         timing: RecordingExportTiming,
         reframe: ReframeTrack? = nil,
         fitContentAspect: CGFloat? = nil,
@@ -812,7 +854,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         self.layoutResolver = RecordingCameraLayoutResolver(
             base: baseLayout,
             style: style,
-            showsCamera: includeBubble
+            showsCamera: includeBubble,
+            cameraAspect: cameraAspect
         )
         self.layoutTimeline = cameraLayoutTimeline
         self.layout = baseLayout
@@ -858,10 +901,10 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         let zoomProgress = viewportTimeline.zoomProgress(at: editorTime)
         let layout = layoutResolver.layout(for: state, zoomProgress: zoomProgress)
         guard let settled = state.settledLayout else { return (layout, nil) }
-        guard settled.kind == .pictureInPicture else {
+        guard settled.kind == .pictureInPicture || settled.kind == .cutout else {
             return (layout, SettledLayout(layout: settled, isShrunk: false))
         }
-        // A corner camera mid-shrink is moving, so it isn't settled; full
+        // A camera mid-shrink is moving, so it isn't settled; full
         // size and shrunk are two steady states with their own resources.
         let scale = layoutResolver.cameraScale(forZoomProgress: zoomProgress)
         if abs(scale - 1) < 0.0001 {
@@ -958,6 +1001,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     struct PendingFrame {
         fileprivate let screenFrame: CVPixelBuffer
         fileprivate let cameraFrame: CVPixelBuffer?
+        fileprivate let cameraTime: TimeInterval
         fileprivate let editorTime: TimeInterval
         fileprivate let sourceTime: TimeInterval
         fileprivate let layout: RecordingStudioLayout
@@ -981,6 +1025,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     func begin(
         screenFrame: CVPixelBuffer,
         cameraFrame: CVPixelBuffer?,
+        cameraTime: TimeInterval = 0,
         editorTime: TimeInterval,
         sourceTime: TimeInterval,
         sourceRepeatsOnNextFrame: Bool,
@@ -1002,7 +1047,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             // shared buffer exactly once. Subsequent encoder submissions are
             // read-only and keep the full selected 30/60 fps output cadence.
             return PendingFrame(
-                screenFrame: screenFrame, cameraFrame: cameraFrame,
+                screenFrame: screenFrame, cameraFrame: cameraFrame, cameraTime: cameraTime,
                 editorTime: editorTime, sourceTime: sourceTime, layout: frameLayout,
                 settledLayout: settled, sampleRects: sampleRects, shouldCacheScreen: false,
                 plansRestore: false, submission: nil, resources: nil, cameraSubmission: nil,
@@ -1045,8 +1090,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             )
         }
         let resources = settled.map { resources(for: $0, layout: frameLayout) }
-        let cameraSubmission = if let resources, let cameraFrame,
-                                  frameLayout.bubbleRect.width > 0, frameLayout.cameraOpacity > 0.001 {
+        let showsCamera = cameraFrame != nil && frameLayout.bubbleRect.width > 0 && frameLayout.cameraOpacity > 0.001
+        let cameraSubmission = if let resources, let cameraFrame, showsCamera, frameLayout.cameraCutout <= 0.001 {
             prepareCamera(cameraFrame, resources: resources)
         } else {
             nil as StudioCameraBubbleScaler.Submission?
@@ -1055,6 +1100,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         return PendingFrame(
             screenFrame: screenFrame,
             cameraFrame: cameraFrame,
+            cameraTime: cameraTime,
             editorTime: editorTime,
             sourceTime: sourceTime,
             layout: frameLayout,
@@ -1179,7 +1225,23 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         }
 
         if let cameraFrame, layout.bubbleRect.width > 0, layout.cameraOpacity > 0.001 {
-            if let resources {
+            if layout.cameraCutout > 0.001 {
+                // The matte changes with every camera frame, so a cutout
+                // always composites on the GPU, settled or not.
+                context.flush()
+                CVPixelBufferUnlockBaseAddress(destination, [])
+                let drawn = renderCutoutCamera(
+                    cameraFrame, cameraTime: frame.cameraTime, editorTime: editorTime, into: destination
+                )
+                CVPixelBufferLockBaseAddress(destination, [])
+                guard let relocked = lockedContext(for: destination) else {
+                    throw RecordingStudioExporter.ExportError.writerFailed(nil)
+                }
+                context = relocked
+                if !drawn {
+                    drawMorphingCamera(cameraFrame, editorTime: editorTime, in: context)
+                }
+            } else if let resources {
                 drawCameraBubble(cameraFrame, resources: resources, submission: frame.cameraSubmission, in: context)
             } else {
                 // The GPU draws into the buffer while the CPU has it unlocked.
@@ -1454,6 +1516,71 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
                 borderWidth: max(1, minDimension * 0.0018),
                 borderAlpha: 0.25 * opacity,
                 shadow: StudioMorphShadow(offset: minDimension * 0.009, blur: minDimension * 0.022, alpha: 0.35 * opacity)
+            ),
+            into: destination
+        )
+    }
+
+    /// Whether the camera is cut out at all at an editor time.
+    func showsCutout(at editorTime: TimeInterval) -> Bool {
+        let layout = frameLayout(at: editorTime).layout
+        return layout.cameraCutout > 0.001 && layout.cameraOpacity > 0.001 && layout.bubbleRect.width > 0
+    }
+
+
+    /// The camera cut out of its background by the layout's cutout amount,
+    /// over the finished frame in the unlocked `destination`: the framed
+    /// camera's shadow and border give way to the person's own shadow as
+    /// the background melts. False if Metal or Vision can't, leaving the
+    /// frame untouched.
+    private func renderCutoutCamera(
+        _ cameraFrame: CVPixelBuffer, cameraTime: TimeInterval, editorTime: TimeInterval,
+        into destination: CVPixelBuffer
+    ) -> Bool {
+        guard !forceCoreGraphics, !morphCameraRendererFailed else { return false }
+        let waitStart = CFAbsoluteTimeGetCurrent()
+        let matte = cutoutMattes?.matte(at: cameraTime)
+            ?? fallbackMattes?.matte(for: cameraFrame, time: cameraTime)
+        cutoutWaitSeconds += CFAbsoluteTimeGetCurrent() - waitStart
+        guard let matte else { return false }
+        if morphCameraRenderer == nil { morphCameraRenderer = StudioMorphCameraRenderer() }
+        guard let renderer = morphCameraRenderer else {
+            morphCameraRendererFailed = true
+            return false
+        }
+        let bubble = layout.bubbleRect
+        guard bubble.width > 0, bubble.height > 0 else { return true }
+        let fillRects = morphCameraSampleTimes(at: editorTime).compactMap { time -> CGRect? in
+            let sample = frameLayout(at: time).layout
+            guard sample.bubbleRect.width > 0, sample.bubbleRect.height > 0 else { return nil }
+            return cameraFillRect(cameraFrame, layout: sample)
+        }
+        guard !fillRects.isEmpty else { return true }
+        let opacity = layout.cameraOpacity
+        let framed = 1 - layout.cameraCutout
+        let picture = cameraFillRect(cameraFrame, layout: layout)
+        let minDimension = min(canvasSize.width, canvasSize.height)
+        let start = CFAbsoluteTimeGetCurrent()
+        defer { metalSeconds += CFAbsoluteTimeGetCurrent() - start }
+        return renderer.render(
+            camera: cameraFrame,
+            fillRects: fillRects,
+            bubble: StudioMorphCameraRenderer.Bubble(
+                rect: bubble,
+                cornerRadius: layout.bubbleCornerRadius,
+                opacity: opacity,
+                borderWidth: max(1, minDimension * 0.0018),
+                borderAlpha: 0.25 * opacity * framed,
+                shadow: StudioMorphShadow(
+                    offset: minDimension * 0.009, blur: minDimension * 0.022, alpha: 0.35 * opacity * framed
+                )
+            ),
+            cutout: StudioMorphCameraRenderer.Cutout(
+                matte: matte,
+                amount: layout.cameraCutout,
+                feather: StudioCutoutStyle.feather(picture: picture, canvas: canvasSize),
+                picture: picture,
+                shadowAlpha: StudioCutoutStyle.shadowAlpha * opacity * layout.cameraCutout
             ),
             into: destination
         )

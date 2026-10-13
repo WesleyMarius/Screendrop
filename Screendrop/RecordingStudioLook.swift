@@ -299,7 +299,14 @@ struct StudioStylePreview: View {
                 .opacity(frame.screenOpacity)
                 .offset(x: card.minX, y: card.minY)
 
-                if frame.cameraOpacity > 0.001 {
+                if frame.cameraOpacity > 0.001, frame.cameraCutout > 0.5 {
+                    let camera = frame.cameraRect
+                    StudioPersonSilhouette()
+                        .fill(Color(white: 0.7))
+                        .shadow(color: .black.opacity(0.25), radius: short * 0.012, y: short * 0.004)
+                        .frame(width: camera.width, height: camera.height)
+                        .offset(x: camera.minX, y: camera.minY)
+                } else if frame.cameraOpacity > 0.001 {
                     let camera = frame.cameraRect
                     RoundedRectangle(cornerRadius: frame.cameraCornerRadius, style: .continuous)
                         .fill(Color(white: 0.78))

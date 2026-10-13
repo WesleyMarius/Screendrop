@@ -2,7 +2,7 @@
 //  RecordingStudioLayoutInspector.swift
 //  Screendrop
 //
-//  The camera layout picker: a grid of the six layouts as quiet miniatures,
+//  The camera layout picker: a grid of the seven layouts as quiet miniatures,
 //  and below it only the options the picked layout has. Used for the
 //  default layout in the Camera section and for a layout cue selected on
 //  the timeline.
@@ -16,14 +16,15 @@ struct StudioCameraLayoutPicker: View {
     /// `isContinuous` is true while a slider is being dragged.
     let onChange: (RecordingCameraLayout, _ isContinuous: Bool) -> Void
 
+    /// Whole-frame layouts on the first row, corner cameras on the second.
     private let columns = Array(
-        repeating: GridItem(.flexible(), spacing: 10, alignment: .top),
-        count: 3
+        repeating: GridItem(.flexible(), spacing: 8, alignment: .top),
+        count: 4
     )
 
     var body: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
-            LazyVGrid(columns: columns, spacing: 12) {
+            LazyVGrid(columns: columns, spacing: 10) {
                 ForEach(RecordingCameraLayout.presets, id: \.self) { preset in
                     let candidate = layout.adopting(preset)
                     StudioCameraLayoutTile(
@@ -81,27 +82,23 @@ struct StudioCameraLayoutPicker: View {
                     .opacity(layout.shape == .circle ? 0.4 : 1)
                 }
 
-                InspectorToggleRow(
-                    "Shrink during zooms",
-                    isOn: Binding(
-                        get: { model.style.camera.shrinksDuringZoom },
-                        set: { isOn in
-                            withAnimation(.fold) { model.style.camera.shrinksDuringZoom = isOn }
-                        }
+                zoomShrinkControls
+            }
+        case .cutout:
+            VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+                group("Position") {
+                    InspectorSegmented(
+                        options: RecordingCameraLayout.Placement.allCases,
+                        isSelected: { $0 == layout.placement },
+                        onTap: { placement in edit { $0.placement = placement } },
+                        label: { Text($0.title).font(.inspectorSegment) }
                     )
-                )
-                .help("The camera steps back while the screen is zoomed in, and returns when it zooms out")
-
-                if model.style.camera.shrinksDuringZoom {
-                    InspectorSlider(
-                        "Shrink",
-                        value: $model.style.camera.zoomShrinkAmount,
-                        range: RecordingCameraBubbleSettings.zoomShrinkAmountRange,
-                        format: .percent()
-                    )
-                    .help("How much smaller the camera gets once a zoom lands")
-                    .transition(.opacity)
                 }
+
+                slider("Size", \.cutoutSize, range: RecordingCameraLayout.cutoutSizeRange)
+                    .help("How tall the camera's picture stands, measured on the canvas's shorter side")
+
+                zoomShrinkControls
             }
         case .split:
             VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
@@ -134,6 +131,32 @@ struct StudioCameraLayoutPicker: View {
             }
         case .screen, .camera:
             EmptyView()
+        }
+    }
+
+    /// A camera over the screen steps back for zooms.
+    @ViewBuilder
+    private var zoomShrinkControls: some View {
+        InspectorToggleRow(
+            "Shrink during zooms",
+            isOn: Binding(
+                get: { model.style.camera.shrinksDuringZoom },
+                set: { isOn in
+                    withAnimation(.fold) { model.style.camera.shrinksDuringZoom = isOn }
+                }
+            )
+        )
+        .help("The camera steps back while the screen is zoomed in, and returns when it zooms out")
+
+        if model.style.camera.shrinksDuringZoom {
+            InspectorSlider(
+                "Shrink",
+                value: $model.style.camera.zoomShrinkAmount,
+                range: RecordingCameraBubbleSettings.zoomShrinkAmountRange,
+                format: .percent()
+            )
+            .help("How much smaller the camera gets once a zoom lands")
+            .transition(.opacity)
         }
     }
 
@@ -218,6 +241,7 @@ private struct StudioCameraLayoutTile: View {
                     .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
                     .foregroundStyle(isSelected ? Palette.label : Palette.secondaryLabel)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.85)
             }
             .contentShape(Rectangle())
         }
@@ -304,7 +328,12 @@ struct StudioCameraLayoutScene: View {
                 }
 
                 let camera = frame.cameraRect
-                if frame.cameraOpacity > 0.001, camera.width > 0 {
+                if frame.cameraOpacity > 0.001, camera.width > 0, layout.kind == .cutout {
+                    MiniatureCutout(isDark: isDark)
+                        .frame(width: camera.width, height: camera.height)
+                        .modifier(SelectionBounce(isSelected: isSelected, anchor: .bottom))
+                        .offset(x: camera.minX, y: camera.minY)
+                } else if frame.cameraOpacity > 0.001, camera.width > 0 {
                     MiniatureCamera(
                         radius: layout.kind == .pictureInPicture
                             ? frame.cameraCornerRadius
@@ -338,11 +367,12 @@ struct StudioCameraLayoutScene: View {
 /// Pops the camera when its tile is picked.
 private struct SelectionBounce: ViewModifier {
     let isSelected: Bool
+    var anchor: UnitPoint = .center
     @State private var scale: CGFloat = 1
 
     func body(content: Content) -> some View {
         content
-            .scaleEffect(scale)
+            .scaleEffect(scale, anchor: anchor)
             .onChange(of: isSelected) { _, selected in
                 guard selected else { return }
                 withAnimation(.snappy(duration: 0.12)) { scale = 1.1 } completion: {
@@ -446,6 +476,46 @@ private struct MiniatureCamera: View {
             }
         }
         .shadow(color: .black.opacity(isDark ? 0.3 : 0.1), radius: 1.5, y: 0.5)
+    }
+}
+
+/// The cutout: just the person, standing on the canvas's bottom edge with
+/// the soft shadow the export gives them.
+private struct MiniatureCutout: View {
+    let isDark: Bool
+
+    var body: some View {
+        StudioPersonSilhouette()
+            .fill(isDark ? Color(white: 0.56) : Color(white: 0.72))
+            .shadow(color: .black.opacity(isDark ? 0.3 : 0.12), radius: 1.5, y: 0.5)
+    }
+}
+
+/// Head and shoulders, centred in a camera picture's frame the way people
+/// sit in front of a webcam; the frame's bottom edge crops the shoulders.
+struct StudioPersonSilhouette: Shape {
+    func path(in rect: CGRect) -> Path {
+        let head = rect.height * 0.4
+        let headCenter = CGPoint(x: rect.midX, y: rect.minY + rect.height * 0.43)
+        var path = Path()
+        path.addEllipse(in: CGRect(
+            x: headCenter.x - head / 2, y: headCenter.y - head / 2, width: head, height: head
+        ))
+        path.addEllipse(in: CGRect(
+            x: headCenter.x - head * 1.15, y: headCenter.y + head * 0.6,
+            width: head * 2.3, height: head * 1.4
+        ))
+        return path.intersection(Path(rect))
+    }
+}
+
+extension RecordingCameraLayout.Placement {
+    var title: String {
+        switch self {
+        case .leading: "Left"
+        case .center: "Center"
+        case .trailing: "Right"
+        }
     }
 }
 

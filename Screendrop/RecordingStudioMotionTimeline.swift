@@ -32,6 +32,7 @@ nonisolated struct RecordingStudioMotionTimeline: Sendable {
         contentMode: RecordingStudioLayout.ContentMode,
         contentCropRect: CGRect,
         showsCamera: Bool,
+        cameraAspect: CGFloat = RecordingCameraLayoutResolver.defaultCameraAspect,
         layoutTimeline: RecordingCameraLayoutTimeline,
         cues: [ZoomCue],
         capture: PointerCaptureFile,
@@ -48,7 +49,9 @@ nonisolated struct RecordingStudioMotionTimeline: Sendable {
             contentCropRect: contentCropRect
         )
         let crop = base.contentCropRect
-        let resolver = RecordingCameraLayoutResolver(base: base, style: style, showsCamera: showsCamera)
+        let resolver = RecordingCameraLayoutResolver(
+            base: base, style: style, showsCamera: showsCamera, cameraAspect: cameraAspect
+        )
         // Retain original subject points. Bounds apply to the destination
         // rectangle after camera clearance, never to the subject beforehand.
         let targets = ViewportTimeline.build(
@@ -186,7 +189,8 @@ nonisolated struct RecordingStudioMotionTimeline: Sendable {
                 screenOpacity: a.frame.screenOpacity + (b.frame.screenOpacity - a.frame.screenOpacity) * t,
                 cameraRect: a.frame.cameraRect.motionLerp(b.frame.cameraRect, t),
                 cameraCornerRadius: a.frame.cameraCornerRadius + (b.frame.cameraCornerRadius - a.frame.cameraCornerRadius) * t,
-                cameraOpacity: a.frame.cameraOpacity + (b.frame.cameraOpacity - a.frame.cameraOpacity) * t
+                cameraOpacity: a.frame.cameraOpacity + (b.frame.cameraOpacity - a.frame.cameraOpacity) * t,
+                cameraCutout: a.frame.cameraCutout + (b.frame.cameraCutout - a.frame.cameraCutout) * t
             ),
             drawRect: a.drawRect.motionLerp(b.drawRect, t),
             isLayoutSettled: a.isLayoutSettled && b.isLayoutSettled,
@@ -244,7 +248,10 @@ nonisolated struct RecordingStudioMotionTimeline: Sendable {
         let card = frame.screenRect
         let center = CGPoint(x: card.midX, y: card.midY)
         guard frame.cameraOpacity > 0.001 else { return center }
-        let camera = card.intersection(frame.cameraRect)
+        // A cutout's frame is mostly empty background either side of the
+        // person, who stands in its middle.
+        let occupied = frame.cameraRect.insetBy(dx: frame.cameraRect.width * 0.2 * frame.cameraCutout, dy: 0)
+        let camera = card.intersection(occupied)
         guard !camera.isNull, camera.width > 0, camera.height > 0 else { return center }
         let regions = [
             CGRect(x: card.minX, y: card.minY, width: camera.minX - card.minX, height: card.height),
@@ -312,6 +319,7 @@ nonisolated private struct StudioLayoutSpring {
     private var radius: DampedSpring
     private var screenOpacity: DampedSpring
     private var cameraOpacity: DampedSpring
+    private var cameraCutout: DampedSpring
 
     init(_ frame: RecordingCameraLayoutFrame) {
         screen = StudioRectSpring(frame.screenRect)
@@ -319,12 +327,14 @@ nonisolated private struct StudioLayoutSpring {
         radius = DampedSpring(position: frame.cameraCornerRadius)
         screenOpacity = DampedSpring(position: frame.screenOpacity)
         cameraOpacity = DampedSpring(position: frame.cameraOpacity)
+        cameraCutout = DampedSpring(position: frame.cameraCutout)
     }
 
     var frame: RecordingCameraLayoutFrame {
         RecordingCameraLayoutFrame(
             screenRect: screen.rect, screenOpacity: screenOpacity.position,
-            cameraRect: camera.rect, cameraCornerRadius: radius.position, cameraOpacity: cameraOpacity.position
+            cameraRect: camera.rect, cameraCornerRadius: radius.position, cameraOpacity: cameraOpacity.position,
+            cameraCutout: min(max(cameraCutout.position, 0), 1)
         )
     }
 
@@ -334,12 +344,14 @@ nonisolated private struct StudioLayoutSpring {
         radius.motionStep(toward: frame.cameraCornerRadius, dt: dt)
         screenOpacity.motionStep(toward: frame.screenOpacity, dt: dt)
         cameraOpacity.motionStep(toward: frame.cameraOpacity, dt: dt)
+        cameraCutout.motionStep(toward: frame.cameraCutout, dt: dt)
     }
 
     func isSettled(on frame: RecordingCameraLayoutFrame) -> Bool {
         screen.isSettled(on: frame.screenRect) && camera.isSettled(on: frame.cameraRect)
             && radius.isSettled(on: frame.cameraCornerRadius)
             && screenOpacity.isSettled(on: frame.screenOpacity) && cameraOpacity.isSettled(on: frame.cameraOpacity)
+            && cameraCutout.isSettled(on: frame.cameraCutout)
     }
 }
 

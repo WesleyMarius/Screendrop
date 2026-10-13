@@ -67,6 +67,8 @@ final class RecordingStudioModel {
     private(set) var hasCameraVideo = false
     private(set) var hasRecordedAudio = false
     private(set) var cameraOffset: TimeInterval = 0
+    /// The camera picture's width over its height, which a cutout takes.
+    private(set) var cameraVideoAspect = RecordingCameraLayoutResolver.defaultCameraAspect
     private(set) var isLoaded = false
     private(set) var loadError: String?
 
@@ -366,6 +368,12 @@ final class RecordingStudioModel {
         if let session, session.hasCamera {
             hasCameraVideo = true
             cameraOffset = manifest?.cameraLeadIn ?? 0
+            if let aspect = await RecordingCameraVideo.aspect(of: session.cameraURL) {
+                guard !isTornDown, !Task.isCancelled else { return }
+                cameraVideoAspect = aspect
+            }
+            // A cutout's first frame shouldn't wait on Vision loading its model.
+            StudioCameraMatteGenerator.prewarm()
             cameraPlayer.replaceCurrentItem(with: AVPlayerItem(url: session.cameraURL))
             cameraPlayer.actionAtItemEnd = .pause
             cameraPlayer.isMuted = true
@@ -2029,6 +2037,7 @@ final class RecordingStudioModel {
             screenURL: screenURL,
             cameraURL: showsCameraLayer && cameraLayoutTimeline.usesCamera ? session?.cameraURL : nil,
             cameraOffset: cameraOffset,
+            cameraAspect: cameraVideoAspect,
             style: style,
             cameraLayoutTimeline: cameraLayoutTimeline,
             viewportTimeline: zoomEnabled ? viewportTimeline : .identity,
@@ -2071,6 +2080,7 @@ final class RecordingStudioModel {
             contentMode: fitContentAspect != nil && reframe == nil ? .fit : .fill,
             contentCropRect: videoCropRect,
             showsCamera: showsCameraLayer,
+            cameraAspect: cameraVideoAspect,
             layoutTimeline: cameraLayoutTimeline,
             cues: zoomEnabled ? zoomCues : [],
             capture: pointerCapture,

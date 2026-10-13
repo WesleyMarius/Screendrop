@@ -69,11 +69,13 @@ enum RecordingSessionRenderer {
             throw RecordingStudioExporter.ExportError.noVideoTrack
         }
 
+        var cameraAspect: CGFloat?
         if session.hasCamera {
             let cameraAsset = AVURLAsset(url: session.cameraURL)
             guard try await !cameraAsset.loadTracks(withMediaType: .video).isEmpty else {
                 throw RenderError.missingCameraTrack
             }
+            cameraAspect = await RecordingCameraVideo.aspect(of: session.cameraURL)
         }
 
         let canvasSize = try await outputSize(for: asset, manifest: manifest)
@@ -168,6 +170,7 @@ enum RecordingSessionRenderer {
             contentMode: fitContentAspect != nil && reframe == nil ? .fit : .fill,
             contentCropRect: videoCropRect,
             showsCamera: style.camera.isVisible,
+            cameraAspect: cameraAspect ?? RecordingCameraLayoutResolver.defaultCameraAspect,
             layoutTimeline: cameraLayoutTimeline,
             cues: zoomEnabled ? zoomCues : [],
             capture: capture,
@@ -178,6 +181,7 @@ enum RecordingSessionRenderer {
             screenURL: session.screenURL,
             cameraURL: style.camera.isVisible && cameraLayoutTimeline.usesCamera ? session.cameraURL : nil,
             cameraOffset: manifest?.cameraLeadIn ?? 0,
+            cameraAspect: cameraAspect,
             style: style,
             cameraLayoutTimeline: cameraLayoutTimeline,
             viewportTimeline: viewportTimeline,

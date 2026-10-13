@@ -27,6 +27,9 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         /// The screen and a tall camera card side by side (stacked on a
         /// portrait canvas).
         case split
+        /// The screen with the person cut out of the camera's background,
+        /// standing on the canvas's bottom edge.
+        case cutout
     }
 
     enum Corner: String, Codable, CaseIterable, Sendable {
@@ -49,6 +52,13 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         case trailing
     }
 
+    /// Where a cutout stands along the bottom edge.
+    enum Placement: String, Codable, CaseIterable, Sendable {
+        case leading
+        case center
+        case trailing
+    }
+
     /// How the screen takes the space a split gives it.
     enum ScreenFit: String, Codable, CaseIterable, Sendable {
         /// The whole recording, letterboxed by the camera card's height.
@@ -60,6 +70,7 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
     static let sizeRange: ClosedRange<Double> = 0.12...0.45
     static let splitRatioRange: ClosedRange<Double> = 0.45...1.2
     static let spacingRange: ClosedRange<Double> = 0...0.12
+    static let cutoutSizeRange: ClosedRange<Double> = 0.3...0.9
 
     var kind: Kind
     var corner: Corner
@@ -75,6 +86,10 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
     /// Split: one gap, as a fraction of the canvas's smaller dimension,
     /// around the frame and between the two cards.
     var spacing: Double
+    var placement: Placement
+    /// Cutout camera frame height as a fraction of the canvas's smaller
+    /// dimension.
+    var cutoutSize: Double
 
     init(
         kind: Kind = .pictureInPicture,
@@ -84,7 +99,9 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         side: Side = .trailing,
         splitRatio: Double = 0.75,
         screenFit: ScreenFit = .fill,
-        spacing: Double = 0.04
+        spacing: Double = 0.04,
+        placement: Placement = .trailing,
+        cutoutSize: Double = 0.6
     ) {
         self.kind = kind
         self.corner = corner
@@ -94,6 +111,8 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         self.splitRatio = Self.clamped(splitRatio, to: Self.splitRatioRange, fallback: 0.75)
         self.screenFit = screenFit
         self.spacing = Self.clamped(spacing, to: Self.spacingRange, fallback: 0.04)
+        self.placement = placement
+        self.cutoutSize = Self.clamped(cutoutSize, to: Self.cutoutSizeRange, fallback: 0.6)
     }
 
     static let screenOnly = RecordingCameraLayout(kind: .screen)
@@ -121,7 +140,7 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case kind, corner, shape, size, side, splitRatio, screenFit, spacing
+        case kind, corner, shape, size, side, splitRatio, screenFit, spacing, placement, cutoutSize
     }
 
     init(from decoder: any Decoder) throws {
@@ -137,6 +156,7 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         let shape: Shape? = value(.shape)
         let side: Side? = value(.side)
         let screenFit: ScreenFit? = value(.screenFit)
+        let placement: Placement? = value(.placement)
         self.init(
             kind: kind ?? .pictureInPicture,
             corner: corner ?? .bottomTrailing,
@@ -145,7 +165,9 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
             side: side ?? .trailing,
             splitRatio: try container.decodeIfPresent(Double.self, forKey: .splitRatio) ?? 0.75,
             screenFit: screenFit ?? .fill,
-            spacing: try container.decodeIfPresent(Double.self, forKey: .spacing) ?? 0.04
+            spacing: try container.decodeIfPresent(Double.self, forKey: .spacing) ?? 0.04,
+            placement: placement ?? .trailing,
+            cutoutSize: try container.decodeIfPresent(Double.self, forKey: .cutoutSize) ?? 0.6
         )
     }
 
@@ -159,6 +181,8 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
         try container.encode(splitRatio, forKey: .splitRatio)
         try container.encode(screenFit.rawValue, forKey: .screenFit)
         try container.encode(spacing, forKey: .spacing)
+        try container.encode(placement.rawValue, forKey: .placement)
+        try container.encode(cutoutSize, forKey: .cutoutSize)
     }
 
     private static func clamped(_ value: Double, to range: ClosedRange<Double>, fallback: Double) -> Double {
@@ -168,14 +192,16 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
 }
 
 extension RecordingCameraLayout {
-    /// The layout grid, in reading order.
+    /// The layout grid, in reading order: the whole-frame arrangements,
+    /// then the corner cameras.
     static let presets: [RecordingCameraLayout] = [
         .screenOnly,
         .cameraOnly,
+        RecordingCameraLayout(kind: .split),
+        RecordingCameraLayout(kind: .cutout),
         RecordingCameraLayout(kind: .pictureInPicture, shape: .square),
         RecordingCameraLayout(kind: .pictureInPicture, shape: .circle),
-        RecordingCameraLayout(kind: .pictureInPicture, shape: .portrait),
-        RecordingCameraLayout(kind: .split)
+        RecordingCameraLayout(kind: .pictureInPicture, shape: .portrait)
     ]
 
     var title: String {
@@ -189,6 +215,7 @@ extension RecordingCameraLayout {
             case .portrait: "Portrait"
             }
         case .split: "Split"
+        case .cutout: "Cutout"
         }
     }
 
@@ -199,6 +226,7 @@ extension RecordingCameraLayout {
         case .camera: "Camera full frame"
         case .pictureInPicture: "Screen with \(title.lowercased()) camera"
         case .split: "Screen and camera side by side"
+        case .cutout: "Screen with you cut out of the camera"
         }
     }
 
@@ -208,6 +236,7 @@ extension RecordingCameraLayout {
         case .camera: "person.crop.rectangle"
         case .pictureInPicture: shape == .circle ? "pip" : "rectangle.inset.bottomright.filled"
         case .split: "rectangle.split.2x1"
+        case .cutout: "person.and.background.dotted"
         }
     }
 
@@ -245,7 +274,7 @@ extension RecordingCameraLayout {
     static func suggestedCue(over base: RecordingCameraLayout) -> RecordingCameraLayout {
         switch base.kind {
         case .camera: base.adopting(RecordingCameraLayout(kind: .pictureInPicture))
-        case .screen, .pictureInPicture, .split: base.adopting(.cameraOnly)
+        case .screen, .pictureInPicture, .split, .cutout: base.adopting(.cameraOnly)
         }
     }
 }
@@ -293,6 +322,10 @@ nonisolated struct RecordingCameraLayoutFrame: Equatable, Sendable {
     var cameraRect: CGRect
     var cameraCornerRadius: CGFloat
     var cameraOpacity: CGFloat
+    /// 0 shows the whole camera picture in its frame; 1 shows only the
+    /// person, cut out of the background. A morph blends the two, so the
+    /// background melts away as the camera settles into a cutout.
+    var cameraCutout: CGFloat = 0
 
     /// Blends two frames. Something hidden at one end appears from (or
     /// leaves into) a slightly smaller copy of where it sits at the other,
@@ -310,10 +343,12 @@ nonisolated struct RecordingCameraLayoutFrame: Equatable, Sendable {
         if from.cameraOpacity <= 0.001 {
             from.cameraRect = to.cameraRect.scaledAboutCenter(0.82)
             from.cameraCornerRadius = to.cameraCornerRadius * 0.82
+            from.cameraCutout = to.cameraCutout
         }
         if to.cameraOpacity <= 0.001 {
             to.cameraRect = from.cameraRect.scaledAboutCenter(0.82)
             to.cameraCornerRadius = from.cameraCornerRadius * 0.82
+            to.cameraCutout = from.cameraCutout
         }
         // Fades run in the first part of the move, so a layer arriving is
         // solid well before it lands and one leaving is gone before it stops.
@@ -323,7 +358,8 @@ nonisolated struct RecordingCameraLayoutFrame: Equatable, Sendable {
             screenOpacity: from.screenOpacity.lerp(to: to.screenOpacity, fade),
             cameraRect: from.cameraRect.lerp(to: to.cameraRect, t),
             cameraCornerRadius: from.cameraCornerRadius.lerp(to: to.cameraCornerRadius, t),
-            cameraOpacity: from.cameraOpacity.lerp(to: to.cameraOpacity, fade)
+            cameraOpacity: from.cameraOpacity.lerp(to: to.cameraOpacity, fade),
+            cameraCutout: from.cameraCutout.lerp(to: to.cameraCutout, t)
         )
     }
 }
@@ -332,8 +368,15 @@ nonisolated struct RecordingCameraLayoutFrame: Equatable, Sendable {
 /// card the style and video crop produce), which every layout scales and
 /// moves rather than reshapes.
 nonisolated struct RecordingCameraLayoutResolver: Sendable {
+    /// Webcams almost always deliver 16:9; the real camera's aspect is
+    /// passed in wherever it's known.
+    static let defaultCameraAspect: CGFloat = 16 / 9
+
     let base: RecordingStudioLayout
     let showsCamera: Bool
+    /// The camera picture's width over its height. A cutout's frame takes
+    /// it exactly, so the whole picture shows and nothing is cropped.
+    let cameraAspect: CGFloat
     private let contentArea: CGRect
     private let minDimension: CGFloat
     private let roundness: CGFloat
@@ -341,9 +384,17 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
     /// The corner camera's scale once a zoom lands; 1 when it doesn't shrink.
     let zoomedCameraScale: CGFloat
 
-    init(base: RecordingStudioLayout, style: RecordingStudioStyle, showsCamera: Bool) {
+    init(
+        base: RecordingStudioLayout,
+        style: RecordingStudioStyle,
+        showsCamera: Bool,
+        cameraAspect: CGFloat = Self.defaultCameraAspect
+    ) {
         self.base = base
         self.showsCamera = showsCamera
+        self.cameraAspect = cameraAspect.isFinite && cameraAspect > 0
+            ? min(max(cameraAspect, 0.3), 3.5)
+            : Self.defaultCameraAspect
         let canvas = base.canvasSize
         minDimension = max(1, min(canvas.width, canvas.height))
         let inset = min(max(style.padding, 0), 0.475) * minDimension
@@ -426,6 +477,15 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
                 cameraOpacity: 1
             )
             return .interpolate(resting, zoomed, progress: CGFloat(zoomProgress))
+        case .cutout:
+            return RecordingCameraLayoutFrame(
+                screenRect: card,
+                screenOpacity: 1,
+                cameraRect: cutoutCamera(for: layout, scale: cameraScale(forZoomProgress: zoomProgress)),
+                cameraCornerRadius: 0,
+                cameraOpacity: 1,
+                cameraCutout: 1
+            )
         }
     }
 
@@ -477,6 +537,24 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
         let short = min(size.width, size.height)
         let radius = layout.shape == .circle ? short / 2 : max(4, roundness * short)
         return (CGRect(origin: CGPoint(x: x, y: y), size: size), radius)
+    }
+
+    /// The whole camera picture, standing on the canvas's bottom edge so the
+    /// edge crops the body where the picture ends. To the side, the frame
+    /// sits flush with the canvas edge when it fits, which puts the person
+    /// - usually mid-picture - well in from the edge; a frame wider than
+    /// that half of the canvas centers instead. It shrinks for a zoom
+    /// toward the edges it rests on.
+    private func cutoutCamera(for layout: RecordingCameraLayout, scale: CGFloat = 1) -> CGRect {
+        let canvas = base.canvasSize
+        let height = max(24, CGFloat(layout.cutoutSize) * minDimension) * scale
+        let width = height * cameraAspect
+        let midX: CGFloat = switch layout.placement {
+        case .leading: min(width / 2, canvas.width / 2)
+        case .center: canvas.width / 2
+        case .trailing: max(canvas.width - width / 2, canvas.width / 2)
+        }
+        return CGRect(x: midX - width / 2, y: canvas.height - height, width: width, height: height)
     }
 
     /// The screen card and a camera card side by side (stacked on a
@@ -570,8 +648,18 @@ extension RecordingStudioLayout {
             ),
             contentCropRect: contentCropRect,
             screenOpacity: frame.screenOpacity,
-            cameraOpacity: frame.cameraOpacity
+            cameraOpacity: frame.cameraOpacity,
+            cameraCutout: Self.melt(frame.cameraCutout)
         )
+    }
+
+    /// The background melts through the middle of a morph, so a framed
+    /// camera leaves framed and lands as just the person, and a cutout
+    /// leaves as the person and lands framed: the change is over before
+    /// the camera settles, either way.
+    nonisolated private static func melt(_ progress: CGFloat) -> CGFloat {
+        let t = min(max((progress - 0.2) / 0.6, 0), 1)
+        return t * t * (3 - 2 * t)
     }
 }
 
@@ -615,6 +703,11 @@ nonisolated struct RecordingCameraLayoutTimeline: Equatable, Sendable {
 
     var usesCamera: Bool {
         layouts.contains(where: \.showsCamera)
+    }
+
+    /// Whether any stretch needs the person segmented from the camera.
+    var usesCutout: Bool {
+        layouts.contains { $0.kind == .cutout }
     }
 
     static func blocks(

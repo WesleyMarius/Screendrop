@@ -223,3 +223,104 @@ kernel void studioMorphCamera(texture2d<float, access::sample> camera [[texture(
     result = result * (1.0f - border) + float4(border);
     output.write(result, pixel);
 }
+
+// MARK: - Camera cutout
+//
+// The person, cut out of the camera's background by Vision's person
+// segmentation. The matte is a few hundred pixels across, so it's sampled
+// bilinearly and its soft edge pulled into a tight one here, at whatever
+// size the camera is drawn: an upscaled matte stays crisp instead of
+// growing a halo of the room behind.
+
+constant float cutoutEdgeLow = 0.45f;
+constant float cutoutEdgeHigh = 0.85f;
+
+// Fades the picture out toward each edge that stands inside the canvas, so
+// shoulders running off the camera's frame soften away instead of ending
+// in a straight cut. `feather` is (left, right, top, bottom) as fractions of
+// the picture; 0 leaves an edge the canvas already crops.
+static float cutoutFeather(float2 uv, float4 feather) {
+    float fade = 1.0f;
+    if (feather.x > 0) fade *= smoothstep(0.0f, feather.x, uv.x);
+    if (feather.y > 0) fade *= smoothstep(0.0f, feather.y, 1.0f - uv.x);
+    if (feather.z > 0) fade *= smoothstep(0.0f, feather.z, uv.y);
+    if (feather.w > 0) fade *= smoothstep(0.0f, feather.w, 1.0f - uv.y);
+    return fade;
+}
+
+// The person's shadow source: the refined matte, resampled to the
+// picture's own aspect (Vision's matte is 4:3 whatever the camera) so the
+// blur that follows is round.
+kernel void studioCutoutShadowSource(texture2d<float, access::sample> matte [[texture(0)]],
+                                     texture2d<float, access::write> output [[texture(1)]],
+                                     uint2 pixel [[thread_position_in_grid]]) {
+    if (pixel.x >= output.get_width() || pixel.y >= output.get_height()) return;
+    constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 uv = (float2(pixel) + 0.5f) / float2(output.get_width(), output.get_height());
+    float person = smoothstep(cutoutEdgeLow, cutoutEdgeHigh, matte.sample(linear, uv).r);
+    output.write(float4(person), pixel);
+}
+
+// The camera on its way to (or settled as) a cutout: `studioMorphCamera`
+// with the background melting away by `cutout`, and the framed camera's
+// shadow and border giving way to one the person casts.
+// shape[0] is the bubble; shape[1] is (radius, opacity, borderWidth,
+// borderAlpha); shape[2] the framed shadow; shape[3] is (regionX, regionY,
+// cutout, hasBelow); shape[4] the feather; shape[5] is the person's shadow
+// (offsetDown as a fraction of the picture, alpha, -, -); shape[6] the
+// picture the shadow lands on, where the whole camera frame is drawn.
+// Without `hasBelow` it draws over nothing, for the preview's own layer.
+kernel void studioCutoutCamera(texture2d<float, access::sample> camera [[texture(0)]],
+                               texture2d<float, access::read> below [[texture(1)]],
+                               texture2d<float, access::write> output [[texture(2)]],
+                               texture2d<float, access::sample> matte [[texture(3)]],
+                               texture2d<float, access::sample> shadowMatte [[texture(4)]],
+                               constant float4 *rects [[buffer(0)]],
+                               constant uint &count [[buffer(1)]],
+                               constant float4 *shape [[buffer(2)]],
+                               uint2 position [[thread_position_in_grid]]) {
+    uint2 pixel = position + uint2(shape[3].xy);
+    if (pixel.x >= output.get_width() || pixel.y >= output.get_height()) return;
+    constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 center = float2(pixel) + 0.5f;
+    float4 bubble = shape[0];
+    float radius = shape[1].x;
+    float opacity = shape[1].y;
+    float cutout = shape[3].z;
+    float4 feather = shape[4];
+    float4 result = shape[3].w > 0 ? below.read(pixel) : float4(0);
+    result = castShadow(result, center, bubble, radius, shape[2]);
+    if (shape[5].y > 0) {
+        float4 picture = shape[6];
+        float2 uv = (center - picture.xy) / picture.zw - float2(0, shape[5].x);
+        float inside = all(uv >= 0.0f) && all(uv <= 1.0f) ? 1.0f : 0.0f;
+        float cast = shape[5].y * shadowMatte.sample(linear, uv).r * cutoutFeather(uv, feather) * inside;
+        // Black at `cast` over the frame: over an opaque frame the same as
+        // darkening it, and it still shows over the preview's clear layer.
+        result = result * (1.0f - cast) + float4(0, 0, 0, cast);
+    }
+    float coverage = clamp(0.5f - roundedRectDistance(center, bubble, radius), 0.0f, 1.0f);
+    if (coverage > 0) {
+        for (uint i = 0; i < count; ++i) {
+            float4 rect = rects[i];
+            float2 edge = clamp(min(center - rect.xy, rect.xy + rect.zw - center) + 0.5f, 0.0f, 1.0f);
+            float2 uv = (center - rect.xy) / rect.zw;
+            float person = cutout > 0
+                ? smoothstep(cutoutEdgeLow, cutoutEdgeHigh, matte.sample(linear, uv).r) * cutoutFeather(uv, feather)
+                : 1.0f;
+            // Sample i at 1/(i+1) keeps the running average; the first
+            // carries the fade.
+            float alpha = coverage * edge.x * edge.y * mix(1.0f, person, cutout)
+                * (i == 0 ? opacity : 1.0f / float(i + 1));
+            if (alpha == 0) continue;
+            float4 value = reconstruct(camera, uv, rect.zw);
+            result = clamp(value * alpha + result * (1.0f - value.a * alpha), 0.0f, 1.0f);
+        }
+    }
+    float width = shape[1].z;
+    float4 inset = bubble + float4(0.5f, 0.5f, -1.0f, -1.0f);
+    float border = clamp(width * 0.5f + 0.5f - abs(roundedRectDistance(center, inset, radius)), 0.0f, 1.0f)
+        * shape[1].w;
+    result = result * (1.0f - border) + float4(border);
+    output.write(result, pixel);
+}

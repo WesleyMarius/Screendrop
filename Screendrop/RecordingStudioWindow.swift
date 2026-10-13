@@ -465,7 +465,10 @@ private struct StudioCanvasComposition: View {
     }
 
     private var resolver: RecordingCameraLayoutResolver {
-        RecordingCameraLayoutResolver(base: baseLayout, style: model.style, showsCamera: model.showsCameraLayer)
+        RecordingCameraLayoutResolver(
+            base: baseLayout, style: model.style, showsCamera: model.showsCameraLayer,
+            cameraAspect: model.cameraVideoAspect
+        )
     }
 
     /// Where the layout timeline puts everything at the playhead. Cropping
@@ -564,7 +567,9 @@ private struct StudioCanvasComposition: View {
             morphFromEdit(previous: targetFrame(resolver, timeline: old), resolver: resolver)
         }
         .onChange(of: model.showsCameraLayer) { old, _ in
-            let previous = RecordingCameraLayoutResolver(base: resolver.base, style: model.style, showsCamera: old)
+            let previous = RecordingCameraLayoutResolver(
+                base: resolver.base, style: model.style, showsCamera: old, cameraAspect: model.cameraVideoAspect
+            )
             morphFromEdit(previous: targetFrame(previous, timeline: model.cameraLayoutTimeline), resolver: resolver)
         }
     }
@@ -1188,6 +1193,10 @@ private enum StudioCursorImageCache {
 /// anywhere; it settles into whichever corner of the screen card it was let
 /// go nearest, with that corner previewed while dragging. Other layouts
 /// place the camera themselves, so there it takes no clicks at all.
+///
+/// A cutout draws the person into a layer over the framed picture, which
+/// fades out as far as the camera is cut out. Until the cutout's first
+/// frame is ready the framed picture stays, so the camera never blinks out.
 private struct StudioCameraBubble: View {
     @Bindable var model: RecordingStudioModel
     let layout: RecordingStudioLayout
@@ -1201,12 +1210,16 @@ private struct StudioCameraBubble: View {
 
     @State private var dragOffset: CGSize?
     @State private var isHovering = false
+    @State private var isCutoutReady = false
 
     var body: some View {
         let rect = layout.bubbleRect.offsetBy(dx: dragOffset?.width ?? 0, dy: dragOffset?.height ?? 0)
         let canvas = layout.canvasSize
         let isActive = isMovable && (isHovering || dragOffset != nil)
         let radius = layout.bubbleCornerRadius
+        let cutout = layout.cameraCutout
+        let showsCutout = cutout > 0.001
+        let framedOpacity = showsCutout && isCutoutReady ? 1 - cutout : 1
 
         ZStack(alignment: .topLeading) {
             if dragOffset != nil {
@@ -1247,6 +1260,7 @@ private struct StudioCameraBubble: View {
                     radius: min(canvas.width, canvas.height) * 0.022,
                     y: min(canvas.width, canvas.height) * 0.009
                 )
+                .opacity(framedOpacity)
                 .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                 .onHover { isHovering = $0 }
                 .pointerStyle(isMovable ? (dragOffset == nil ? PointerStyle.grabIdle : .grabActive) : nil)
@@ -1258,8 +1272,38 @@ private struct StudioCameraBubble: View {
                 // through to the canvas, which plays and pauses.
                 .allowsHitTesting(isMovable)
                 .offset(x: rect.minX, y: rect.minY)
+
+            if showsCutout {
+                StudioCameraCutoutView(
+                    player: model.cameraPlayer,
+                    parameters: cutoutParameters(rect: rect, radius: radius, cutout: cutout),
+                    onReady: {
+                        withAnimation(.easeOut(duration: 0.15)) { isCutoutReady = true }
+                    }
+                )
+                .frame(width: rect.width, height: rect.height)
+                .allowsHitTesting(false)
+                .offset(x: rect.minX, y: rect.minY)
+            }
         }
         .frame(width: canvas.width, height: canvas.height, alignment: .topLeading)
+        .onChange(of: showsCutout) { _, shows in
+            if !shows { isCutoutReady = false }
+        }
+    }
+
+    /// The export's feather and shadow for where the picture sits now.
+    private func cutoutParameters(rect: CGRect, radius: CGFloat, cutout: CGFloat) -> StudioCutoutLayerParameters {
+        let aspect = model.cameraVideoAspect
+        let fill = max(rect.width / aspect, rect.height)
+        let picture = CGRect(
+            x: rect.midX - fill * aspect / 2, y: rect.midY - fill / 2, width: fill * aspect, height: fill
+        )
+        return StudioCutoutLayerParameters(
+            cornerRadius: radius,
+            feather: StudioCutoutStyle.feather(picture: picture, canvas: layout.canvasSize),
+            shadowAlpha: StudioCutoutStyle.shadowAlpha * cutout
+        )
     }
 
     /// The card corner nearest the camera's center.

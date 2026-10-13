@@ -509,6 +509,9 @@ nonisolated struct RecordingStudioLayout: Sendable, Equatable {
     /// and no camera until a frame is applied.
     var screenOpacity: CGFloat = 1
     var cameraOpacity: CGFloat = 1
+    /// How far the camera is cut out of its background; see
+    /// RecordingCameraLayoutFrame.cameraCutout.
+    var cameraCutout: CGFloat = 0
 
     /// How content occupies a card whose aspect differs from the video's.
     enum ContentMode: Sendable {
