@@ -571,13 +571,22 @@ private struct MiniatureCutout: View {
 }
 
 /// Head and shoulders, drawn the way Apple's person glyph is: a round head
-/// over domed shoulders. Sized by the frame's height - capped by its width,
-/// so a tall card gets a person, not a wide one - centred where people sit
-/// in front of a webcam, and always cropped by the frame's bottom edge.
+/// over domed shoulders, framed in a 16:9 camera picture. The picture
+/// aspect-fills the frame as the camera itself does, so a thin card shows
+/// the same person closer up, cropped at its sides, never a stretched one,
+/// and the frame's bottom edge always crops the shoulders.
 struct StudioPersonSilhouette: Shape {
+    var pictureAspect: CGFloat = 16 / 9
+
     func path(in rect: CGRect) -> Path {
-        let head = min(rect.height * 0.36, rect.width * 0.4)
-        let center = CGPoint(x: rect.midX, y: rect.minY + rect.height * 0.41)
+        guard rect.width > 0, rect.height > 0 else { return Path() }
+        let fill = max(rect.width / pictureAspect, rect.height)
+        let picture = CGRect(
+            x: rect.midX - fill * pictureAspect / 2, y: rect.midY - fill / 2,
+            width: fill * pictureAspect, height: fill
+        )
+        let head = picture.height * 0.36
+        let center = CGPoint(x: picture.midX, y: picture.minY + picture.height * 0.41)
         let shouldersTop = center.y + head * 0.5 + head * 0.13
         var path = Path(ellipseIn: CGRect(
             x: center.x - head / 2, y: center.y - head / 2, width: head, height: head
@@ -585,7 +594,7 @@ struct StudioPersonSilhouette: Shape {
         path.addPath(Path(
             roundedRect: CGRect(
                 x: center.x - head * 0.95, y: shouldersTop,
-                width: head * 1.9, height: rect.maxY - shouldersTop + head
+                width: head * 1.9, height: picture.maxY - shouldersTop + head
             ),
             cornerRadius: head * 0.82,
             style: .continuous
