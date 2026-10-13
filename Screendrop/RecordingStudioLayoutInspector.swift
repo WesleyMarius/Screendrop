@@ -16,28 +16,24 @@ struct StudioCameraLayoutPicker: View {
     /// `isContinuous` is true while a slider is being dragged.
     let onChange: (RecordingCameraLayout, _ isContinuous: Bool) -> Void
 
-    private static let tileSpacing: CGFloat = 8
     private let columns = Array(
-        repeating: GridItem(.flexible(), spacing: Self.tileSpacing),
+        repeating: GridItem(.flexible(), spacing: 10, alignment: .top),
         count: 3
     )
 
     var body: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
-            LazyVGrid(columns: columns, spacing: Self.tileSpacing) {
+            LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(RecordingCameraLayout.presets, id: \.self) { preset in
                     let candidate = layout.adopting(preset)
-                    let isSelected = layout.matches(preset: preset)
-                    InspectorTile(
-                        title: preset.detailedTitle,
+                    StudioCameraLayoutTile(
+                        layout: candidate,
+                        title: preset.title,
                         aspectRatio: tileAspect,
-                        isSelected: isSelected,
-                        action: {
-                            guard candidate != layout else { return }
-                            onChange(candidate, false)
-                        }
+                        isSelected: layout.matches(preset: preset)
                     ) {
-                        StudioCameraLayoutSchematic(layout: candidate, isSelected: isSelected)
+                        guard candidate != layout else { return }
+                        onChange(candidate, false)
                     }
                 }
             }
@@ -181,18 +177,76 @@ struct StudioCameraLayoutPicker: View {
     }
 }
 
-/// A miniature of a layout, drawn by the real resolver on an idealized
-/// frame so every tile shares one padding and one set of corners whatever
-/// the project's own style. Neutral throughout; the camera takes the accent
-/// on the selected tile.
-struct StudioCameraLayoutSchematic: View {
+/// One layout in the picker: a tiny scene above its name. Unpicked scenes
+/// rest muted; the picked one comes into colour and its camera bounces in.
+private struct StudioCameraLayoutTile: View {
+    let layout: RecordingCameraLayout
+    let title: String
+    let aspectRatio: CGFloat
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+    private static let radius: CGFloat = 10
+    private static let ringGap: CGFloat = 3
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 7) {
+                StudioCameraLayoutScene(layout: layout, isSelected: isSelected)
+                    .aspectRatio(aspectRatio, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: Self.radius, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(isHovering && !isSelected ? 0.16 : 0.07), lineWidth: 0.5)
+                    }
+                    .saturation(isSelected ? 1 : isHovering ? 0.7 : 0.25)
+                    .padding(Self.ringGap)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.radius + Self.ringGap, style: .continuous)
+                            .strokeBorder(InspectorControlPalette.selectionRing, lineWidth: 2)
+                            .opacity(isSelected ? 1 : 0)
+                    }
+
+                Text(title)
+                    .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
+                    .foregroundStyle(isSelected ? Palette.label : Palette.secondaryLabel)
+                    .lineLimit(1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(StudioCameraLayoutTileButtonStyle())
+        .onHover { isHovering = $0 }
+        .animation(.easeOut(duration: 0.18), value: isHovering)
+        .animation(.easeOut(duration: 0.22), value: isSelected)
+        .help(layout.detailedTitle)
+        .accessibilityLabel(layout.detailedTitle)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+private struct StudioCameraLayoutTileButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: configuration.isPressed)
+    }
+}
+
+/// A layout drawn by the real resolver on an idealized frame, so every
+/// tile shares one padding and one set of corners whatever the project's
+/// own style: a soft backdrop, a little app window, and a camera with a
+/// person in it.
+struct StudioCameraLayoutScene: View {
     let layout: RecordingCameraLayout
     var isSelected = false
+
+    @Environment(\.colorScheme) private var colorScheme
 
     private static let style: RecordingStudioStyle = {
         var style = RecordingStudioStyle(background: .none)
         style.padding = 0.1
-        style.cornerRadius = 0.05
+        style.cornerRadius = 0.06
         style.camera.roundness = 0.3
         style.camera.shrinksDuringZoom = false
         return style
@@ -209,53 +263,156 @@ struct StudioCameraLayoutSchematic: View {
     var body: some View {
         GeometryReader { proxy in
             let size = proxy.size
-            let base = RecordingStudioLayout.make(
-                canvasSize: size,
-                style: Self.style,
-                usesUniformPadding: true
-            )
+            let base = RecordingStudioLayout.make(canvasSize: size, style: Self.style, usesUniformPadding: true)
             let frame = RecordingCameraLayoutResolver(base: base, style: Self.style, showsCamera: true)
                 .frame(for: miniature)
-            let radius = base.cardCornerRadius
 
             ZStack(alignment: .topLeading) {
-                Color.primary.opacity(0.035)
+                backdrop
 
                 if frame.screenOpacity > 0.001 {
-                    let card = frame.screenRect
-                    RoundedRectangle(cornerRadius: radius, style: .continuous)
-                        .fill(Color.primary.opacity(0.09))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: radius, style: .continuous)
-                                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5)
-                        }
-                        .overlay {
-                            Image(systemName: "cursorarrow")
-                                .font(.system(size: max(6, min(card.width, card.height) * 0.22), weight: .semibold))
-                                .foregroundStyle(Color.primary.opacity(0.3))
-                        }
-                        .frame(width: card.width, height: card.height)
-                        .offset(x: card.minX, y: card.minY)
+                    MiniatureWindow(radius: base.cardCornerRadius, isDark: isDark)
+                        .frame(width: frame.screenRect.width, height: frame.screenRect.height)
+                        .offset(x: frame.screenRect.minX, y: frame.screenRect.minY)
                 }
 
                 let camera = frame.cameraRect
                 if frame.cameraOpacity > 0.001, camera.width > 0 {
-                    RoundedRectangle(cornerRadius: frame.cameraCornerRadius, style: .continuous)
-                        .fill(isSelected ? AnyShapeStyle(Palette.accent) : AnyShapeStyle(Color.primary.opacity(0.26)))
-                        .overlay {
-                            Image(systemName: "person.fill")
-                                .font(.system(size: max(5, min(camera.width, camera.height) * 0.42)))
-                                .foregroundStyle(Color.white.opacity(0.92))
-                                .offset(y: min(camera.width, camera.height) * 0.1)
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: frame.cameraCornerRadius, style: .continuous))
+                    MiniatureCamera(radius: frame.cameraCornerRadius, isDark: isDark)
                         .frame(width: camera.width, height: camera.height)
+                        .modifier(SelectionBounce(isSelected: isSelected))
                         .offset(x: camera.minX, y: camera.minY)
                 }
             }
             .frame(width: size.width, height: size.height)
         }
         .accessibilityHidden(true)
+    }
+
+    private var isDark: Bool { colorScheme == .dark }
+
+    private var backdrop: some View {
+        LinearGradient(
+            colors: isDark
+                ? [Color(red: 0.25, green: 0.22, blue: 0.33), Color(red: 0.33, green: 0.24, blue: 0.24)]
+                : [Color(red: 0.86, green: 0.84, blue: 0.97), Color(red: 0.99, green: 0.87, blue: 0.80)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+}
+
+/// Pops the camera when its tile is picked.
+private struct SelectionBounce: ViewModifier {
+    let isSelected: Bool
+    @State private var scale: CGFloat = 1
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(scale)
+            .onChange(of: isSelected) { _, selected in
+                guard selected else { return }
+                withAnimation(.snappy(duration: 0.12)) { scale = 1.1 } completion: {
+                    withAnimation(.bouncy(duration: 0.4, extraBounce: 0.15)) { scale = 1 }
+                }
+            }
+    }
+}
+
+/// A tiny app window: title bar with traffic lights, a sidebar, a few lines
+/// of text, and the pointer the recording is about.
+private struct MiniatureWindow: View {
+    let radius: CGFloat
+    let isDark: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let size = proxy.size
+            let unit = min(size.width, size.height)
+            let bar = max(4, unit * 0.14)
+            let dot = bar * 0.42
+            let line = max(1.5, unit * 0.045)
+            let showsSidebar = size.width > size.height * 0.9
+
+            ZStack(alignment: .topLeading) {
+                (isDark ? Color(white: 0.17) : Color.white)
+
+                HStack(spacing: dot * 0.55) {
+                    ForEach([Color(red: 1, green: 0.37, blue: 0.34),
+                             Color(red: 1, green: 0.74, blue: 0.18),
+                             Color(red: 0.16, green: 0.79, blue: 0.25)], id: \.self) { color in
+                        Circle().fill(color).frame(width: dot, height: dot)
+                    }
+                }
+                .padding(.leading, bar * 0.45)
+                .frame(height: bar)
+
+                HStack(alignment: .top, spacing: 0) {
+                    if showsSidebar {
+                        Rectangle()
+                            .fill(Color.primary.opacity(isDark ? 0.06 : 0.04))
+                            .frame(width: size.width * 0.24)
+                    }
+                    VStack(alignment: .leading, spacing: line * 1.3) {
+                        ForEach([0.72, 0.5, 0.62], id: \.self) { fraction in
+                            Capsule()
+                                .fill(Color.primary.opacity(isDark ? 0.16 : 0.1))
+                                .frame(width: size.width * (showsSidebar ? 0.6 : 0.78) * fraction, height: line)
+                        }
+                    }
+                    .padding(.top, line * 2)
+                    .padding(.leading, line * 2.4)
+                }
+                .padding(.top, bar)
+
+                Image(systemName: "cursorarrow")
+                    .font(.system(size: max(6, unit * 0.17), weight: .semibold))
+                    .foregroundStyle(isDark ? Color.white : Color.black.opacity(0.8))
+                    .shadow(color: .black.opacity(0.15), radius: 0.5, y: 0.5)
+                    .position(x: size.width * (showsSidebar ? 0.55 : 0.5), y: size.height * 0.66)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        }
+        .shadow(color: .black.opacity(isDark ? 0.35 : 0.12), radius: 3, y: 1.5)
+    }
+}
+
+/// The camera: a person against a warm wall, cropped by the camera's shape
+/// like a real webcam, with the export's light rim and soft shadow.
+private struct MiniatureCamera: View {
+    let radius: CGFloat
+    let isDark: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let size = proxy.size
+            let head = min(size.width, size.height) * 0.36
+            let headY = size.height * 0.5 - head * 0.12
+
+            ZStack {
+                LinearGradient(
+                    colors: isDark
+                        ? [Color(red: 0.47, green: 0.40, blue: 0.37), Color(red: 0.32, green: 0.27, blue: 0.26)]
+                        : [Color(red: 0.84, green: 0.76, blue: 0.70), Color(red: 0.66, green: 0.57, blue: 0.53)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                Ellipse()
+                    .fill(Color.white.opacity(0.88))
+                    .frame(width: head * 2.15, height: head * 1.4)
+                    .position(x: size.width / 2, y: headY + head * 1.28)
+                Circle()
+                    .fill(Color.white.opacity(0.95))
+                    .frame(width: head, height: head)
+                    .position(x: size.width / 2, y: headY)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.55), lineWidth: 1)
+            }
+        }
+        .shadow(color: .black.opacity(isDark ? 0.4 : 0.2), radius: 3, y: 1.5)
     }
 }
 
