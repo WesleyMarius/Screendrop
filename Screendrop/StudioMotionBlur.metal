@@ -88,3 +88,138 @@ kernel void studioMotionBlur(texture2d<float, access::sample> source [[texture(0
     }
     output.write(result, pixel);
 }
+
+// MARK: - Layout morphs
+//
+// While a layout morphs, the card and camera change shape every frame, so
+// their clips and shadows can't be cached. Both are computed here from the
+// shape instead of drawn by Core Graphics on the CPU at canvas size.
+
+// Abramowitz & Stegun 7.1.26; Metal has no erf.
+static float erfApprox(float x) {
+    float s = sign(x);
+    x = abs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * x);
+    float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t
+                      + 0.254829592f) * t * exp(-x * x);
+    return s * y;
+}
+
+// Signed distance to a rounded rect (x, y, width, height), negative inside.
+static float roundedRectDistance(float2 p, float4 rect, float radius) {
+    float2 halfSize = rect.zw * 0.5f;
+    float r = min(radius, min(halfSize.x, halfSize.y));
+    float2 q = abs(p - rect.xy - halfSize) - halfSize + r;
+    return length(max(q, 0.0f)) + min(max(q.x, q.y), 0.0f) - r;
+}
+
+// Core Graphics' shadow blur is a Gaussian with sigma = blur / 2, cut off
+// at about 1.05 x blur. `shadow` is (offsetDown, sigma, cutoff, alpha).
+// The fraction of the kernel below x:
+static float shadowCDF(float x, float sigma, float cutoff) {
+    float scale = 1.0f / (sigma * M_SQRT2_F);
+    return 0.5f + 0.5f * erfApprox(clamp(x, -cutoff, cutoff) * scale) / erfApprox(cutoff * scale);
+}
+
+// Alpha of a rounded rect's blurred shadow at p, before the shadow's own
+// alpha: exact across each row, integrated numerically down the column
+// (after Evan Wallace's rounded-box shadow).
+static float roundedRectShadow(float2 p, float4 rect, float radius, float sigma, float cutoff) {
+    float2 halfSize = rect.zw * 0.5f;
+    float corner = min(radius, min(halfSize.x, halfSize.y));
+    p -= rect.xy + halfSize;
+    float start = clamp(-cutoff, p.y - halfSize.y, p.y + halfSize.y);
+    float end = clamp(cutoff, p.y - halfSize.y, p.y + halfSize.y);
+    if (end <= start) return 0;
+    constexpr int steps = 16;
+    float step = (end - start) / float(steps);
+    float scale = 1.0f / (sigma * M_SQRT2_F);
+    float norm = erfApprox(cutoff * scale) * sigma * sqrt(2.0f * M_PI_F);
+    float value = 0;
+    for (int i = 0; i < steps; ++i) {
+        float y = start + (float(i) + 0.5f) * step;
+        float row = p.y - y;
+        float delta = min(halfSize.y - corner - abs(row), 0.0f);
+        float curved = halfSize.x - corner + sqrt(max(0.0f, corner * corner - delta * delta));
+        float across = shadowCDF(p.x + curved, sigma, cutoff) - shadowCDF(p.x - curved, sigma, cutoff);
+        value += across * exp(-y * y / (2.0f * sigma * sigma));
+    }
+    return clamp(value * step / norm, 0.0f, 1.0f);
+}
+
+static float4 castShadow(float4 below, float2 center, float4 rect, float radius, float4 shadow) {
+    if (shadow.w <= 0) return below;
+    float alpha = shadow.w * roundedRectShadow(center - float2(0, shadow.x), rect, radius, shadow.y, shadow.z);
+    return below * (1.0f - alpha);
+}
+
+// The screen pass for a frame inside a morph: the plain background, the
+// card's shadow, then the shutter samples clipped to the card.
+// shape[0] is the card rect; shape[1] is (radius, opacity, -, -); shape[2]
+// is its shadow.
+kernel void studioMorphScreen(texture2d<float, access::sample> source [[texture(0)]],
+                              texture2d<float, access::read> backdrop [[texture(1)]],
+                              texture2d<float, access::write> output [[texture(2)]],
+                              constant float4 *rects [[buffer(0)]],
+                              constant uint &count [[buffer(1)]],
+                              constant float4 *shape [[buffer(2)]],
+                              uint2 pixel [[thread_position_in_grid]]) {
+    if (pixel.x >= output.get_width() || pixel.y >= output.get_height()) return;
+    float2 center = float2(pixel) + 0.5f;
+    float4 card = shape[0];
+    float radius = shape[1].x;
+    float4 result = castShadow(backdrop.read(pixel), center, card, radius, shape[2]);
+    float coverage = clamp(0.5f - roundedRectDistance(center, card, radius), 0.0f, 1.0f) * shape[1].y;
+    if (coverage > 0) {
+        for (uint i = 0; i < count; ++i) {
+            float4 rect = rects[i];
+            float2 edge = clamp(min(center - rect.xy, rect.xy + rect.zw - center) + 0.5f, 0.0f, 1.0f);
+            float opacity = coverage * edge.x * edge.y / float(i + 1);
+            if (opacity == 0) continue;
+            float4 value = reconstruct(source, (center - rect.xy) / rect.zw, rect.zw);
+            result = round(clamp(value * opacity + result * (1.0f - value.a * opacity), 0.0f, 1.0f) * 255.0f) / 255.0f;
+        }
+    }
+    output.write(result, pixel);
+}
+
+// The camera inside a morph, over a copy of the finished frame beneath it:
+// its shadow, the aspect-filled shutter samples clipped to the bubble, and
+// the hairline border, over only the region at `shape[3].xy`.
+// shape[0] is the bubble; shape[1] is (radius, opacity, borderWidth,
+// borderAlpha); shape[2] its shadow; shape[3].xy the region's origin.
+kernel void studioMorphCamera(texture2d<float, access::sample> camera [[texture(0)]],
+                              texture2d<float, access::read> below [[texture(1)]],
+                              texture2d<float, access::write> output [[texture(2)]],
+                              constant float4 *rects [[buffer(0)]],
+                              constant uint &count [[buffer(1)]],
+                              constant float4 *shape [[buffer(2)]],
+                              uint2 position [[thread_position_in_grid]]) {
+    uint2 pixel = position + uint2(shape[3].xy);
+    if (pixel.x >= output.get_width() || pixel.y >= output.get_height()) return;
+    float2 center = float2(pixel) + 0.5f;
+    float4 bubble = shape[0];
+    float radius = shape[1].x;
+    float opacity = shape[1].y;
+    float4 result = castShadow(below.read(pixel), center, bubble, radius, shape[2]);
+    float coverage = clamp(0.5f - roundedRectDistance(center, bubble, radius), 0.0f, 1.0f);
+    if (coverage > 0) {
+        for (uint i = 0; i < count; ++i) {
+            float4 rect = rects[i];
+            float2 edge = clamp(min(center - rect.xy, rect.xy + rect.zw - center) + 0.5f, 0.0f, 1.0f);
+            // Sample i at 1/(i+1) keeps the running average; the first
+            // carries the fade.
+            float alpha = coverage * edge.x * edge.y * (i == 0 ? opacity : 1.0f / float(i + 1));
+            if (alpha == 0) continue;
+            float4 value = reconstruct(camera, (center - rect.xy) / rect.zw, rect.zw);
+            result = clamp(value * alpha + result * (1.0f - value.a * alpha), 0.0f, 1.0f);
+        }
+    }
+    // A stroke centred on the bubble inset by halfSize a pixel.
+    float width = shape[1].z;
+    float4 inset = bubble + float4(0.5f, 0.5f, -1.0f, -1.0f);
+    float border = clamp(width * 0.5f + 0.5f - abs(roundedRectDistance(center, inset, radius)), 0.0f, 1.0f)
+        * shape[1].w;
+    result = result * (1.0f - border) + float4(border);
+    output.write(result, pixel);
+}

@@ -449,7 +449,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         var writerWaitSeconds = 0.0
         var renderedFrames = 0
         defer {
-            Self.logger.info("Export frames=\(renderedFrames) fps=\(timing.framesPerSecond) motionBlur=\(timing.motionBlurEnabled) Metal blur frames=\(compositor.metalFrameCount) reusedScreenFrames=\(compositor.reusedScreenFrameCount) renderSeconds=\(renderSeconds) metalSeconds=\(compositor.metalSeconds) decodeSeconds=\(decodeSeconds) writerWaitSeconds=\(writerWaitSeconds)")
+            Self.logger.info("Export frames=\(renderedFrames) fps=\(timing.framesPerSecond) motionBlur=\(timing.motionBlurEnabled) Metal blur frames=\(compositor.metalFrameCount) reusedScreenFrames=\(compositor.reusedScreenFrameCount) reusedComposedFrames=\(compositor.reusedComposedFrameCount) renderSeconds=\(renderSeconds) metalSeconds=\(compositor.metalSeconds) decodeSeconds=\(decodeSeconds) writerWaitSeconds=\(writerWaitSeconds)")
         }
 
         var inFlight: (frame: StudioFrameCompositor.PendingFrame, index: Int)?
@@ -504,25 +504,21 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             guard let pool = adaptor.pixelBufferPool else {
                 throw ExportError.writerFailed(nil)
             }
-            var destinationBuffer: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &destinationBuffer)
-            guard let destinationBuffer else {
-                throw ExportError.writerFailed(nil)
-            }
-
             let cameraBuffer = cameraFeed?.latestFrame(at: sourceTime)
             let nextTime = timing.time(forFrame: frame + 1)
             let sourceRepeats = (pending == nil || pending!.time > nextTime)
                 && clipTimeline.location(at: nextTime)?.segmentID == location.segmentID
             let renderStart = CFAbsoluteTimeGetCurrent()
-            let begun = compositor.begin(
-                screenFrame: sourceBuffer,
-                cameraFrame: cameraBuffer,
-                editorTime: editorTime,
-                sourceTime: sourceTime,
-                sourceRepeatsOnNextFrame: sourceRepeats,
-                into: destinationBuffer
-            )
+            let begun = try autoreleasepool {
+                try compositor.begin(
+                    screenFrame: sourceBuffer,
+                    cameraFrame: cameraBuffer,
+                    editorTime: editorTime,
+                    sourceTime: sourceTime,
+                    sourceRepeatsOnNextFrame: sourceRepeats,
+                    pool: pool
+                )
+            }
             renderSeconds += CFAbsoluteTimeGetCurrent() - renderStart
 
             // The GPU renders this frame while the previous one gets its
@@ -689,7 +685,7 @@ nonisolated private struct SettledLayout: Hashable, Sendable {
 /// averaged across the shutter like any other camera move.
 nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// Everything that stays fixed while one layout is settled.
-    private final class LayoutResources {
+    fileprivate final class LayoutResources {
         let layout: RecordingStudioLayout
         let backdrop: CGImage?
         var metalRenderer: StudioMetalScreenRenderer?
@@ -698,6 +694,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         /// Retained so pixel-buffer pool reuse can't produce a false cache hit.
         var bubbleContentSource: CVPixelBuffer?
         var bubbleContentImage: CGImage?
+        var scheduledCameraSource: CVPixelBuffer?
+        var scheduledCameraSubmission: StudioCameraBubbleScaler.Submission?
 
         init(layout: RecordingStudioLayout, backdrop: CGImage?) {
             self.layout = layout
@@ -720,11 +718,13 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// a full-canvas backdrop per layout the export ever used.
     private var layoutResources: [(key: SettledLayout, resources: LayoutResources)] = []
     private static let maxLayoutResources = 2
-    /// Morph frames redraw their renderer's backdrop and clip, so two take
-    /// turns: one frame's pass can still be running while the next is drawn.
-    private var morphRenderers: [StudioMetalScreenRenderer?] = [nil, nil]
-    private var morphRendererIndex = 0
-    private var morphRenderersFailed = false
+    /// Morph frames compute the card's clip and shadow on the GPU over the
+    /// plain background, so one renderer serves every one of them.
+    private var morphRenderer: StudioMetalScreenRenderer?
+    private var morphRendererFailed = false
+    /// The camera inside a morph; nil until needed or if Metal can't.
+    private var morphCameraRenderer: StudioMorphCameraRenderer?
+    private var morphCameraRendererFailed = false
     /// A quarter-size canvas for the moving card's shadow. A shadow is a
     /// blur, so its resolution doesn't show, and full size costs ten times
     /// as much every frame.
@@ -768,6 +768,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// layout is part of the key: the cached layer includes its backdrop.
     private var plannedCacheKey: (source: CVPixelBuffer, rect: CGRect, layout: SettledLayout)?
     private(set) var reusedScreenFrameCount = 0
+    private let composedFrameCache = StudioComposedFrameCache<ComposedFrameState>()
+    private(set) var reusedComposedFrameCount = 0
+    private let bypassFrameCache = ProcessInfo.processInfo.environment["SCREENDROP_EXPORT_BYPASS_FRAME_CACHE"] == "1"
     private let bypassScreenCache = ProcessInfo.processInfo.environment["SCREENDROP_EXPORT_BYPASS_SCREEN_CACHE"] == "1"
     // Developer comparison switch; export settings and saved projects do not change.
     private let forceCoreGraphics = ProcessInfo.processInfo.environment["SCREENDROP_EXPORT_RENDERER"] == "cpu"
@@ -906,6 +909,51 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         return RecordingVideoCropGeometry.viewport(base, crop: videoCropRect)
     }
 
+    /// Only settled, single-sample frames qualify. Include the actual
+    /// interpolated geometry and every overlay's displayed state: a layout
+    /// label or a stationary cursor alone is insufficient to establish that
+    /// the complete frame is unchanged. Buffer identity retains its source.
+    private struct ComposedFrameState: Equatable {
+        let screen: CVPixelBuffer?
+        let camera: CVPixelBuffer?
+        let layout: RecordingStudioLayout
+        let screenRect: CGRect?
+        let pointer: PointerFrame?
+        let keystroke: KeystrokeCaptionFrame?
+        let speedBadge: SpeedBadgeFrame?
+        let subtitle: String?
+        let karaoke: KaraokeTimeline.Line?
+
+        static func == (a: Self, b: Self) -> Bool {
+            a.screen === b.screen && a.camera === b.camera && a.layout == b.layout
+                && a.screenRect == b.screenRect && a.pointer == b.pointer
+                && a.keystroke == b.keystroke && a.speedBadge == b.speedBadge
+                && a.subtitle == b.subtitle && a.karaoke == b.karaoke
+        }
+    }
+
+    private func composedState(
+        screenFrame: CVPixelBuffer, cameraFrame: CVPixelBuffer?,
+        layout: RecordingStudioLayout, settled: SettledLayout?, sampleRects: [CGRect],
+        editorTime: TimeInterval, sourceTime: TimeInterval
+    ) -> ComposedFrameState? {
+        guard !bypassFrameCache, settled != nil, sampleRects.count <= 1 else { return nil }
+        let showsScreen = layout.screenOpacity > 0.001
+        let showsCamera = layout.cameraOpacity > 0.001 && layout.bubbleRect.width > 0
+        let subtitle = subtitleTimeline?.text(at: sourceTime)
+        return ComposedFrameState(
+            screen: showsScreen ? screenFrame : nil,
+            camera: showsCamera ? cameraFrame : nil,
+            layout: layout,
+            screenRect: sampleRects.first,
+            pointer: showsScreen ? pointerTimeline?.frame(at: editorTime) : nil,
+            keystroke: showsScreen ? keystrokeTimeline?.frame(at: sourceTime) : nil,
+            speedBadge: showsScreen ? speedBadgeTimeline?.frame(at: editorTime) : nil,
+            subtitle: subtitle,
+            karaoke: subtitle != nil && subtitleStyle.highlightsSpokenWord ? karaokeTimeline?.line(at: sourceTime) : nil
+        )
+    }
+
     /// A frame whose screen layer may still be rendering on the GPU.
     struct PendingFrame {
         fileprivate let screenFrame: CVPixelBuffer
@@ -921,6 +969,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         /// cache; the restore itself waits for finish, which runs in order.
         fileprivate let plansRestore: Bool
         fileprivate let submission: StudioMetalScreenRenderer.Submission?
+        fileprivate let resources: LayoutResources?
+        fileprivate let cameraSubmission: StudioCameraBubbleScaler.Submission?
+        fileprivate let reusesComposedFrame: Bool
         let destination: CVPixelBuffer
     }
 
@@ -933,14 +984,36 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         editorTime: TimeInterval,
         sourceTime: TimeInterval,
         sourceRepeatsOnNextFrame: Bool,
-        into destination: CVPixelBuffer
-    ) -> PendingFrame {
+        pool: CVPixelBufferPool
+    ) throws -> PendingFrame {
         let (frameLayout, settled) = frameLayout(at: editorTime)
         let showsScreen = frameLayout.screenOpacity > 0.001
         let sampleRects = showsScreen
             ? timing.screenSampleRects(at: editorTime, frameRect: screenDrawRect(at:))
             : []
         let sampleCount = sampleRects.count
+        let composedState = composedState(
+            screenFrame: screenFrame, cameraFrame: cameraFrame,
+            layout: frameLayout, settled: settled, sampleRects: sampleRects,
+            editorTime: editorTime, sourceTime: sourceTime
+        )
+        if let composedState, let cached = composedFrameCache.frame(matching: composedState) {
+            // The preceding frame finishes before this one, completing the
+            // shared buffer exactly once. Subsequent encoder submissions are
+            // read-only and keep the full selected 30/60 fps output cadence.
+            return PendingFrame(
+                screenFrame: screenFrame, cameraFrame: cameraFrame,
+                editorTime: editorTime, sourceTime: sourceTime, layout: frameLayout,
+                settledLayout: settled, sampleRects: sampleRects, shouldCacheScreen: false,
+                plansRestore: false, submission: nil, resources: nil, cameraSubmission: nil,
+                reusesComposedFrame: true, destination: cached
+            )
+        }
+        var destinationBuffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &destinationBuffer) == kCVReturnSuccess,
+              let destination = destinationBuffer else {
+            throw RecordingStudioExporter.ExportError.writerFailed(nil)
+        }
         let plansRestore = !bypassScreenCache && sampleCount == 1
             && plannedCacheKey.map {
                 $0.source === screenFrame && $0.rect == sampleRects[0] && $0.layout == settled
@@ -971,6 +1044,14 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
                 layout: frameLayout, into: destination
             )
         }
+        let resources = settled.map { resources(for: $0, layout: frameLayout) }
+        let cameraSubmission = if let resources, let cameraFrame,
+                                  frameLayout.bubbleRect.width > 0, frameLayout.cameraOpacity > 0.001 {
+            prepareCamera(cameraFrame, resources: resources)
+        } else {
+            nil as StudioCameraBubbleScaler.Submission?
+        }
+        composedFrameCache.store(destination, state: composedState)
         return PendingFrame(
             screenFrame: screenFrame,
             cameraFrame: cameraFrame,
@@ -982,6 +1063,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             shouldCacheScreen: shouldCacheScreen,
             plansRestore: plansRestore,
             submission: submission,
+            resources: resources,
+            cameraSubmission: cameraSubmission,
+            reusesComposedFrame: false,
             destination: destination
         )
     }
@@ -989,12 +1073,16 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// Completes a frame begun earlier: waits for its screen pass, then draws
     /// the CPU overlays into its destination.
     func finish(_ frame: PendingFrame) throws {
+        if frame.reusesComposedFrame {
+            reusedComposedFrameCount += 1
+            return
+        }
         layout = frame.layout
         let destination = frame.destination
         let screenFrame = frame.screenFrame
         let sampleRects = frame.sampleRects
         let settled = frame.settledLayout
-        let resources = settled.map { resources(for: $0, layout: frame.layout) }
+        let resources = frame.resources
         let reusedScreen = frame.plansRestore && screenLayerCache.restore(
             source: screenFrame, rect: sampleRects[0], into: destination
         )
@@ -1024,19 +1112,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         CVPixelBufferLockBaseAddress(destination, [])
         defer { CVPixelBufferUnlockBaseAddress(destination, []) }
 
-        guard let base = CVPixelBufferGetBaseAddress(destination),
-              let context = CGContext(
-                data: base,
-                width: CVPixelBufferGetWidth(destination),
-                height: CVPixelBufferGetHeight(destination),
-                bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(destination),
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-              ) else {
+        guard var context = lockedContext(for: destination) else {
             throw RecordingStudioExporter.ExportError.writerFailed(nil)
         }
-        context.interpolationQuality = .high
 
         let screenOpacity = layout.screenOpacity
         if !reusedScreen, !renderedWithMetal {
@@ -1102,9 +1180,20 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
 
         if let cameraFrame, layout.bubbleRect.width > 0, layout.cameraOpacity > 0.001 {
             if let resources {
-                drawCameraBubble(cameraFrame, resources: resources, in: context)
+                drawCameraBubble(cameraFrame, resources: resources, submission: frame.cameraSubmission, in: context)
             } else {
-                drawMorphingCamera(cameraFrame, editorTime: editorTime, in: context)
+                // The GPU draws into the buffer while the CPU has it unlocked.
+                context.flush()
+                CVPixelBufferUnlockBaseAddress(destination, [])
+                let drawn = renderMorphingCamera(cameraFrame, editorTime: editorTime, into: destination)
+                CVPixelBufferLockBaseAddress(destination, [])
+                guard let relocked = lockedContext(for: destination) else {
+                    throw RecordingStudioExporter.ExportError.writerFailed(nil)
+                }
+                context = relocked
+                if !drawn {
+                    drawMorphingCamera(cameraFrame, editorTime: editorTime, in: context)
+                }
             }
         }
 
@@ -1195,40 +1284,37 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         layout: RecordingStudioLayout,
         into destination: CVPixelBuffer
     ) -> StudioMetalScreenRenderer.Submission? {
-        guard !sampleRects.isEmpty, !forceCoreGraphics, !metalFailed, !morphRenderersFailed,
+        guard !sampleRects.isEmpty, !forceCoreGraphics, !metalFailed, !morphRendererFailed,
               StudioMetalScreenRenderer.shouldAccelerate(screenFrame: screenFrame, sampleRects: sampleRects)
         else { return nil }
-        morphRendererIndex = (morphRendererIndex + 1) % morphRenderers.count
-        if morphRenderers[morphRendererIndex] == nil {
-            morphRenderers[morphRendererIndex] = StudioMetalScreenRenderer(
+        if morphRenderer == nil {
+            morphRenderer = StudioMetalScreenRenderer(
                 canvasSize: canvasSize, backdrop: plainBackdrop,
-                cardPath: roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius), colorSpace: colorSpace
+                cardPath: CGPath(rect: .zero, transform: nil), colorSpace: colorSpace
             )
-        }
-        guard let renderer = morphRenderers[morphRendererIndex] else {
-            morphRenderersFailed = true
-            return nil
         }
         let submitStart = CFAbsoluteTimeGetCurrent()
         defer { metalSeconds += CFAbsoluteTimeGetCurrent() - submitStart }
-        let redrawn = renderer.redraw(
-            backdrop: { context in
-                drawBackdrop(plainBackdrop, in: context)
-                drawCardShadow(for: layout, in: context)
-            },
-            clip: { context in
-                context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
-                context.setFillColor(CGColor(gray: 1, alpha: layout.screenOpacity))
-                context.fillPath()
-            }
-        )
-        guard redrawn,
-              let submission = renderer.submit(screenFrame: screenFrame, sampleRects: sampleRects, into: destination)
-        else {
-            morphRenderersFailed = true
+        guard let submission = morphRenderer?.submitMorph(
+            screenFrame: screenFrame,
+            sampleRects: sampleRects,
+            card: StudioMetalScreenRenderer.MorphCard(
+                rect: layout.cardRect, cornerRadius: layout.cardCornerRadius,
+                opacity: layout.screenOpacity, shadow: cardShadow(for: layout)
+            ),
+            into: destination
+        ) else {
+            morphRendererFailed = true
             return nil
         }
         return submission
+    }
+
+    /// The card's shadow, as `renderBackdrop` casts it for a settled layout.
+    private func cardShadow(for layout: RecordingStudioLayout) -> StudioMorphShadow? {
+        guard layout.screenOpacity > 0.001, style.shadow > 0.01, style.background != .none else { return nil }
+        let blur = min(canvasSize.width, canvasSize.height) * 0.045 * style.shadow
+        return StudioMorphShadow(offset: blur * 0.35, blur: blur, alpha: 0.55 * style.shadow * layout.screenOpacity)
     }
 
     /// The most samples a morphing layer averages. The Core Graphics path
@@ -1279,16 +1365,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private func drawMorphingCamera(_ cameraFrame: CVPixelBuffer, editorTime: TimeInterval, in context: CGContext) {
         guard let cameraImage = Self.makeImage(from: cameraFrame, colorSpace: colorSpace) else { return }
         let opacity = layout.cameraOpacity
-        // A running average can't also carry a fade, so a fading camera
-        // draws once, mid-shutter.
-        var times = opacity < 0.999
-            ? [editorTime]
-            : timing.sampleTimes(at: editorTime) { self.frameLayout(at: $0).layout.bubbleRect }
-        if times.count > Self.maxMorphCameraSamples {
-            times = (0..<Self.maxMorphCameraSamples).map { index in
-                times[index * (times.count - 1) / (Self.maxMorphCameraSamples - 1)]
-            }
-        }
+        let times = morphCameraSampleTimes(at: editorTime)
         let bubble = layout.bubbleRect
         guard !times.isEmpty, bubble.width > 0, bubble.height > 0 else { return }
         let imageSize = CGSize(width: cameraImage.width, height: cameraImage.height)
@@ -1332,6 +1409,71 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
 
     private static let maxMorphCameraSamples = 4
 
+    private func morphCameraSampleTimes(at editorTime: TimeInterval) -> [TimeInterval] {
+        // A running average can't also carry a fade, so a fading camera
+        // draws once, mid-shutter.
+        let times = layout.cameraOpacity < 0.999
+            ? [editorTime]
+            : timing.sampleTimes(at: editorTime) { self.frameLayout(at: $0).layout.bubbleRect }
+        guard times.count > Self.maxMorphCameraSamples else { return times }
+        return (0..<Self.maxMorphCameraSamples).map { index in
+            times[index * (times.count - 1) / (Self.maxMorphCameraSamples - 1)]
+        }
+    }
+
+    /// `drawMorphingCamera` on the GPU, into the unlocked `destination`.
+    /// False if Metal can't, leaving the frame untouched.
+    private func renderMorphingCamera(
+        _ cameraFrame: CVPixelBuffer, editorTime: TimeInterval, into destination: CVPixelBuffer
+    ) -> Bool {
+        guard !forceCoreGraphics, !morphCameraRendererFailed else { return false }
+        if morphCameraRenderer == nil { morphCameraRenderer = StudioMorphCameraRenderer() }
+        guard let renderer = morphCameraRenderer else {
+            morphCameraRendererFailed = true
+            return false
+        }
+        let bubble = layout.bubbleRect
+        guard bubble.width > 0, bubble.height > 0 else { return true }
+        let fillRects = morphCameraSampleTimes(at: editorTime).compactMap { time -> CGRect? in
+            let sample = frameLayout(at: time).layout
+            guard sample.bubbleRect.width > 0, sample.bubbleRect.height > 0 else { return nil }
+            return cameraFillRect(cameraFrame, layout: sample)
+        }
+        guard !fillRects.isEmpty else { return true }
+        let opacity = layout.cameraOpacity
+        let minDimension = min(canvasSize.width, canvasSize.height)
+        let start = CFAbsoluteTimeGetCurrent()
+        defer { metalSeconds += CFAbsoluteTimeGetCurrent() - start }
+        return renderer.render(
+            camera: cameraFrame,
+            fillRects: fillRects,
+            bubble: StudioMorphCameraRenderer.Bubble(
+                rect: bubble,
+                cornerRadius: layout.bubbleCornerRadius,
+                opacity: opacity,
+                borderWidth: max(1, minDimension * 0.0018),
+                borderAlpha: 0.25 * opacity,
+                shadow: StudioMorphShadow(offset: minDimension * 0.009, blur: minDimension * 0.022, alpha: 0.35 * opacity)
+            ),
+            into: destination
+        )
+    }
+
+    private func lockedContext(for destination: CVPixelBuffer) -> CGContext? {
+        guard let base = CVPixelBufferGetBaseAddress(destination),
+              let context = CGContext(
+                data: base,
+                width: CVPixelBufferGetWidth(destination),
+                height: CVPixelBufferGetHeight(destination),
+                bitsPerComponent: 8,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(destination),
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+              ) else { return nil }
+        context.interpolationQuality = .high
+        return context
+    }
+
     private func submitMetal(
         screenFrame: CVPixelBuffer,
         sampleRects: [CGRect],
@@ -1366,9 +1508,12 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// but while a layout is settled its geometry is fixed: the blurred
     /// shadow renders once, the clipped camera layer once per camera frame,
     /// and each output frame only blits them 1:1.
-    private func drawCameraBubble(_ cameraFrame: CVPixelBuffer, resources: LayoutResources, in context: CGContext) {
+    private func drawCameraBubble(
+        _ cameraFrame: CVPixelBuffer, resources: LayoutResources,
+        submission: StudioCameraBubbleScaler.Submission?, in context: CGContext
+    ) {
         if resources.bubbleContentSource !== cameraFrame {
-            resources.bubbleContentImage = renderBubbleContent(cameraFrame, resources: resources)
+            resources.bubbleContentImage = renderBubbleContent(cameraFrame, resources: resources, submission: submission)
             resources.bubbleContentSource = resources.bubbleContentImage == nil ? nil : cameraFrame
         }
         guard let content = resources.bubbleContentImage else { return }
@@ -1417,27 +1562,49 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         return scaler
     }
 
-    private func renderBubbleContent(_ cameraFrame: CVPixelBuffer, resources: LayoutResources) -> CGImage? {
+    private func cameraFillRect(_ cameraFrame: CVPixelBuffer, layout: RecordingStudioLayout) -> CGRect {
+        let bubble = layout.bubbleRect
+        let scale = max(bubble.width / CGFloat(CVPixelBufferGetWidth(cameraFrame)),
+                        bubble.height / CGFloat(CVPixelBufferGetHeight(cameraFrame)))
+        let size = CGSize(width: CGFloat(CVPixelBufferGetWidth(cameraFrame)) * scale,
+                          height: CGFloat(CVPixelBufferGetHeight(cameraFrame)) * scale)
+        return CGRect(x: bubble.midX - size.width / 2, y: bubble.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
+    /// Schedule the camera before finishing the previous frame's overlays.
+    /// Consecutive output ticks sharing one decoded camera frame also share
+    /// its scale submission; the resulting image is still clipped identically.
+    private func prepareCamera(
+        _ cameraFrame: CVPixelBuffer, resources: LayoutResources
+    ) -> StudioCameraBubbleScaler.Submission? {
+        guard resources.bubbleContentSource !== cameraFrame else { return nil }
+        if resources.scheduledCameraSource === cameraFrame { return resources.scheduledCameraSubmission }
+        let layerRect = bubbleContentRect(for: resources.layout)
+        let fillRect = cameraFillRect(cameraFrame, layout: resources.layout)
+        let submission = cameraScaler(for: resources)?.submit(
+            cameraFrame,
+            fillRect: fillRect.offsetBy(dx: -layerRect.minX, dy: -(canvasSize.height - layerRect.maxY))
+        )
+        resources.scheduledCameraSource = submission == nil ? nil : cameraFrame
+        resources.scheduledCameraSubmission = submission
+        return submission
+    }
+
+    private func renderBubbleContent(
+        _ cameraFrame: CVPixelBuffer, resources: LayoutResources,
+        submission: StudioCameraBubbleScaler.Submission?
+    ) -> CGImage? {
         let layout = resources.layout
         let bubble = layout.bubbleRect
         let imageSize = CGSize(width: CVPixelBufferGetWidth(cameraFrame), height: CVPixelBufferGetHeight(cameraFrame))
         guard imageSize.width > 0, imageSize.height > 0 else { return nil }
-        let scale = max(bubble.width / imageSize.width, bubble.height / imageSize.height)
-        let fillSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-        let fillRect = CGRect(
-            x: bubble.midX - fillSize.width / 2,
-            y: bubble.midY - fillSize.height / 2,
-            width: fillSize.width,
-            height: fillSize.height
-        )
+        let fillRect = cameraFillRect(cameraFrame, layout: layout)
         let minDimension = min(canvasSize.width, canvasSize.height)
         let layerRect = bubbleContentRect(for: layout)
         // The GPU scales straight into the layer's pixel box, so the draw
         // below is 1:1; Core Graphics resamples the full frame otherwise.
-        let scaledCamera = cameraScaler(for: resources)?.scale(
-            cameraFrame,
-            fillRect: fillRect.offsetBy(dx: -layerRect.minX, dy: -(canvasSize.height - layerRect.maxY))
-        )
+        let scaledCamera = submission.flatMap { cameraScaler(for: resources)?.image(for: $0) }
         let cameraImage = scaledCamera == nil ? Self.makeImage(from: cameraFrame, colorSpace: colorSpace) : nil
         guard scaledCamera != nil || cameraImage != nil else { return nil }
         return renderLayer(covering: layerRect) { context in

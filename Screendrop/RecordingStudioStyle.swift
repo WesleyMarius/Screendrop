@@ -473,7 +473,7 @@ enum RecordingStudioDefaults {
 /// All rects are in the given canvas space with a top-left origin. `make`
 /// produces the resting card; a camera layout frame then moves the card and
 /// places the camera (RecordingCameraLayoutResolver).
-nonisolated struct RecordingStudioLayout: Sendable {
+nonisolated struct RecordingStudioLayout: Sendable, Equatable {
     /// Original follows the visible source, then adds an equal border without
     /// stretching the video. Padding remains a fraction of the canvas's short side.
     static func originalCanvasSize(

@@ -12,15 +12,18 @@ nonisolated final class StudioMetalScreenRenderer {
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
+    /// For frames inside a layout morph; nil if the shader is missing.
+    private let morphPipeline: MTLComputePipelineState?
     private let textureCache: CVMetalTextureCache
     private let backdropTexture: MTLTexture
     private let clipTexture: MTLTexture
     private let downsampler: MPSImageLanczosScale
     private var downsampledTexture: MTLTexture?
+    /// The prefilter is independent of the viewport's translation. Queue
+    /// ordering makes it safe to reuse even before its first pass completes.
+    /// Retain the source so decoder-pool recycling cannot create a false hit.
+    private var downsampledSource: CVPixelBuffer?
     private let colorSpace: CGColorSpace
-    /// CPU copies of the backdrop and clip, kept for `redraw`.
-    private var backdropStaging: CGContext?
-    private var clipStaging: CGContext?
 
     init?(
         canvasSize: CGSize, backdrop: CGImage?, cardPath: CGPath,
@@ -63,40 +66,14 @@ nonisolated final class StudioMetalScreenRenderer {
         self.device = device
         self.queue = queue
         self.pipeline = pipeline
+        self.morphPipeline = library.makeFunction(name: "studioMorphScreen")
+            .flatMap { try? device.makeComputePipelineState(function: $0) }
         self.textureCache = cache
         self.backdropTexture = backdropTexture
         self.clipTexture = clipTexture
         self.downsampler = MPSImageLanczosScale(device: device)
         self.downsampler.edgeMode = .clamp
         self.colorSpace = colorSpace
-    }
-
-    /// Replaces the backdrop and the card clip, for a card that moves from
-    /// frame to frame. The clip's alpha is the screen's coverage, so a
-    /// fading card draws with a partly transparent clip. The caller must not
-    /// redraw while a pass submitted on this renderer is still running.
-    func redraw(backdrop drawBackdrop: (CGContext) -> Void, clip drawClip: (CGContext) -> Void) -> Bool {
-        let width = backdropTexture.width
-        let height = backdropTexture.height
-        func staging(_ existing: CGContext?) -> CGContext? {
-            existing ?? CGContext(
-                data: nil, width: width, height: height, bitsPerComponent: 8,
-                bytesPerRow: width * 4, space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
-        }
-        guard let backdrop = staging(backdropStaging), let clip = staging(clipStaging),
-              let backdropPixels = backdrop.data, let clipPixels = clip.data
-        else { return false }
-        backdropStaging = backdrop
-        clipStaging = clip
-        let bounds = CGRect(x: 0, y: 0, width: width, height: height)
-        drawBackdrop(backdrop)
-        clip.clear(bounds)
-        drawClip(clip)
-        let region = MTLRegionMake2D(0, 0, width, height)
-        backdropTexture.replace(region: region, mipmapLevel: 0, withBytes: backdropPixels, bytesPerRow: backdrop.bytesPerRow)
-        clipTexture.replace(region: region, mipmapLevel: 0, withBytes: clipPixels, bytesPerRow: clip.bytesPerRow)
-        return true
     }
 
     /// A committed pass. It retains the Core Video texture wrappers, whose
@@ -106,11 +83,37 @@ nonisolated final class StudioMetalScreenRenderer {
         fileprivate let textures: [CVMetalTexture]
     }
 
+    /// The card of a frame inside a layout morph, in top-left canvas
+    /// pixels. Its clip and shadow are computed from this shape on the GPU,
+    /// over the renderer's backdrop, which should be the plain background.
+    struct MorphCard {
+        var rect: CGRect
+        var cornerRadius: CGFloat
+        /// The screen's coverage, for a card fading in or out.
+        var opacity: CGFloat
+        var shadow: StudioMorphShadow?
+    }
+
     /// Rectangles use the same top-left canvas coordinates as StudioLayout.
     /// Returns nil, without encoding anything, if Metal cannot take a frame.
     /// Commands on one queue run in order, so the shared downsample texture
     /// is never overwritten while an earlier pass still reads it.
     func submit(screenFrame: CVPixelBuffer, sampleRects: [CGRect], into destination: CVPixelBuffer) -> Submission? {
+        submit(screenFrame: screenFrame, sampleRects: sampleRects, morph: nil, into: destination)
+    }
+
+    /// A frame inside a layout morph: unlike `redraw`, nothing is drawn on
+    /// the CPU or uploaded, so passes can follow each other on one renderer.
+    func submitMorph(
+        screenFrame: CVPixelBuffer, sampleRects: [CGRect], card: MorphCard, into destination: CVPixelBuffer
+    ) -> Submission? {
+        guard morphPipeline != nil else { return nil }
+        return submit(screenFrame: screenFrame, sampleRects: sampleRects, morph: card, into: destination)
+    }
+
+    private func submit(
+        screenFrame: CVPixelBuffer, sampleRects: [CGRect], morph: MorphCard?, into destination: CVPixelBuffer
+    ) -> Submission? {
         guard (1...24).contains(sampleRects.count),
             sampleRects.allSatisfy({
                 $0.width > 0 && $0.height > 0 && $0.minX.isFinite && $0.minY.isFinite && $0.width.isFinite
@@ -139,11 +142,14 @@ nonisolated final class StudioMetalScreenRenderer {
                 descriptor.usage = [.shaderRead, .shaderWrite]
                 descriptor.storageMode = .private
                 downsampledTexture = device.makeTexture(descriptor: descriptor)
+                downsampledSource = nil
             }
             guard let downsampledTexture else { return nil }
-            downsampler.encode(
-                commandBuffer: command, sourceTexture: sourceTexture,
-                destinationTexture: downsampledTexture)
+            if downsampledSource !== screenFrame {
+                downsampler.encode(
+                    commandBuffer: command, sourceTexture: sourceTexture,
+                    destinationTexture: downsampledTexture)
+            }
             sampledTexture = downsampledTexture
         }
         // shouldAccelerate screens these out first; this only guards callers
@@ -157,11 +163,26 @@ nonisolated final class StudioMetalScreenRenderer {
 
         var count = UInt32(sampleRects.count)
         let rects = sampleRects.map { SIMD4<Float>(Float($0.minX), Float($0.minY), Float($0.width), Float($0.height)) }
-        encoder.setComputePipelineState(pipeline)
+        let pipeline: MTLComputePipelineState
         encoder.setTexture(sampledTexture, index: 0)
         encoder.setTexture(backdropTexture, index: 1)
-        encoder.setTexture(clipTexture, index: 2)
-        encoder.setTexture(outputTexture, index: 3)
+        if let morph, let morphPipeline {
+            pipeline = morphPipeline
+            encoder.setTexture(outputTexture, index: 2)
+            let shape: [SIMD4<Float>] = [
+                SIMD4(Float(morph.rect.minX), Float(morph.rect.minY), Float(morph.rect.width), Float(morph.rect.height)),
+                SIMD4(Float(morph.cornerRadius), Float(morph.opacity), 0, 0),
+                morph.shadow?.parameters ?? .zero
+            ]
+            shape.withUnsafeBytes { bytes in
+                encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 2)
+            }
+        } else {
+            pipeline = self.pipeline
+            encoder.setTexture(clipTexture, index: 2)
+            encoder.setTexture(outputTexture, index: 3)
+        }
+        encoder.setComputePipelineState(pipeline)
         rects.withUnsafeBytes { bytes in
             encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 0)
         }
@@ -173,6 +194,9 @@ nonisolated final class StudioMetalScreenRenderer {
             threadsPerThreadgroup: MTLSize(width: width, height: height, depth: 1))
         encoder.endEncoding()
         command.commit()
+        // Set only after committing: a failed submission must not make a
+        // later frame skip a prefilter that never ran.
+        downsampledSource = sampledTexture === downsampledTexture ? screenFrame : nil
         return Submission(command: command, textures: [source, output])
     }
 
@@ -234,5 +258,21 @@ nonisolated final class StudioMetalScreenRenderer {
             region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
             withBytes: pixels, bytesPerRow: context.bytesPerRow)
         return texture
+    }
+}
+
+/// A black shadow as Core Graphics casts it, for the morph shaders to
+/// compute from a shape: offset downwards and blurred, in canvas pixels.
+nonisolated struct StudioMorphShadow {
+    var offset: CGFloat
+    var blur: CGFloat
+    var alpha: CGFloat
+
+    /// Core Graphics' blur measures as a Gaussian with sigma = blur / 2,
+    /// cut off at 1.05 x blur; this matches it within 2/255 at full alpha
+    /// for the blurs exports use.
+    var parameters: SIMD4<Float> {
+        let blur = max(blur, 0.5)
+        return SIMD4(Float(offset), Float(blur * 0.5), Float(blur * 1.05), Float(alpha))
     }
 }
