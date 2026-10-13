@@ -177,8 +177,9 @@ struct StudioCameraLayoutPicker: View {
     }
 }
 
-/// One layout in the picker: a tiny scene above its name. Every scene
-/// looks the same; the ring marks the picked one, and its camera bounces in.
+/// One layout in the picker: a tiny scene sitting in a flat white card,
+/// above its name. Every card looks the same; the ring marks the picked
+/// one, and its camera bounces in.
 private struct StudioCameraLayoutTile: View {
     let layout: RecordingCameraLayout
     let title: String
@@ -187,19 +188,25 @@ private struct StudioCameraLayoutTile: View {
     let action: () -> Void
 
     @State private var isHovering = false
-    private static let radius: CGFloat = 10
+    @Environment(\.colorScheme) private var colorScheme
+    private static let radius: CGFloat = 12
+    /// The white margin between the card's edge and the scene's well.
+    private static let cardInset: CGFloat = 3
+    private static let wellRadius = radius - cardInset
     private static let ringGap: CGFloat = 3
 
     var body: some View {
         Button(action: action) {
             VStack(spacing: 7) {
-                StudioCameraLayoutScene(layout: layout, isSelected: isSelected, outerRadius: Self.radius)
+                StudioCameraLayoutScene(layout: layout, isSelected: isSelected, outerRadius: Self.wellRadius)
                     .aspectRatio(aspectRatio, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: Self.radius, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: Self.wellRadius, style: .continuous))
                     .overlay {
-                        RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
-                            .strokeBorder(Color.primary.opacity(isHovering && !isSelected ? 0.16 : 0.07), lineWidth: 0.5)
+                        RoundedRectangle(cornerRadius: Self.wellRadius, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.05), lineWidth: 0.5)
                     }
+                    .padding(Self.cardInset)
+                    .background { card }
                     .padding(Self.ringGap)
                     .overlay {
                         RoundedRectangle(cornerRadius: Self.radius + Self.ringGap, style: .continuous)
@@ -222,6 +229,24 @@ private struct StudioCameraLayoutTile: View {
         .accessibilityLabel(layout.detailedTitle)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
+
+    /// Flat, with a hairline edge and a barely-there lift that firms up a
+    /// touch on hover.
+    private var card: some View {
+        let isDark = colorScheme == .dark
+        let lifted = isHovering && !isSelected
+        return RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+            .fill(isDark ? Color(white: 0.22) : Color.white)
+            .overlay {
+                RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(lifted ? 0.13 : 0.08), lineWidth: 0.5)
+            }
+            .shadow(
+                color: .black.opacity(isDark ? 0.3 : (lifted ? 0.09 : 0.055)),
+                radius: lifted ? 2.5 : 1.5,
+                y: 1
+            )
+    }
 }
 
 private struct StudioCameraLayoutTileButtonStyle: ButtonStyle {
@@ -234,7 +259,7 @@ private struct StudioCameraLayoutTileButtonStyle: ButtonStyle {
 
 /// A layout drawn by the real resolver on an idealized frame, so every
 /// tile shares one padding and one set of corners whatever the project's
-/// own style: a soft backdrop, a little app window, and a camera with a
+/// own style: a flat grey well, a little app window, and a camera with a
 /// person in it.
 struct StudioCameraLayoutScene: View {
     let layout: RecordingCameraLayout
@@ -306,13 +331,7 @@ struct StudioCameraLayoutScene: View {
     }
 
     private var backdrop: some View {
-        LinearGradient(
-            colors: isDark
-                ? [Color(red: 0.25, green: 0.22, blue: 0.33), Color(red: 0.33, green: 0.24, blue: 0.24)]
-                : [Color(red: 0.86, green: 0.84, blue: 0.97), Color(red: 0.99, green: 0.87, blue: 0.80)],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
+        isDark ? Color(white: 0.14) : Color(white: 0.945)
     }
 }
 
@@ -352,7 +371,7 @@ private struct MiniatureWindow: View {
             let showsSidebar = size.width > size.height * 0.9
 
             ZStack(alignment: .topLeading) {
-                (isDark ? Color(white: 0.17) : Color.white)
+                (isDark ? Color(white: 0.25) : Color.white)
 
                 HStack(spacing: dot * 0.55) {
                     ForEach([Color(red: 1, green: 0.37, blue: 0.34),
@@ -384,18 +403,21 @@ private struct MiniatureWindow: View {
 
                 Image(systemName: "cursorarrow")
                     .font(.system(size: max(6, unit * 0.17), weight: .semibold))
-                    .foregroundStyle(isDark ? Color.white : Color.black.opacity(0.8))
-                    .shadow(color: .black.opacity(0.15), radius: 0.5, y: 0.5)
+                    .foregroundStyle(isDark ? Color.white.opacity(0.9) : Color.black.opacity(0.75))
                     .position(x: size.width * (showsSidebar ? 0.55 : 0.5), y: size.height * 0.66)
             }
             .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(isDark ? 0.1 : 0.07), lineWidth: 0.5)
+            }
         }
-        .shadow(color: .black.opacity(isDark ? 0.35 : 0.12), radius: 3, y: 1.5)
+        .shadow(color: .black.opacity(isDark ? 0.25 : 0.06), radius: 1.5, y: 0.5)
     }
 }
 
-/// The camera: a person against a plain grey wall, cropped by the camera's shape
-/// like a real webcam, with the export's light rim and soft shadow.
+/// The camera: a person against a flat grey wall, cropped by the camera's
+/// shape like a real webcam, in a thin white frame with a faint shadow.
 private struct MiniatureCamera: View {
     let radius: CGFloat
     let isDark: Bool
@@ -407,29 +429,23 @@ private struct MiniatureCamera: View {
             let headY = size.height * 0.5 - head * 0.12
 
             ZStack {
-                LinearGradient(
-                    colors: isDark
-                        ? [Color(white: 0.42), Color(white: 0.28)]
-                        : [Color(white: 0.8), Color(white: 0.63)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
+                isDark ? Color(white: 0.36) : Color(white: 0.82)
                 Ellipse()
-                    .fill(Color.white.opacity(0.88))
+                    .fill(Color.white.opacity(isDark ? 0.75 : 0.92))
                     .frame(width: head * 2.15, height: head * 1.4)
                     .position(x: size.width / 2, y: headY + head * 1.28)
                 Circle()
-                    .fill(Color.white.opacity(0.95))
+                    .fill(Color.white.opacity(isDark ? 0.85 : 1))
                     .frame(width: head, height: head)
                     .position(x: size.width / 2, y: headY)
             }
             .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.55), lineWidth: 1)
+                    .strokeBorder(Color.white.opacity(isDark ? 0.3 : 0.95), lineWidth: 1.25)
             }
         }
-        .shadow(color: .black.opacity(isDark ? 0.4 : 0.2), radius: 3, y: 1.5)
+        .shadow(color: .black.opacity(isDark ? 0.3 : 0.1), radius: 1.5, y: 0.5)
     }
 }
 
