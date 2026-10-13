@@ -503,6 +503,8 @@ nonisolated struct RecordingStudioLayout: Sendable {
     /// reframe export renders into a different aspect, this is the
     /// aspect-fill size so the content covers the card without stretching.
     let contentFillSize: CGSize
+    /// Source region the layout frames, before any animated zoom.
+    var contentCropRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     /// Set by a camera layout frame; the resting layout shows the screen
     /// and no camera until a frame is applied.
     var screenOpacity: CGFloat = 1
@@ -584,21 +586,13 @@ nonisolated struct RecordingStudioLayout: Sendable {
             // Draw the full source behind the card at the scale where the
             // selected source rectangle fills it exactly. The viewport anchor
             // then positions that rectangle without touching other layers.
-            if usesUniformPadding {
-                // Even-pixel export rounding can slightly change the canvas
-                // aspect. Fill that fraction of a pixel instead of exposing
-                // wallpaper at zero padding or stretching the source.
-                let fillHeight = max(
-                    cardRect.height / crop.height,
-                    cardRect.width / (crop.width * sourceAspect)
-                )
-                contentFillSize = CGSize(width: sourceAspect * fillHeight, height: fillHeight)
-            } else {
-                contentFillSize = CGSize(
-                    width: cardRect.width / crop.width,
-                    height: cardRect.height / crop.height
-                )
-            }
+            // Pixel rounding can slightly change the card's aspect. Use one
+            // uniform source scale for every output mode, including Fit.
+            let fillHeight = max(
+                cardRect.height / crop.height,
+                cardRect.width / (crop.width * sourceAspect)
+            )
+            contentFillSize = CGSize(width: sourceAspect * fillHeight, height: fillHeight)
         } else if let contentAspect, contentAspect > 0, cardRect.height > 0 {
             let fillHeight = max(cardRect.height, cardRect.width / contentAspect)
             contentFillSize = CGSize(
@@ -614,6 +608,7 @@ nonisolated struct RecordingStudioLayout: Sendable {
             bubbleRect: .zero,
             bubbleCornerRadius: 0,
             contentFillSize: contentFillSize,
+            contentCropRect: crop,
             cameraOpacity: 0
         )
     }

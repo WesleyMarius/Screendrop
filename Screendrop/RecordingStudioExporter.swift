@@ -72,7 +72,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         let fitContentAspect: CGFloat?
         let usesUniformPadding: Bool
         /// Zoom cameras for fill splits, which crop the screen.
-        let layoutZoom: RecordingCameraLayoutZoom
+        let motionTimeline: RecordingStudioMotionTimeline
 
         init(
             screenURL: URL,
@@ -99,7 +99,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             reframe: ReframeTrack? = nil,
             fitContentAspect: CGFloat? = nil,
             usesUniformPadding: Bool = false,
-            layoutZoom: RecordingCameraLayoutZoom = .none
+            motionTimeline: RecordingStudioMotionTimeline = .none
         ) {
             self.screenURL = screenURL
             self.cameraURL = cameraURL
@@ -125,7 +125,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             self.reframe = reframe
             self.fitContentAspect = fitContentAspect
             self.usesUniformPadding = usesUniformPadding
-            self.layoutZoom = layoutZoom
+            self.motionTimeline = motionTimeline
         }
     }
 
@@ -362,7 +362,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             reframe: configuration.reframe,
             fitContentAspect: configuration.fitContentAspect,
             usesUniformPadding: configuration.usesUniformPadding,
-            layoutZoom: configuration.layoutZoom
+            motionTimeline: configuration.motionTimeline
         )
 
         let screenAudioOutput = audioOutput
@@ -751,7 +751,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let subtitleStyle: SubtitleBarStyle
     private let karaokeTimeline: KaraokeTimeline?
     private let reframe: ReframeTrack?
-    private let layoutZoom: RecordingCameraLayoutZoom
+    private let motionTimeline: RecordingStudioMotionTimeline
     private var artworkImageCache: [String: CGImage] = [:]
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
@@ -792,7 +792,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         reframe: ReframeTrack? = nil,
         fitContentAspect: CGFloat? = nil,
         usesUniformPadding: Bool = false,
-        layoutZoom: RecordingCameraLayoutZoom = .none
+        motionTimeline: RecordingStudioMotionTimeline = .none
     ) {
         self.canvasSize = canvasSize
         self.videoCropRect = RecordingVideoCropGeometry.normalized(videoCropRect)
@@ -825,7 +825,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         self.karaokeTimeline = karaokeTimeline
         self.reframe = reframe
         // Without a camera every layout resolves to the bare screen.
-        self.layoutZoom = includeBubble ? layoutZoom : .none
+        self.motionTimeline = motionTimeline
         self.timing = timing
         self.pointerScale = style.cursorScale
         self.colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -843,6 +843,14 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         layout: RecordingStudioLayout,
         settled: SettledLayout?
     ) {
+        if let frame = motionTimeline.layoutFrame(at: editorTime, canvasSize: canvasSize) {
+            let layout = baseLayout.applying(frame)
+            guard motionTimeline.isLayoutSettled(at: editorTime) else { return (layout, nil) }
+            return (layout, SettledLayout(
+                layout: layoutTimeline.layout(at: editorTime),
+                isShrunk: motionTimeline.isZoomed(at: editorTime)
+            ))
+        }
         let state = layoutTimeline.state(at: editorTime)
         let zoomProgress = viewportTimeline.zoomProgress(at: editorTime)
         let layout = layoutResolver.layout(for: state, zoomProgress: zoomProgress)
@@ -890,13 +898,11 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         return resources
     }
 
-    /// The virtual camera for a frame: a fill split's own zoom camera while
-    /// one shows, otherwise the reframe crop-and-follow track when exporting
-    /// into a different aspect, or the zoom viewport.
+    /// The viewport derived from the shared screen-motion rectangle. Older
+    /// callers without that track retain the reframe/zoom camera fallback.
     private func viewportFrame(at editorTime: TimeInterval) -> ViewportFrame {
-        let base = layoutZoom.viewport(at: editorTime, state: layoutTimeline.state(at: editorTime)) { time in
-            reframe?.frame(at: time) ?? viewportTimeline.frame(at: time)
-        }
+        if let viewport = motionTimeline.viewport(at: editorTime) { return viewport }
+        let base = reframe?.frame(at: editorTime) ?? viewportTimeline.frame(at: editorTime)
         return RecordingVideoCropGeometry.viewport(base, crop: videoCropRect)
     }
 

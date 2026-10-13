@@ -160,7 +160,7 @@ enum RecordingSessionRenderer {
             )
             : aspect.canvasSize(for: canvasSize)
         let videoCropRect = document?.normalizedVideoCropRect ?? CGRect(x: 0, y: 0, width: 1, height: 1)
-        let layoutZoom = RecordingCameraLayoutZoom.build(
+        let motionTimeline = RecordingStudioMotionTimeline.build(
             canvasSize: exportCanvasSize,
             style: style,
             usesUniformPadding: aspect == .original,
@@ -206,7 +206,7 @@ enum RecordingSessionRenderer {
             reframe: reframe,
             fitContentAspect: fitContentAspect,
             usesUniformPadding: aspect == .original,
-            layoutZoom: layoutZoom
+            motionTimeline: motionTimeline
         )
     }
 

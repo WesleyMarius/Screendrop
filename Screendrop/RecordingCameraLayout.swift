@@ -398,13 +398,34 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
             )
         case .split:
             let split = splitRects(for: layout)
-            return RecordingCameraLayoutFrame(
+            let resting = RecordingCameraLayoutFrame(
                 screenRect: split.screen,
                 screenOpacity: 1,
                 cameraRect: split.camera,
                 cameraCornerRadius: base.cardCornerRadius,
                 cameraOpacity: 1
             )
+            guard zoomProgress > 0 else { return resting }
+            let aspect = min(max(split.camera.width / max(split.camera.height, 1), 9 / 16), 16 / 9)
+            let side = minDimension * 0.5
+            let cameraSize = CGSize(width: min(side, side * aspect), height: min(side, side / aspect))
+            let inset = max(minDimension * 0.01, CGFloat(layout.spacing) * minDimension * 0.25)
+            let isLandscape = base.canvasSize.width >= base.canvasSize.height
+            let leading = layout.side == .leading
+            let camera = CGRect(
+                x: isLandscape && leading ? inset : base.canvasSize.width - inset - cameraSize.width,
+                y: !isLandscape && leading ? inset : base.canvasSize.height - inset - cameraSize.height,
+                width: cameraSize.width,
+                height: cameraSize.height
+            )
+            let zoomed = RecordingCameraLayoutFrame(
+                screenRect: card,
+                screenOpacity: 1,
+                cameraRect: camera,
+                cameraCornerRadius: base.cardCornerRadius,
+                cameraOpacity: 1
+            )
+            return .interpolate(resting, zoomed, progress: CGFloat(zoomProgress))
         }
     }
 
@@ -467,8 +488,13 @@ nonisolated struct RecordingCameraLayoutResolver: Sendable {
         let canvas = CGRect(origin: .zero, size: base.canvasSize)
         let gap = CGFloat(layout.spacing) * minDimension
         let area = canvas.insetBy(dx: min(gap, canvas.width / 4), dy: min(gap, canvas.height / 4))
-        let card = base.cardRect
-        let aspect = card.height > 0 ? max(0.1, card.width / card.height) : 16 / 9
+        // Fit is measured against the selected source, even when the output
+        // aspect has already cropped the resting screen card.
+        let visibleSize = CGSize(
+            width: base.contentFillSize.width * base.contentCropRect.width,
+            height: base.contentFillSize.height * base.contentCropRect.height
+        )
+        let aspect = visibleSize.height > 0 ? max(0.1, visibleSize.width / visibleSize.height) : 16 / 9
         let ratio = CGFloat(layout.splitRatio)
         let cameraFirst = layout.side == .leading
         let fills = layout.screenFit == .fill
@@ -527,8 +553,10 @@ extension RecordingStudioLayout {
     /// its shape, cropping the overflow when a fill split reshapes it - so
     /// zoom and cursor math carry over unchanged.
     nonisolated func applying(_ frame: RecordingCameraLayoutFrame) -> RecordingStudioLayout {
-        let scale = cardRect.width > 0 && cardRect.height > 0
-            ? max(frame.screenRect.width / cardRect.width, frame.screenRect.height / cardRect.height)
+        let visibleWidth = contentFillSize.width * contentCropRect.width
+        let visibleHeight = contentFillSize.height * contentCropRect.height
+        let scale = visibleWidth > 0 && visibleHeight > 0
+            ? max(frame.screenRect.width / visibleWidth, frame.screenRect.height / visibleHeight)
             : 1
         return RecordingStudioLayout(
             canvasSize: canvasSize,
@@ -540,6 +568,7 @@ extension RecordingStudioLayout {
                 width: contentFillSize.width * scale,
                 height: contentFillSize.height * scale
             ),
+            contentCropRect: contentCropRect,
             screenOpacity: frame.screenOpacity,
             cameraOpacity: frame.cameraOpacity
         )
@@ -713,94 +742,5 @@ private extension CGRect {
             width: width * scale,
             height: height * scale
         )
-    }
-}
-
-// MARK: - Zooming inside a cropped card
-
-/// A fill split shows only a slice of the screen recording. Its camera is
-/// the same zoom timeline as everywhere else - one spring moving the zoom
-/// and the framing together - built for that narrower slice, so a zoom
-/// centres its target in what the card actually shows. Unzoomed it rests
-/// still, exactly like the full-width card. Morphs blend between cameras
-/// along with the layout.
-nonisolated struct RecordingCameraLayoutZoom: Sendable {
-    private let timelines: [RecordingCameraLayout: ViewportTimeline]
-
-    static let none = RecordingCameraLayoutZoom(timelines: [:])
-
-    /// `canvasSize` through `contentCropRect` must describe the resting
-    /// layout exactly as the compositor builds it.
-    static func build(
-        canvasSize: CGSize,
-        style: RecordingStudioStyle,
-        usesUniformPadding: Bool,
-        contentAspect: CGFloat?,
-        contentMode: RecordingStudioLayout.ContentMode,
-        contentCropRect: CGRect,
-        showsCamera: Bool,
-        layoutTimeline: RecordingCameraLayoutTimeline,
-        cues: [ZoomCue],
-        capture: PointerCaptureFile,
-        clipTimeline: RecordingClipTimeline
-    ) -> RecordingCameraLayoutZoom {
-        let fills = Set(layoutTimeline.layouts.filter { $0.kind == .split && $0.screenFit == .fill })
-        guard showsCamera, !fills.isEmpty, canvasSize.width > 0, canvasSize.height > 0 else { return .none }
-        let base = RecordingStudioLayout.make(
-            canvasSize: canvasSize,
-            style: style,
-            usesUniformPadding: usesUniformPadding,
-            contentAspect: contentAspect,
-            contentMode: contentMode,
-            contentCropRect: contentCropRect
-        )
-        let resolver = RecordingCameraLayoutResolver(base: base, style: style, showsCamera: true)
-        var timelines: [RecordingCameraLayout: ViewportTimeline] = [:]
-        for layout in fills {
-            let applied = base.applying(resolver.frame(for: layout))
-            guard applied.contentFillSize.width > 0, applied.contentFillSize.height > 0 else { continue }
-            let visible = CGSize(
-                width: applied.cardRect.width / applied.contentFillSize.width,
-                height: applied.cardRect.height / applied.contentFillSize.height
-            )
-            // A card that still shows the whole recording uses the ordinary camera.
-            guard visible.width < 0.999 || visible.height < 0.999 else { continue }
-            timelines[layout] = ViewportTimeline.build(
-                cues: cues,
-                capture: capture,
-                clipTimeline: clipTimeline,
-                visibleFraction: visible
-            )
-        }
-        return RecordingCameraLayoutZoom(timelines: timelines)
-    }
-
-    /// The camera at an editor time: a fill split's own zoom timeline while
-    /// one shows, `base` elsewhere, blended across a morph.
-    func viewport(
-        at time: TimeInterval,
-        state: RecordingCameraLayoutTimeline.State,
-        base: (TimeInterval) -> ViewportFrame
-    ) -> ViewportFrame {
-        guard !timelines.isEmpty else { return base(time) }
-        func camera(for layout: RecordingCameraLayout) -> ViewportFrame {
-            timelines[layout]?.frame(at: time) ?? base(time)
-        }
-        switch state {
-        case .settled(let layout):
-            return camera(for: layout)
-        case .transition(let from, let to, let progress):
-            guard timelines[from] != nil || timelines[to] != nil else { return base(time) }
-            let a = camera(for: from)
-            let b = camera(for: to)
-            let t = RecordingCameraLayoutTimeline.ease(progress)
-            return ViewportFrame(
-                magnification: a.magnification + (b.magnification - a.magnification) * t,
-                anchor: CGPoint(
-                    x: a.anchor.x + (b.anchor.x - a.anchor.x) * t,
-                    y: a.anchor.y + (b.anchor.y - a.anchor.y) * t
-                )
-            )
-        }
     }
 }

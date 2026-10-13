@@ -80,8 +80,9 @@ final class RecordingStudioModel {
             }
             if oldValue.camera.layout != style.camera.layout {
                 rebuildCameraLayoutTimeline()
-            } else if oldValue.camera != style.camera || oldValue.padding != style.padding {
-                rebuildLayoutZoom()
+            } else if oldValue.camera != style.camera || oldValue.padding != style.padding
+                || oldValue.cornerRadius != style.cornerRadius {
+                rebuildMotionTimeline()
             }
             scheduleProjectSave()
         }
@@ -160,7 +161,7 @@ final class RecordingStudioModel {
     var videoCropRect = CropRectEditor.unit {
         didSet {
             scheduleProjectSave()
-            if oldValue != videoCropRect { rebuildLayoutZoom() }
+            if oldValue != videoCropRect { rebuildMotionTimeline() }
         }
     }
     private(set) var isCroppingVideo = false
@@ -169,9 +170,8 @@ final class RecordingStudioModel {
     /// The preview's copy of the reframe camera, kept current with every
     /// edit that would change the exported crop.
     private(set) var previewReframe: ReframeTrack?
-    /// The zoom cameras of fill splits, which show only a slice of the
-    /// screen. Shared by the preview and the export.
-    private(set) var layoutZoom = RecordingCameraLayoutZoom.none
+    /// Shared screen, clipping-card, and camera motion for preview and export.
+    private(set) var motionTimeline = RecordingStudioMotionTimeline.none
     private var reframeFocusTimeline: PointerTimeline?
     private var reframeFocusResolved = false
     private(set) var subtitleCues: [RecordingSubtitleCue] = []
@@ -1175,7 +1175,7 @@ final class RecordingStudioModel {
         if next != cameraLayoutTimeline {
             cameraLayoutTimeline = next
         }
-        if rebuildsZoom { rebuildLayoutZoom() }
+        if rebuildsZoom { rebuildMotionTimeline() }
     }
 
     private func replaceLayoutCues(_ cues: [RecordingCameraLayoutCue]) {
@@ -1359,9 +1359,8 @@ final class RecordingStudioModel {
     }
 
     private func rebuildViewportTimeline() {
-        // Layout cues live on the same edited timeline, so every cut,
-        // trim or speed change that moves zooms moves them too. The fill
-        // splits' zoom cameras rebuild below, with the preview reframe.
+        // Layout cues live on the edited timeline. Rebuild their shared
+        // motion with every cut, trim, speed change, or zoom edit.
         rebuildCameraLayoutTimeline(rebuildsZoom: false)
         guard sourceDuration > 0 else {
             viewportTimeline = .identity
@@ -2053,26 +2052,25 @@ final class RecordingStudioModel {
             reframe: reframe,
             fitContentAspect: fitContentAspect,
             usesUniformPadding: exportAspect == .original,
-            layoutZoom: makeLayoutZoom(reframe: reframe)
+            motionTimeline: makeMotionTimeline(reframe: reframe)
         )
     }
 
-    /// The zoom camera of each fill split on the timeline, on the export
-    /// canvas exactly as the compositor lays it out.
-    private func makeLayoutZoom(reframe: ReframeTrack?) -> RecordingCameraLayoutZoom {
-        guard showsCameraLayer, sourceDuration > 0 else { return .none }
+    /// Shared screen and camera motion, on the same canvas used by export.
+    private func makeMotionTimeline(reframe: ReframeTrack?) -> RecordingStudioMotionTimeline {
+        guard sourceDuration > 0 else { return .none }
         let fitContentAspect: CGFloat? =
             (exportAspect == .original || exportAspectMode == .fit) && videoSize.height > 0
                 ? videoSize.width / videoSize.height
                 : nil
-        return RecordingCameraLayoutZoom.build(
+        return RecordingStudioMotionTimeline.build(
             canvasSize: basePreviewCanvasSize,
             style: style,
             usesUniformPadding: exportAspect == .original,
             contentAspect: reframe?.sourceAspect ?? fitContentAspect,
             contentMode: fitContentAspect != nil && reframe == nil ? .fit : .fill,
             contentCropRect: videoCropRect,
-            showsCamera: true,
+            showsCamera: showsCameraLayer,
             layoutTimeline: cameraLayoutTimeline,
             cues: zoomEnabled ? zoomCues : [],
             capture: pointerCapture,
@@ -2080,9 +2078,9 @@ final class RecordingStudioModel {
         )
     }
 
-    private func rebuildLayoutZoom() {
+    private func rebuildMotionTimeline() {
         guard isLoaded else { return }
-        layoutZoom = makeLayoutZoom(reframe: previewReframe)
+        motionTimeline = makeMotionTimeline(reframe: previewReframe)
     }
 
     /// The crop-and-follow camera for non-original aspect exports. Focus
@@ -2123,7 +2121,7 @@ final class RecordingStudioModel {
     private func rebuildPreviewReframe() {
         guard isLoaded else { return }
         previewReframe = makeReframeTrack()
-        layoutZoom = makeLayoutZoom(reframe: previewReframe)
+        motionTimeline = makeMotionTimeline(reframe: previewReframe)
     }
 
     // MARK: - Preview canvas
@@ -2167,15 +2165,11 @@ final class RecordingStudioModel {
         exportAspect == .original || exportAspectMode == .fit ? .fit : .fill
     }
 
-    /// Virtual camera for the preview: the reframe crop when active, the
-    /// zoom viewport otherwise (including Fit mode, where zooms play
-    /// inside the fitted card).
+    /// Shared rendered viewport, with the uncomposed camera retained while
+    /// the user edits the source crop.
     func previewViewportFrame(at time: TimeInterval) -> ViewportFrame {
-        let base = isCroppingVideo
-            ? previewReframe?.frame(at: time) ?? viewportFrame(at: time)
-            : layoutZoom.viewport(at: time, state: cameraLayoutTimeline.state(at: time)) { time in
-                previewReframe?.frame(at: time) ?? viewportFrame(at: time)
-            }
+        if !isCroppingVideo, let viewport = motionTimeline.viewport(at: time) { return viewport }
+        let base = previewReframe?.frame(at: time) ?? viewportFrame(at: time)
         return RecordingVideoCropGeometry.viewport(base, crop: previewVideoCropRect)
     }
 

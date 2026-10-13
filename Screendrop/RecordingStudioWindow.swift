@@ -474,7 +474,11 @@ private struct StudioCanvasComposition: View {
         _ resolver: RecordingCameraLayoutResolver,
         timeline: RecordingCameraLayoutTimeline
     ) -> RecordingCameraLayoutFrame {
-        isEditingVideoCrop
+        if !isEditingVideoCrop, timeline == model.cameraLayoutTimeline,
+           let frame = model.motionTimeline.layoutFrame(at: model.displayTime, canvasSize: canvasSize) {
+            return frame
+        }
+        return isEditingVideoCrop
             ? resolver.frame(for: .screenOnly)
             : resolver.frame(
                 for: timeline.state(at: model.displayTime),
