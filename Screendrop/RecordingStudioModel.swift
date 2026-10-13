@@ -80,6 +80,9 @@ final class RecordingStudioModel {
             if isLoaded, oldValue.background != style.background {
                 RecordingStudioDefaults.background = style.background
             }
+            if oldValue.camera.isVisible != style.camera.isVisible {
+                updateCameraMatteCache()
+            }
             if oldValue.camera.layout != style.camera.layout {
                 rebuildCameraLayoutTimeline()
             } else if oldValue.camera != style.camera || oldValue.padding != style.padding
@@ -1203,7 +1206,7 @@ final class RecordingStudioModel {
     /// and starts over after.
     private func updateCameraMatteCache() {
         let isRendering = exportState.isExporting || shareState.isBusy
-        guard isLoaded, !isTornDown, !isRendering, hasCameraVideo,
+        guard isLoaded, !isTornDown, !isRendering, showsCameraLayer,
               cameraLayoutTimeline.usesCutout, let session,
               !StudioCameraMatteCache.isComplete(forCamera: session.cameraURL)
         else {
