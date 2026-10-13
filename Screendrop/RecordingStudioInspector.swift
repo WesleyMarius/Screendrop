@@ -43,6 +43,7 @@ private enum StudioInspectorContent: Hashable {
     case look
     case page(StudioInspectorPage)
     case zoom(UUID)
+    case layout(UUID)
 }
 
 struct StudioInspector: View {
@@ -65,6 +66,10 @@ struct StudioInspector: View {
                 case .zoom:
                     if let cue = model.selectedCue {
                         selectedZoomPage(for: cue)
+                    }
+                case .layout:
+                    if let cue = model.selectedLayoutCue {
+                        selectedLayoutPage(for: cue)
                     }
                 }
             }
@@ -108,6 +113,7 @@ struct StudioInspector: View {
     /// A selected zoom wins: clicking one is always a request to edit it.
     private var content: StudioInspectorContent {
         if let cue = model.selectedCue { return .zoom(cue.id) }
+        if let cue = model.selectedLayoutCue { return .layout(cue.id) }
         if let page, availablePages.contains(page) { return .page(page) }
         return .look
     }
@@ -514,23 +520,61 @@ struct StudioInspector: View {
         }
     }
 
+    /// The default layout. Cues on the timeline's Layout lane switch to
+    /// another one for part of the video.
     private var cameraControls: some View {
-        InspectorFieldPair {
-            InspectorSlider(
-                "Size",
-                value: $model.style.camera.size,
-                range: 0.12...0.45,
-                format: .percent()
-            )
-        } trailing: {
-            InspectorSlider(
-                "Rounding",
-                value: $model.style.camera.roundness,
-                range: 0.05...0.5,
-                format: .percent()
+        VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+            StudioCameraLayoutPicker(model: model, layout: model.style.camera.layout) { layout, isContinuous in
+                if isContinuous {
+                    model.style.camera.layout = layout
+                } else {
+                    withAnimation(.morphQuickIfAllowed) { model.style.camera.layout = layout }
+                }
+            }
+
+            InspectorHint(
+                model.cameraLayoutCues.isEmpty
+                    ? "Drag across the Layout lane to switch layouts for part of the video."
+                    : "Used wherever the Layout lane has no layout of its own."
             )
         }
-        .help("Drag the camera directly on the canvas to place it")
+    }
+
+    // MARK: Layout cue
+
+    private func selectedLayoutPage(for selected: RecordingCameraLayoutCue) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            pageHeader(
+                "Layout",
+                systemImage: selected.layout.systemImage,
+                backTitle: page?.title ?? "Look",
+                onBack: {
+                    model.selectedLayoutCueID = nil
+                }
+            ) {
+                InspectorIconButton(systemName: "trash", help: "Remove Layout") {
+                    withAnimation(.morphIfAllowed) { model.removeLayoutCue(id: selected.id) }
+                }
+            }
+
+            pageBody(isActive: model.showsCameraLayer) {
+                VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+                    if !model.showsCameraLayer {
+                        InspectorHint("The camera is turned off for this recording.")
+                    }
+                    StudioCameraLayoutPicker(model: model, layout: selected.layout) { layout, isContinuous in
+                        var updated = selected
+                        updated.layout = layout
+                        if isContinuous {
+                            model.resizeLayoutCue(updated)
+                        } else {
+                            model.updateLayoutCue(updated, actionName: "Change Layout")
+                        }
+                    }
+                    InspectorHint("Morphs in at the start of this stretch and back to the default at its end.")
+                }
+            }
+        }
     }
 
     // MARK: Motion

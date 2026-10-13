@@ -121,6 +121,8 @@ private struct RecordingStudioContent: View {
             withAnimation(.morphIfAllowed) {
                 if let selectedCueID = model.selectedCueID {
                     model.removeZoomCue(id: selectedCueID)
+                } else if let selectedLayoutCueID = model.selectedLayoutCueID {
+                    model.removeLayoutCue(id: selectedLayoutCueID)
                 } else if model.selectedClipID != nil {
                     model.deleteSelectedClip()
                 }
@@ -280,7 +282,6 @@ private struct StudioCanvas: View {
             let cropEditingLayout = RecordingStudioLayout.make(
                 canvasSize: canvasSize,
                 style: model.style,
-                includeBubble: model.hasCameraVideo,
                 usesUniformPadding: model.exportAspect == .original,
                 contentAspect: model.sourceVideoAspect,
                 contentMode: .fit
@@ -431,23 +432,68 @@ private struct StudioPlaybackFlashView: View {
 /// The complete canvas composition. A video crop changes only the screen card
 /// layout and viewport; background, camera and captions remain in canvas space.
 /// Original sizes that canvas to the visible source plus an equal border.
+///
+/// The camera layout timeline moves the card and the camera every frame, the
+/// same way the exporter resolves them. An edit made while paused (picking a
+/// layout, adding a cue) morphs from what was on screen into the new frame
+/// instead of jumping.
 private struct StudioCanvasComposition: View {
     @Bindable var model: RecordingStudioModel
     let canvasSize: CGSize
     let isEditingVideoCrop: Bool
 
-    var body: some View {
-        let layout = RecordingStudioLayout.make(
+    private struct LayoutMorph: Equatable {
+        let id = UUID()
+        let from: RecordingCameraLayoutFrame
+        let start: Date
+    }
+
+    private static let editMorphDuration: TimeInterval = 0.45
+
+    @State private var layoutMorph: LayoutMorph?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var baseLayout: RecordingStudioLayout {
+        RecordingStudioLayout.make(
             canvasSize: canvasSize,
             style: model.style,
-            includeBubble: model.hasCameraVideo,
             usesUniformPadding: model.exportAspect == .original,
             contentAspect: isEditingVideoCrop ? model.sourceVideoAspect : model.previewContentAspect,
             contentMode: isEditingVideoCrop ? .fit : model.previewContentMode,
             contentCropRect: isEditingVideoCrop ? CropRectEditor.unit : model.videoCropRect
         )
+    }
 
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !model.isPlaying)) { _ in
+    private var resolver: RecordingCameraLayoutResolver {
+        RecordingCameraLayoutResolver(base: baseLayout, style: model.style, showsCamera: model.showsCameraLayer)
+    }
+
+    /// Where the layout timeline puts everything at the playhead. Cropping
+    /// works on the bare screen.
+    private func targetFrame(
+        _ resolver: RecordingCameraLayoutResolver,
+        timeline: RecordingCameraLayoutTimeline
+    ) -> RecordingCameraLayoutFrame {
+        isEditingVideoCrop
+            ? resolver.frame(for: .screenOnly)
+            : resolver.frame(for: timeline.state(at: model.displayTime))
+    }
+
+    var body: some View {
+        let resolver = resolver
+
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !model.isPlaying && layoutMorph == nil)) { context in
+            let target = targetFrame(resolver, timeline: model.cameraLayoutTimeline)
+            let frame = layoutMorph.map { morph in
+                RecordingCameraLayoutFrame.interpolate(
+                    morph.from,
+                    target,
+                    progress: CGFloat(RecordingCameraLayoutTimeline.ease(
+                        context.date.timeIntervalSince(morph.start) / Self.editMorphDuration
+                    ))
+                )
+            } ?? target
+            let layout = resolver.base.applying(frame)
             let zoomTarget = zoomTargetCue
             // While a zoom's target is on show the frame stays unzoomed, so
             // the target reads against the whole picture.
@@ -460,58 +506,27 @@ private struct StudioCanvasComposition: View {
                     .frame(width: canvasSize.width, height: canvasSize.height)
                     .clipped()
 
-                StudioPlayerLayerView(player: model.screenPlayer, gravity: .resize)
-                    .frame(
-                        width: layout.contentFillSize.width,
-                        height: layout.contentFillSize.height
-                    )
-                    .scaleEffect(state.magnification)
-                    .offset(
-                        x: (0.5 - state.anchor.x) * state.magnification * layout.contentFillSize.width,
-                        y: (0.5 - state.anchor.y) * state.magnification * layout.contentFillSize.height
-                    )
-                    .frame(width: layout.cardRect.width, height: layout.cardRect.height)
-                    .overlay {
-                        if let pointer = model.pointerFrame(at: model.displayTime) {
-                            StudioCursorOverlay(
-                                pointer: pointer,
-                                artwork: model.artwork(id: pointer.artworkID),
-                                state: state,
-                                cardSize: layout.cardRect.size,
-                                contentSize: layout.contentFillSize,
-                                cursorScale: model.style.cursorScale,
-                                showsClickEffect: model.showsPressEffects
-                            )
-                        }
-                    }
-                    .clipShape(RoundedRectangle(cornerRadius: layout.cardCornerRadius, style: .continuous))
-                    .overlay {
-                        if let caption = model.keystrokeCaption(at: model.displayTime) {
-                            StudioKeystrokeCaptionView(
-                                caption: caption,
-                                placement: model.keystrokePlacement,
-                                cardSize: layout.cardRect.size
-                            )
-                        }
-                    }
-                    .overlay {
-                        if let badge = model.speedBadge(at: model.displayTime) {
-                            StudioSpeedBadgeView(
-                                badge: badge,
-                                placement: model.speedBadgePlacement,
-                                cardSize: layout.cardRect.size
-                            )
-                        }
-                    }
-                    .shadow(
-                        color: .black.opacity((model.previewBackground ?? model.style.background) == .none ? 0 : 0.55 * model.style.shadow),
-                        radius: min(canvasSize.width, canvasSize.height) * 0.045 * model.style.shadow,
-                        y: min(canvasSize.width, canvasSize.height) * 0.016 * model.style.shadow
-                    )
-                    .position(x: layout.cardRect.midX, y: layout.cardRect.midY)
+                screenCard(layout: layout, state: state)
+                    .opacity(layout.screenOpacity)
 
-                if model.isCameraVisible(at: model.displayTime), layout.bubbleRect.width > 0 {
-                    StudioCameraBubble(model: model, layout: layout)
+                if model.showsCameraLayer, layout.bubbleRect.width > 0, layout.cameraOpacity > 0.001 {
+                    let settled = model.cameraLayoutTimeline.state(at: model.displayTime).settledLayout
+                    StudioCameraBubble(
+                        model: model,
+                        layout: layout,
+                        isMovable: !isEditingVideoCrop && !model.isPlaying && frame == target
+                            && settled?.kind == .pictureInPicture,
+                        destination: { corner in
+                            var moved = settled ?? model.style.camera.layout
+                            moved.corner = corner
+                            let destination = resolver.frame(for: moved)
+                            return (destination.cameraRect, destination.cameraCornerRadius)
+                        },
+                        onDrop: { dropped, corner in
+                            dropCamera(at: dropped, into: corner, from: frame)
+                        }
+                    )
+                    .opacity(layout.cameraOpacity)
                 }
 
                 if let subtitle = model.subtitleText(at: model.displayTime) {
@@ -523,7 +538,7 @@ private struct StudioCanvasComposition: View {
                     )
                 }
 
-                if let zoomTarget {
+                if let zoomTarget, layout.screenOpacity > 0.5 {
                     StudioZoomTargetOverlay(
                         model: model,
                         cue: zoomTarget,
@@ -535,6 +550,105 @@ private struct StudioCanvasComposition: View {
             .frame(width: canvasSize.width, height: canvasSize.height)
         }
         .frame(width: canvasSize.width, height: canvasSize.height)
+        .onChange(of: model.cameraLayoutTimeline) { old, _ in
+            morphFromEdit(previous: targetFrame(resolver, timeline: old), resolver: resolver)
+        }
+        .onChange(of: model.showsCameraLayer) { old, _ in
+            let previous = RecordingCameraLayoutResolver(base: resolver.base, style: model.style, showsCamera: old)
+            morphFromEdit(previous: targetFrame(previous, timeline: model.cameraLayoutTimeline), resolver: resolver)
+        }
+    }
+
+    /// Moves the corner camera to `corner` of whichever layout is showing,
+    /// settling from where it was let go.
+    private func dropCamera(at dropped: CGRect, into corner: RecordingCameraLayout.Corner, from frame: RecordingCameraLayoutFrame) {
+        if !reduceMotion {
+            var from = frame
+            from.cameraRect = dropped
+            startMorph(from: from)
+        }
+        model.editLayout(atEditorTime: model.displayTime, actionName: "Move Camera") { $0.corner = corner }
+    }
+
+    private func startMorph(from: RecordingCameraLayoutFrame) {
+        let morph = LayoutMorph(from: from, start: Date())
+        layoutMorph = morph
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.editMorphDuration))
+            if layoutMorph == morph { layoutMorph = nil }
+        }
+    }
+
+    /// Starts a short morph from what the canvas showed before an edit.
+    /// Playback already moves through the timeline's own morphs.
+    private func morphFromEdit(previous: RecordingCameraLayoutFrame, resolver: RecordingCameraLayoutResolver) {
+        guard !model.isPlaying, !reduceMotion else { return }
+        let now = Date()
+        // Mid-morph, start from where the canvas is rather than where the
+        // interrupted morph began.
+        let from = layoutMorph.map { morph in
+            RecordingCameraLayoutFrame.interpolate(
+                morph.from,
+                previous,
+                progress: CGFloat(RecordingCameraLayoutTimeline.ease(
+                    now.timeIntervalSince(morph.start) / Self.editMorphDuration
+                ))
+            )
+        } ?? previous
+        guard from != targetFrame(resolver, timeline: model.cameraLayoutTimeline) else { return }
+        startMorph(from: from)
+    }
+
+    private func screenCard(layout: RecordingStudioLayout, state: ViewportFrame) -> some View {
+        StudioPlayerLayerView(player: model.screenPlayer, gravity: .resize)
+            .frame(
+                width: layout.contentFillSize.width,
+                height: layout.contentFillSize.height
+            )
+            .scaleEffect(state.magnification)
+            .offset(
+                x: (0.5 - state.anchor.x) * state.magnification * layout.contentFillSize.width,
+                y: (0.5 - state.anchor.y) * state.magnification * layout.contentFillSize.height
+            )
+            .frame(width: layout.cardRect.width, height: layout.cardRect.height)
+            .overlay {
+                if let pointer = model.pointerFrame(at: model.displayTime) {
+                    StudioCursorOverlay(
+                        pointer: pointer,
+                        artwork: model.artwork(id: pointer.artworkID),
+                        state: state,
+                        cardSize: layout.cardRect.size,
+                        contentSize: layout.contentFillSize,
+                        cursorScale: model.style.cursorScale,
+                        showsClickEffect: model.showsPressEffects
+                    )
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: layout.cardCornerRadius, style: .continuous))
+            .overlay {
+                if let caption = model.keystrokeCaption(at: model.displayTime) {
+                    StudioKeystrokeCaptionView(
+                        caption: caption,
+                        placement: model.keystrokePlacement,
+                        cardSize: layout.cardRect.size
+                    )
+                }
+            }
+            .overlay {
+                if let badge = model.speedBadge(at: model.displayTime) {
+                    StudioSpeedBadgeView(
+                        badge: badge,
+                        placement: model.speedBadgePlacement,
+                        cardSize: layout.cardRect.size
+                    )
+                }
+            }
+            .shadow(
+                color: .black.opacity((model.previewBackground ?? model.style.background) == .none ? 0 : 0.55 * model.style.shadow),
+                radius: min(canvasSize.width, canvasSize.height) * 0.045 * model.style.shadow,
+                y: min(canvasSize.width, canvasSize.height) * 0.016 * model.style.shadow
+            )
+            .position(x: layout.cardRect.midX, y: layout.cardRect.midY)
     }
 
     /// The selected zoom, shown as a target on the paused canvas.
@@ -1060,46 +1174,57 @@ private enum StudioCursorImageCache {
     }
 }
 
-/// The draggable talking-head bubble. It snaps to the canvas corners, edge
-/// midpoints and center lines (inside the same safe margin the layout keeps),
-/// drawing a guide for each axis it has snapped on.
+/// The camera on the canvas. A corner camera can be picked up and dropped
+/// anywhere; it settles into whichever corner of the screen card it was let
+/// go nearest, with that corner previewed while dragging. Other layouts
+/// place the camera themselves, so there it takes no clicks at all.
 private struct StudioCameraBubble: View {
     @Bindable var model: RecordingStudioModel
     let layout: RecordingStudioLayout
+    let isMovable: Bool
+    /// Where the camera would land in each corner.
+    let destination: (RecordingCameraLayout.Corner) -> (rect: CGRect, radius: CGFloat)
+    /// Called with the rect it was let go at and the corner it snaps to.
+    let onDrop: (CGRect, RecordingCameraLayout.Corner) -> Void
 
-    private static let snapDistance: CGFloat = 8
     private static let hoverRingPadding: CGFloat = 3
 
-    private struct SnapGuides: Equatable {
-        var x: CGFloat?
-        var y: CGFloat?
-    }
-
-    /// Bubble center in canvas points when the drag began.
-    @State private var dragStartCenter: CGPoint?
-    @State private var guides = SnapGuides()
+    @State private var dragOffset: CGSize?
     @State private var isHovering = false
 
     var body: some View {
-        let rect = layout.bubbleRect
+        let rect = layout.bubbleRect.offsetBy(dx: dragOffset?.width ?? 0, dy: dragOffset?.height ?? 0)
         let canvas = layout.canvasSize
-        let isActive = isHovering || dragStartCenter != nil
+        let isActive = isMovable && (isHovering || dragOffset != nil)
+        let radius = layout.bubbleCornerRadius
 
         ZStack(alignment: .topLeading) {
-            guideLines(in: canvas)
+            if dragOffset != nil {
+                let target = destination(corner(for: rect))
+                RoundedRectangle(cornerRadius: target.radius, style: .continuous)
+                    .fill(Palette.highlight.opacity(0.14))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: target.radius, style: .continuous)
+                            .strokeBorder(Palette.highlight.opacity(0.8), style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
+                    }
+                    .frame(width: target.rect.width, height: target.rect.height)
+                    .offset(x: target.rect.minX, y: target.rect.minY)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
 
             StudioPlayerLayerView(player: model.cameraPlayer, gravity: .resizeAspectFill)
                 .frame(width: rect.width, height: rect.height)
-                .clipShape(RoundedRectangle(cornerRadius: layout.bubbleCornerRadius, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: layout.bubbleCornerRadius, style: .continuous)
+                    RoundedRectangle(cornerRadius: radius, style: .continuous)
                         .strokeBorder(.white.opacity(0.25), lineWidth: 1)
                 }
                 .overlay {
                     if isActive {
                         // Nested radius: the ring sits `hoverRingPadding` outside.
                         RoundedRectangle(
-                            cornerRadius: layout.bubbleCornerRadius + Self.hoverRingPadding,
+                            cornerRadius: radius + Self.hoverRingPadding,
                             style: .continuous
                         )
                         .strokeBorder(Palette.highlight, lineWidth: 2)
@@ -1112,100 +1237,44 @@ private struct StudioCameraBubble: View {
                     radius: min(canvas.width, canvas.height) * 0.022,
                     y: min(canvas.width, canvas.height) * 0.009
                 )
-                .contentShape(RoundedRectangle(cornerRadius: layout.bubbleCornerRadius, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                 .onHover { isHovering = $0 }
-                .pointerStyle(dragStartCenter == nil ? PointerStyle.grabIdle : .grabActive)
+                .pointerStyle(isMovable ? (dragOffset == nil ? PointerStyle.grabIdle : .grabActive) : nil)
                 // Swallow clicks so they don't toggle playback underneath.
                 .onTapGesture {}
-                .gesture(dragGesture(rect: rect, canvas: canvas))
-                .help("Drag to place the camera")
+                .gesture(dragGesture, including: isMovable ? .all : .none)
+                .help(isMovable ? "Drag the camera to another corner" : "")
+                // A camera the layout places (full frame, split) lets clicks
+                // through to the canvas, which plays and pauses.
+                .allowsHitTesting(isMovable)
                 .offset(x: rect.minX, y: rect.minY)
         }
         .frame(width: canvas.width, height: canvas.height, alignment: .topLeading)
     }
 
-    @ViewBuilder
-    private func guideLines(in canvas: CGSize) -> some View {
-        ZStack(alignment: .topLeading) {
-            if let x = guides.x {
-                Rectangle()
-                    .fill(Palette.highlight)
-                    .frame(width: 1, height: canvas.height)
-                    .offset(x: x - 0.5)
-            }
-            if let y = guides.y {
-                Rectangle()
-                    .fill(Palette.highlight)
-                    .frame(width: canvas.width, height: 1)
-                    .offset(y: y - 0.5)
-            }
+    /// The card corner nearest the camera's center.
+    private func corner(for rect: CGRect) -> RecordingCameraLayout.Corner {
+        let card = layout.cardRect
+        switch (rect.midX < card.midX, rect.midY < card.midY) {
+        case (true, true): return .topLeading
+        case (false, true): return .topTrailing
+        case (true, false): return .bottomLeading
+        case (false, false): return .bottomTrailing
         }
-        .frame(width: canvas.width, height: canvas.height, alignment: .topLeading)
-        .allowsHitTesting(false)
     }
 
-    private func dragGesture(rect: CGRect, canvas: CGSize) -> some Gesture {
-        // Global coordinates: the bubble moves under the pointer, so local
+    private var dragGesture: some Gesture {
+        // Global coordinates: the camera moves under the pointer, so local
         // translations would chase their own updates.
         DragGesture(coordinateSpace: .global)
             .onChanged { value in
-                if dragStartCenter == nil {
-                    // Start from where the bubble is drawn, not the stored
-                    // center, which the layout may have clamped.
-                    dragStartCenter = CGPoint(x: rect.midX, y: rect.midY)
-                }
-                guard let start = dragStartCenter, canvas.width > 0, canvas.height > 0 else { return }
-                let proposed = CGPoint(
-                    x: start.x + value.translation.width,
-                    y: start.y + value.translation.height
-                )
-                let margin = RecordingStudioLayout.bubbleMargin(
-                    forMinDimension: min(canvas.width, canvas.height)
-                )
-                let (snappedX, guideX) = Self.snap(
-                    proposed.x,
-                    radius: rect.width / 2,
-                    length: canvas.width,
-                    margin: margin
-                )
-                let (snappedY, guideY) = Self.snap(
-                    proposed.y,
-                    radius: rect.height / 2,
-                    length: canvas.height,
-                    margin: margin
-                )
-                guides = SnapGuides(x: guideX, y: guideY)
-                model.style.camera.center = CGPoint(
-                    x: min(max(snappedX / canvas.width, 0), 1),
-                    y: min(max(snappedY / canvas.height, 0), 1)
-                )
+                dragOffset = value.translation
             }
-            .onEnded { _ in
-                dragStartCenter = nil
-                withAnimation(.easeOut(duration: 0.15)) {
-                    guides = SnapGuides()
-                }
+            .onEnded { value in
+                let dropped = layout.bubbleRect.offsetBy(dx: value.translation.width, dy: value.translation.height)
+                dragOffset = nil
+                onDrop(dropped, corner(for: dropped))
             }
-    }
-
-    /// Snaps one axis of the bubble center to the near edge, the middle, or
-    /// the far edge. Returns the snapped center and where to draw the guide.
-    private static func snap(
-        _ center: CGFloat,
-        radius: CGFloat,
-        length: CGFloat,
-        margin: CGFloat
-    ) -> (CGFloat, CGFloat?) {
-        let targets: [(center: CGFloat, guide: CGFloat)] = [
-            (margin + radius, margin),
-            (length / 2, length / 2),
-            (length - margin - radius, length - margin)
-        ]
-        guard let nearest = targets.min(by: { abs($0.center - center) < abs($1.center - center) }),
-              abs(nearest.center - center) <= snapDistance else {
-            return (center, nil)
-        }
-        return (nearest.center, nearest.guide)
     }
 }
 

@@ -109,6 +109,11 @@ enum RecordingSessionRenderer {
         let viewportTimeline = zoomEnabled
             ? ViewportTimeline.build(cues: zoomCues, capture: capture, clipTimeline: clipTimeline)
             : .identity
+        let cameraLayoutTimeline = RecordingCameraLayoutTimeline.build(
+            defaultLayout: style.camera.layout,
+            cues: document?.cameraLayoutCues ?? [],
+            clipTimeline: clipTimeline
+        )
         let showsPressEffects = pointerSynthesized
             && manifest?.pressEffectsBaked == false
             && (document?.showsClickEffects ?? manifest?.pressEffectsEnabled ?? true)
@@ -150,9 +155,10 @@ enum RecordingSessionRenderer {
 
         return RecordingStudioExporter.Configuration(
             screenURL: session.screenURL,
-            cameraURL: session.hasCamera ? session.cameraURL : nil,
+            cameraURL: style.camera.isVisible && cameraLayoutTimeline.usesCamera ? session.cameraURL : nil,
             cameraOffset: manifest?.cameraLeadIn ?? 0,
             style: style,
+            cameraLayoutTimeline: cameraLayoutTimeline,
             viewportTimeline: viewportTimeline,
             pointerTimeline: pointerSynthesized ? pointerTimeline : nil,
             showsPressEffects: showsPressEffects,

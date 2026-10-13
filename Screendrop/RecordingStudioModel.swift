@@ -78,6 +78,9 @@ final class RecordingStudioModel {
             if isLoaded, oldValue.background != style.background {
                 RecordingStudioDefaults.background = style.background
             }
+            if oldValue.camera.layout != style.camera.layout {
+                rebuildCameraLayoutTimeline()
+            }
             scheduleProjectSave()
         }
     }
@@ -179,6 +182,11 @@ final class RecordingStudioModel {
     private(set) var pointerTimeline = PointerTimeline.empty
     private(set) var keystrokeTimeline = KeystrokeCaptionTimeline.empty
     var selectedCueID: UUID?
+    /// Stretches of the recording in a layout other than the default.
+    private(set) var cameraLayoutCues: [RecordingCameraLayoutCue] = []
+    /// The default layout and every cue resolved along editor time.
+    private(set) var cameraLayoutTimeline = RecordingCameraLayoutTimeline.constant(RecordingCameraLayout())
+    var selectedLayoutCueID: UUID?
     private(set) var clipTimeline = RecordingClipTimeline(segments: []) {
         didSet {
             if clipTimeline != oldValue {
@@ -256,6 +264,7 @@ final class RecordingStudioModel {
     private let editUndoManager = UndoManager()
     private(set) var undoRevision = 0
     private var zoomEditSnapshot: [ZoomCue]?
+    private var layoutEditSnapshot: [RecordingCameraLayoutCue]?
     /// The document as of the last explicit save. Everything the user does
     /// after that lives in memory and in the autosaved draft until they save
     /// again, which is what makes the close prompt meaningful.
@@ -462,6 +471,7 @@ final class RecordingStudioModel {
         style = document.style.value
         zoomEnabled = document.zoomEnabled
         zoomCues = document.zoomCues
+        cameraLayoutCues = (document.cameraLayoutCues ?? []).sorted { $0.start < $1.start }
         // A project that never chose its own settings inherits whatever
         // was picked last, so "export as MP4" sticks across recordings.
         exportSettings = document.exportSettings ?? RecordingExportPreferences.lastSettings
@@ -526,6 +536,7 @@ final class RecordingStudioModel {
         replacementAudio = nil
         editUndoManager.removeAllActions()
         zoomEditSnapshot = nil
+        layoutEditSnapshot = nil
         lastSavedDocument = nil
         pointerCapture = PointerCaptureFile()
         pointerTimeline = .empty
@@ -535,6 +546,7 @@ final class RecordingStudioModel {
         reframeFocusTimeline = nil
         recordedPressTimes.removeAll()
         zoomCues.removeAll()
+        cameraLayoutCues.removeAll()
         subtitleCues.removeAll()
         transcriptWords.removeAll()
         subtitleTimeline = .empty
@@ -695,11 +707,20 @@ final class RecordingStudioModel {
         guard clipTimeline.segments.contains(where: { $0.id == id }) else { return }
         selectedClipID = id
         selectedCueID = nil
+        selectedLayoutCueID = nil
     }
 
     func selectZoomCue(id: UUID) {
         guard zoomCues.contains(where: { $0.id == id }) else { return }
         selectedCueID = id
+        selectedClipID = nil
+        selectedLayoutCueID = nil
+    }
+
+    func selectLayoutCue(id: UUID) {
+        guard cameraLayoutCues.contains(where: { $0.id == id }) else { return }
+        selectedLayoutCueID = id
+        selectedCueID = nil
         selectedClipID = nil
     }
 
@@ -1046,6 +1067,7 @@ final class RecordingStudioModel {
         applyZoomCues(cues, actionName: "Add Zoom")
         selectedCueID = cue.id
         selectedClipID = nil
+        selectedLayoutCueID = nil
     }
 
     func removeZoomCue(id: UUID) {
@@ -1108,6 +1130,179 @@ final class RecordingStudioModel {
         zoomCues.first { $0.id == selectedCueID }
     }
 
+    // MARK: - Camera layouts
+
+    var selectedLayoutCue: RecordingCameraLayoutCue? {
+        cameraLayoutCues.first { $0.id == selectedLayoutCueID }
+    }
+
+    var cameraLayoutTimelineBlocks: [RecordingCameraLayoutTimelineBlock] {
+        RecordingCameraLayoutTimeline.blocks(for: cameraLayoutCues, clipTimeline: clipTimeline)
+    }
+
+    /// The cue covering an editor time, if any.
+    func layoutCue(atEditorTime time: TimeInterval) -> RecordingCameraLayoutCue? {
+        cameraLayoutTimelineBlocks
+            .first { $0.editorStart <= time && time < $0.editorEnd }?
+            .cue
+    }
+
+    /// Changes whichever layout is showing at `time`: the cue covering it,
+    /// or the default when none does. Used by direct edits on the canvas.
+    func editLayout(atEditorTime time: TimeInterval, actionName: String, _ change: (inout RecordingCameraLayout) -> Void) {
+        if var cue = layoutCue(atEditorTime: time) {
+            change(&cue.layout)
+            updateLayoutCue(cue, actionName: actionName)
+        } else {
+            change(&style.camera.layout)
+        }
+    }
+
+    private func rebuildCameraLayoutTimeline() {
+        let next = RecordingCameraLayoutTimeline.build(
+            defaultLayout: style.camera.layout,
+            cues: cameraLayoutCues,
+            clipTimeline: clipTimeline
+        )
+        if next != cameraLayoutTimeline {
+            cameraLayoutTimeline = next
+        }
+    }
+
+    private func replaceLayoutCues(_ cues: [RecordingCameraLayoutCue]) {
+        cameraLayoutCues = cues.sorted { $0.start < $1.start }
+        rebuildCameraLayoutTimeline()
+        scheduleProjectSave()
+    }
+
+    private func applyLayoutCues(_ cues: [RecordingCameraLayoutCue], actionName: String) {
+        let sorted = cues.sorted { $0.start < $1.start }
+        guard sorted != cameraLayoutCues else { return }
+        let previous = cameraLayoutCues
+        registerUndo(actionName) { target in
+            target.applyLayoutCues(previous, actionName: actionName)
+        }
+        replaceLayoutCues(sorted)
+    }
+
+    /// Opens a continuous edit (a drag); `endLayoutCueEdit` registers it as
+    /// one undo step.
+    func beginLayoutCueEdit() {
+        if layoutEditSnapshot == nil {
+            layoutEditSnapshot = cameraLayoutCues
+        }
+    }
+
+    func endLayoutCueEdit(actionName: String = "Edit Layout") {
+        guard let previous = layoutEditSnapshot else { return }
+        layoutEditSnapshot = nil
+        guard previous != cameraLayoutCues else { return }
+        registerUndo(actionName) { target in
+            target.applyLayoutCues(previous, actionName: actionName)
+        }
+    }
+
+    /// Adds a cue at the playhead, three seconds long or up to the next cue.
+    func addLayoutCue(at time: TimeInterval, layout: RecordingCameraLayout? = nil) {
+        let sourceTime = clipTimeline.sourceTime(at: time)
+        let start = min(max(0, sourceTime), max(0, sourceDuration - RecordingCameraLayoutCue.minimumDuration))
+        insertLayoutCue(start: start, end: min(sourceDuration, start + 3), layout: layout)
+    }
+
+    /// Creates a cue spanning a dragged range in the layout lane. Times are
+    /// editor time and need not be ordered.
+    func addLayoutCue(fromEditorTime editorStart: TimeInterval, toEditorTime editorEnd: TimeInterval) {
+        let lowSource = clipTimeline.sourceTime(at: min(editorStart, editorEnd))
+        let highSource = clipTimeline.sourceTime(at: max(editorStart, editorEnd))
+        let minimum = RecordingCameraLayoutCue.minimumDuration
+        let start = min(max(0, lowSource), max(0, sourceDuration - minimum))
+        let end = max(start + minimum, min(sourceDuration, highSource))
+        insertLayoutCue(start: start, end: end, layout: nil)
+    }
+
+    private func insertLayoutCue(start: TimeInterval, end: TimeInterval, layout: RecordingCameraLayout?) {
+        guard let span = freeLayoutSpan(from: start, preferredEnd: end) else { return }
+        let cue = RecordingCameraLayoutCue(
+            start: span.lowerBound,
+            end: span.upperBound,
+            layout: layout ?? .suggestedCue(over: style.camera.layout)
+        )
+        var cues = cameraLayoutCues
+        cues.append(cue)
+        applyLayoutCues(cues, actionName: "Add Layout")
+        selectLayoutCue(id: cue.id)
+    }
+
+    /// Mirrors zoom cue placement: a request inside a cue is pushed past it,
+    /// and the span stops at the next cue.
+    private func freeLayoutSpan(from start: TimeInterval, preferredEnd: TimeInterval) -> ClosedRange<TimeInterval>? {
+        guard sourceDuration > 0 else { return nil }
+        let minimum = RecordingCameraLayoutCue.minimumDuration
+        let length = max(preferredEnd - start, minimum)
+        var lower = min(max(start, 0), sourceDuration)
+        while let covering = cameraLayoutCues.first(where: { $0.start <= lower && $0.end > lower }) {
+            lower = covering.end
+        }
+        let upper = cameraLayoutCues
+            .filter { $0.start > lower }
+            .map(\.start)
+            .min() ?? sourceDuration
+        guard upper - lower >= minimum else { return nil }
+        return lower...min(lower + length, upper)
+    }
+
+    private func layoutNeighborBounds(forCueAt index: Int) -> (lower: TimeInterval, upper: TimeInterval) {
+        let cues = cameraLayoutCues
+        return (
+            lower: index > 0 ? max(0, cues[index - 1].end) : 0,
+            upper: index + 1 < cues.count ? min(cues[index + 1].start, sourceDuration) : sourceDuration
+        )
+    }
+
+    func removeLayoutCue(id: UUID) {
+        applyLayoutCues(cameraLayoutCues.filter { $0.id != id }, actionName: "Remove Layout")
+        if selectedLayoutCueID == id {
+            selectedLayoutCueID = nil
+        }
+    }
+
+    /// Applies an edited cue as its own undo step.
+    func updateLayoutCue(_ cue: RecordingCameraLayoutCue, actionName: String) {
+        beginLayoutCueEdit()
+        resizeLayoutCue(cue)
+        endLayoutCueEdit(actionName: actionName)
+    }
+
+    /// Applies an edited cue during a continuous edit, stopping either edge
+    /// at the neighboring cues.
+    func resizeLayoutCue(_ cue: RecordingCameraLayoutCue) {
+        var cues = cameraLayoutCues
+        guard let index = cues.firstIndex(where: { $0.id == cue.id }) else { return }
+        let bounds = layoutNeighborBounds(forCueAt: index)
+        let minimum = RecordingCameraLayoutCue.minimumDuration
+        var updated = cue
+        updated.start = min(max(updated.start, bounds.lower), max(bounds.lower, bounds.upper - minimum))
+        updated.end = min(max(updated.end, updated.start + minimum), bounds.upper)
+        cues[index] = updated
+        replaceLayoutCues(cues)
+    }
+
+    /// Slides a cue without changing its length, parking it against a
+    /// neighbor rather than squashing it.
+    func moveLayoutCue(_ cue: RecordingCameraLayoutCue) {
+        var cues = cameraLayoutCues
+        guard let index = cues.firstIndex(where: { $0.id == cue.id }) else { return }
+        let bounds = layoutNeighborBounds(forCueAt: index)
+        let minimum = RecordingCameraLayoutCue.minimumDuration
+        let room = max(bounds.upper - bounds.lower, minimum)
+        let length = min(max(cue.duration, minimum), room)
+        var moved = cue
+        moved.start = min(max(cue.start, bounds.lower), max(bounds.lower, bounds.upper - length))
+        moved.end = min(moved.start + length, bounds.upper)
+        cues[index] = moved
+        replaceLayoutCues(cues)
+    }
+
     var visibleRecordedPressTimes: [TimeInterval] {
         recordedPressTimes.compactMap { clipTimeline.editorTime(forSourceTime: $0) }
     }
@@ -1155,6 +1350,9 @@ final class RecordingStudioModel {
     }
 
     private func rebuildViewportTimeline() {
+        // Layout cues live on the same edited timeline, so every cut,
+        // trim or speed change that moves zooms moves them too.
+        rebuildCameraLayoutTimeline()
         guard sourceDuration > 0 else {
             viewportTimeline = .identity
             return
@@ -1186,6 +1384,7 @@ final class RecordingStudioModel {
             style: style,
             zoomEnabled: zoomEnabled,
             zoomCues: zoomCues.filter { !$0.isImplicit },
+            cameraLayoutCues: cameraLayoutCues.isEmpty ? nil : cameraLayoutCues,
             clipTimeline: clipTimeline,
             exportSettings: exportSettings,
             showsClickEffects: showsClickEffects,
@@ -1796,9 +1995,10 @@ final class RecordingStudioModel {
         return flags.contains(.option) || (flags.contains(.command) && flags.contains(.shift))
     }
 
-    func isCameraVisible(at time: TimeInterval) -> Bool {
-        // No time gate: before cameraOffset the player is parked on the
-        // camera's first frame, which beats the bubble popping in late.
+    /// Whether any layout on the timeline can show the camera at all.
+    /// No time gate: before cameraOffset the player is parked on the
+    /// camera's first frame, which beats the camera popping in late.
+    var showsCameraLayer: Bool {
         hasCameraVideo && style.camera.isVisible
     }
 
@@ -1812,9 +2012,10 @@ final class RecordingStudioModel {
                 : nil
         return RecordingStudioExporter.Configuration(
             screenURL: screenURL,
-            cameraURL: hasCameraVideo && style.camera.isVisible ? session?.cameraURL : nil,
+            cameraURL: showsCameraLayer && cameraLayoutTimeline.usesCamera ? session?.cameraURL : nil,
             cameraOffset: cameraOffset,
             style: style,
+            cameraLayoutTimeline: cameraLayoutTimeline,
             viewportTimeline: zoomEnabled ? viewportTimeline : .identity,
             pointerTimeline: pointerIsSynthesized ? pointerTimeline : nil,
             showsPressEffects: showsPressEffects,

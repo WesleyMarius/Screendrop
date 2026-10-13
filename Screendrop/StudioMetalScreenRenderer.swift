@@ -17,6 +17,10 @@ nonisolated final class StudioMetalScreenRenderer {
     private let clipTexture: MTLTexture
     private let downsampler: MPSImageLanczosScale
     private var downsampledTexture: MTLTexture?
+    private let colorSpace: CGColorSpace
+    /// CPU copies of the backdrop and clip, kept for `redraw`.
+    private var backdropStaging: CGContext?
+    private var clipStaging: CGContext?
 
     init?(
         canvasSize: CGSize, backdrop: CGImage?, cardPath: CGPath,
@@ -64,6 +68,35 @@ nonisolated final class StudioMetalScreenRenderer {
         self.clipTexture = clipTexture
         self.downsampler = MPSImageLanczosScale(device: device)
         self.downsampler.edgeMode = .clamp
+        self.colorSpace = colorSpace
+    }
+
+    /// Replaces the backdrop and the card clip, for a card that moves from
+    /// frame to frame. The clip's alpha is the screen's coverage, so a
+    /// fading card draws with a partly transparent clip. The caller must not
+    /// redraw while a pass submitted on this renderer is still running.
+    func redraw(backdrop drawBackdrop: (CGContext) -> Void, clip drawClip: (CGContext) -> Void) -> Bool {
+        let width = backdropTexture.width
+        let height = backdropTexture.height
+        func staging(_ existing: CGContext?) -> CGContext? {
+            existing ?? CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        }
+        guard let backdrop = staging(backdropStaging), let clip = staging(clipStaging),
+              let backdropPixels = backdrop.data, let clipPixels = clip.data
+        else { return false }
+        backdropStaging = backdrop
+        clipStaging = clip
+        let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        drawBackdrop(backdrop)
+        clip.clear(bounds)
+        drawClip(clip)
+        let region = MTLRegionMake2D(0, 0, width, height)
+        backdropTexture.replace(region: region, mipmapLevel: 0, withBytes: backdropPixels, bytesPerRow: backdrop.bytesPerRow)
+        clipTexture.replace(region: region, mipmapLevel: 0, withBytes: clipPixels, bytesPerRow: clip.bytesPerRow)
+        return true
     }
 
     /// A committed pass. It retains the Core Video texture wrappers, whose
@@ -145,7 +178,7 @@ nonisolated final class StudioMetalScreenRenderer {
 
     /// Blocks until the pass finishes. False means the frame has no screen
     /// layer and must be drawn another way.
-    func wait(for submission: Submission) -> Bool {
+    static func wait(for submission: Submission) -> Bool {
         withExtendedLifetime(submission.textures) { submission.command.waitUntilCompleted() }
         return submission.command.status == .completed
     }

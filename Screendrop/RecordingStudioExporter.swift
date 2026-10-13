@@ -34,6 +34,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         let cameraURL: URL?
         let cameraOffset: TimeInterval
         let style: RecordingStudioStyle
+        /// Where the screen and camera sit over time.
+        let cameraLayoutTimeline: RecordingCameraLayoutTimeline
         let viewportTimeline: ViewportTimeline
         /// Non-nil when the capture hid the OS cursor and the export must
         /// draw the synthetic pointer along this smoothed timeline.
@@ -75,6 +77,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             cameraURL: URL?,
             cameraOffset: TimeInterval,
             style: RecordingStudioStyle,
+            cameraLayoutTimeline: RecordingCameraLayoutTimeline,
             viewportTimeline: ViewportTimeline,
             pointerTimeline: PointerTimeline?,
             showsPressEffects: Bool,
@@ -99,6 +102,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             self.cameraURL = cameraURL
             self.cameraOffset = cameraOffset
             self.style = style
+            self.cameraLayoutTimeline = cameraLayoutTimeline
             self.viewportTimeline = viewportTimeline
             self.pointerTimeline = style.hidesCursor ? nil : pointerTimeline
             self.showsPressEffects = showsPressEffects
@@ -338,6 +342,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             canvasSize: canvasSize,
             videoCropRect: configuration.videoCropRect,
             style: configuration.style,
+            cameraLayoutTimeline: configuration.cameraLayoutTimeline,
             viewportTimeline: configuration.viewportTimeline,
             pointerTimeline: configuration.pointerTimeline,
             showsPressEffects: configuration.showsPressEffects,
@@ -662,11 +667,67 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
 // MARK: - Frame compositor
 
 /// Draws one output frame: cached backdrop, then the zoom-transformed screen
-/// frame clipped to the rounded card, then the camera bubble.
+/// frame clipped to the rounded card, then the camera.
+///
+/// The camera layout timeline moves the card and the camera. While a layout
+/// is settled, everything static about it - the backdrop with the card's
+/// shadow, the Metal clip, the camera's shadow and scaler - is built once
+/// and kept for the next time that layout shows. Frames inside a morph are
+/// drawn in full by Core Graphics, with the moving screen and camera
+/// averaged across the shutter like any other camera move.
 nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
+    /// Everything that stays fixed while one layout is settled.
+    private final class LayoutResources {
+        let layout: RecordingStudioLayout
+        let backdrop: CGImage?
+        var metalRenderer: StudioMetalScreenRenderer?
+        var bubbleShadow: (image: CGImage, rect: CGRect)??
+        var cameraScaler: StudioCameraBubbleScaler??
+        /// Retained so pixel-buffer pool reuse can't produce a false cache hit.
+        var bubbleContentSource: CVPixelBuffer?
+        var bubbleContentImage: CGImage?
+
+        init(layout: RecordingStudioLayout, backdrop: CGImage?) {
+            self.layout = layout
+            self.backdrop = backdrop
+        }
+    }
+
     private let canvasSize: CGSize
     private let videoCropRect: CGRect
-    private let layout: RecordingStudioLayout
+    private let style: RecordingStudioStyle
+    /// The resting card, before any camera layout moves it.
+    private let baseLayout: RecordingStudioLayout
+    private let layoutResolver: RecordingCameraLayoutResolver
+    private let layoutTimeline: RecordingCameraLayoutTimeline
+    /// The frame being finished. `begin` runs a frame ahead, so it works
+    /// from its own resolved layout and never reads this.
+    private var layout: RecordingStudioLayout
+    /// Settled layouts' resources, most recent last. Two cover the common
+    /// back-and-forth between a talking head and the screen without holding
+    /// a full-canvas backdrop per layout the export ever used.
+    private var layoutResources: [(key: RecordingCameraLayout, resources: LayoutResources)] = []
+    private static let maxLayoutResources = 2
+    /// Morph frames redraw their renderer's backdrop and clip, so two take
+    /// turns: one frame's pass can still be running while the next is drawn.
+    private var morphRenderers: [StudioMetalScreenRenderer?] = [nil, nil]
+    private var morphRendererIndex = 0
+    private var morphRenderersFailed = false
+    /// A quarter-size canvas for the moving card's shadow. A shadow is a
+    /// blur, so its resolution doesn't show, and full size costs ten times
+    /// as much every frame.
+    private lazy var morphShadowContext: CGContext? = {
+        let width = max(1, Int((canvasSize.width / Self.morphShadowScale).rounded(.up)))
+        let height = max(1, Int((canvasSize.height / Self.morphShadowScale).rounded(.up)))
+        return CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+    }()
+    private static let morphShadowScale: CGFloat = 4
+    /// Card-space overlays (pointer, captions) fade with the screen.
+    private var overlayOpacity: CGFloat = 1
     private let viewportTimeline: ViewportTimeline
     private let pointerTimeline: PointerTimeline?
     private let showsPressEffects: Bool
@@ -681,20 +742,18 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private var artworkImageCache: [String: CGImage] = [:]
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
-    private let backdrop: CGImage?
+    /// The background alone, for frames inside a layout morph.
+    private let plainBackdrop: CGImage?
     private let timing: RecordingExportTiming
-    private var metalRenderer: StudioMetalScreenRenderer?
     private var metalFailed = false
     private(set) var metalFrameCount = 0
     /// Wall time submitting and waiting on Metal passes. With a frame in
     /// flight this is only the GPU time the CPU could not overlap.
     private(set) var metalSeconds = 0.0
     private let screenLayerCache = StudioScreenLayerCache()
-    /// The layer the cache will hold once every begun frame finishes.
-    private var plannedCacheKey: (source: CVPixelBuffer, rect: CGRect)?
-    /// Retained so pixel-buffer pool reuse can't produce a false cache hit.
-    private var bubbleContentSource: CVPixelBuffer?
-    private var bubbleContentImage: CGImage?
+    /// The layer the cache will hold once every begun frame finishes. The
+    /// layout is part of the key: the cached layer includes its backdrop.
+    private var plannedCacheKey: (source: CVPixelBuffer, rect: CGRect, layout: RecordingCameraLayout)?
     private(set) var reusedScreenFrameCount = 0
     private let bypassScreenCache = ProcessInfo.processInfo.environment["SCREENDROP_EXPORT_BYPASS_SCREEN_CACHE"] == "1"
     // Developer comparison switch; export settings and saved projects do not change.
@@ -704,6 +763,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         canvasSize: CGSize,
         videoCropRect: CGRect,
         style: RecordingStudioStyle,
+        cameraLayoutTimeline: RecordingCameraLayoutTimeline,
         viewportTimeline: ViewportTimeline,
         pointerTimeline: PointerTimeline?,
         showsPressEffects: Bool,
@@ -722,15 +782,23 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     ) {
         self.canvasSize = canvasSize
         self.videoCropRect = RecordingVideoCropGeometry.normalized(videoCropRect)
-        self.layout = RecordingStudioLayout.make(
+        self.style = style
+        let baseLayout = RecordingStudioLayout.make(
             canvasSize: canvasSize,
             style: style,
-            includeBubble: includeBubble,
             usesUniformPadding: usesUniformPadding,
             contentAspect: reframe?.sourceAspect ?? fitContentAspect,
             contentMode: fitContentAspect != nil && reframe == nil ? .fit : .fill,
             contentCropRect: videoCropRect
         )
+        self.baseLayout = baseLayout
+        self.layoutResolver = RecordingCameraLayoutResolver(
+            base: baseLayout,
+            style: style,
+            showsCamera: includeBubble
+        )
+        self.layoutTimeline = cameraLayoutTimeline
+        self.layout = baseLayout
         self.viewportTimeline = viewportTimeline
         self.pointerTimeline = style.hidesCursor ? nil : pointerTimeline
         self.showsPressEffects = showsPressEffects
@@ -745,12 +813,49 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         self.timing = timing
         self.pointerScale = style.cursorScale
         self.colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        self.backdrop = Self.renderBackdrop(
+        self.plainBackdrop = Self.renderBackdrop(
             canvasSize: canvasSize,
-            layout: layout,
+            layout: nil,
             style: style,
             colorSpace: colorSpace
         )
+    }
+
+    /// The layout state and resolved layout at an editor time.
+    private func frameLayout(at editorTime: TimeInterval) -> (
+        layout: RecordingStudioLayout,
+        settled: RecordingCameraLayout?
+    ) {
+        let state = layoutTimeline.state(at: editorTime)
+        return (layoutResolver.layout(for: state), state.settledLayout)
+    }
+
+    /// Where the screen draws at an editor time, with the layout at that
+    /// same moment - so a morph blurs like any other camera move.
+    private func screenDrawRect(at editorTime: TimeInterval) -> CGRect {
+        frameLayout(at: editorTime).layout.frameRect(for: viewportFrame(at: editorTime))
+    }
+
+    private func resources(for key: RecordingCameraLayout, layout: RecordingStudioLayout) -> LayoutResources {
+        if let index = layoutResources.firstIndex(where: { $0.key == key }) {
+            let entry = layoutResources.remove(at: index)
+            layoutResources.append(entry)
+            return entry.resources
+        }
+        let resources = LayoutResources(
+            layout: layout,
+            backdrop: Self.renderBackdrop(
+                canvasSize: canvasSize,
+                layout: layout.screenOpacity > 0.001 ? layout : nil,
+                style: style,
+                colorSpace: colorSpace
+            )
+        )
+        layoutResources.append((key, resources))
+        if layoutResources.count > Self.maxLayoutResources {
+            layoutResources.removeFirst()
+        }
+        return resources
     }
 
     /// The virtual camera for a frame: the reframe crop-and-follow track
@@ -766,6 +871,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         fileprivate let cameraFrame: CVPixelBuffer?
         fileprivate let editorTime: TimeInterval
         fileprivate let sourceTime: TimeInterval
+        fileprivate let layout: RecordingStudioLayout
+        /// Nil while the frame is inside a layout morph.
+        fileprivate let settledLayout: RecordingCameraLayout?
         fileprivate let sampleRects: [CGRect]
         fileprivate let shouldCacheScreen: Bool
         /// Set when the previous frame leaves this exact screen layer in the
@@ -786,34 +894,49 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         sourceRepeatsOnNextFrame: Bool,
         into destination: CVPixelBuffer
     ) -> PendingFrame {
-        let sampleRects = timing.screenSampleRects(at: editorTime) { time in
-            layout.frameRect(for: viewportFrame(at: time))
-        }
+        let (frameLayout, settled) = frameLayout(at: editorTime)
+        let showsScreen = frameLayout.screenOpacity > 0.001
+        let sampleRects = showsScreen
+            ? timing.screenSampleRects(at: editorTime, frameRect: screenDrawRect(at:))
+            : []
         let sampleCount = sampleRects.count
         let plansRestore = !bypassScreenCache && sampleCount == 1
-            && plannedCacheKey.map { $0.source === screenFrame && $0.rect == sampleRects[0] } == true
+            && plannedCacheKey.map {
+                $0.source === screenFrame && $0.rect == sampleRects[0] && $0.layout == settled
+            } == true
         // Cache only a settled layer that can be reused on the next tick.
         // Moving frames and continuously changing video avoid the extra copy.
         let shouldCacheScreen = !bypassScreenCache && sourceRepeatsOnNextFrame && sampleCount == 1
-            && sampleRects[0] == layout.frameRect(for: viewportFrame(at: editorTime + timing.frameInterval))
+            && settled != nil
+            && layoutTimeline.state(at: editorTime + timing.frameInterval).settledLayout == settled
+            && sampleRects[0] == screenDrawRect(at: editorTime + timing.frameInterval)
             && StudioScreenLayerCache.canCapture(width: Int(canvasSize.width), height: Int(canvasSize.height))
         // Mirrors the cache transitions finish(_:) applies in order: a
         // restored layer stays cached, a newly cached one replaces it, and
         // anything else clears it.
         if !shouldCacheScreen {
             plannedCacheKey = nil
-        } else if !plansRestore {
-            plannedCacheKey = (screenFrame, sampleRects[0])
+        } else if !plansRestore, let settled {
+            plannedCacheKey = (screenFrame, sampleRects[0], settled)
         }
 
-        let submission = plansRestore ? nil : submitMetal(
-            screenFrame: screenFrame, sampleRects: sampleRects, into: destination
-        )
+        let submission: StudioMetalScreenRenderer.Submission? = if plansRestore {
+            nil
+        } else if settled == nil {
+            submitMorphMetal(screenFrame: screenFrame, sampleRects: sampleRects, layout: frameLayout, into: destination)
+        } else {
+            submitMetal(
+                screenFrame: screenFrame, sampleRects: sampleRects, settled: settled,
+                layout: frameLayout, into: destination
+            )
+        }
         return PendingFrame(
             screenFrame: screenFrame,
             cameraFrame: cameraFrame,
             editorTime: editorTime,
             sourceTime: sourceTime,
+            layout: frameLayout,
+            settledLayout: settled,
             sampleRects: sampleRects,
             shouldCacheScreen: shouldCacheScreen,
             plansRestore: plansRestore,
@@ -825,9 +948,12 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     /// Completes a frame begun earlier: waits for its screen pass, then draws
     /// the CPU overlays into its destination.
     func finish(_ frame: PendingFrame) throws {
+        layout = frame.layout
         let destination = frame.destination
         let screenFrame = frame.screenFrame
         let sampleRects = frame.sampleRects
+        let settled = frame.settledLayout
+        let resources = settled.map { resources(for: $0, layout: frame.layout) }
         let reusedScreen = frame.plansRestore && screenLayerCache.restore(
             source: screenFrame, rect: sampleRects[0], into: destination
         )
@@ -839,10 +965,13 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         var renderedWithMetal = false
         if !reusedScreen,
            let submission = frame.submission ?? submitMetal(
-               screenFrame: screenFrame, sampleRects: sampleRects, into: destination
+               screenFrame: screenFrame, sampleRects: sampleRects, settled: settled,
+               layout: frame.layout, into: destination
            ) {
             let waitStart = CFAbsoluteTimeGetCurrent()
-            renderedWithMetal = metalRenderer?.wait(for: submission) == true
+            // The submission holds its own command buffer, so it can be
+            // waited on even if its layout's resources were since evicted.
+            renderedWithMetal = StudioMetalScreenRenderer.wait(for: submission)
             metalSeconds += CFAbsoluteTimeGetCurrent() - waitStart
             if renderedWithMetal { metalFrameCount += 1 }
             else { metalFailed = true }
@@ -868,31 +997,40 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         }
         context.interpolationQuality = .high
 
-        if !reusedScreen, !renderedWithMetal, let backdrop {
-            context.draw(backdrop, in: CGRect(origin: .zero, size: canvasSize))
-        } else if !reusedScreen, !renderedWithMetal {
-            context.setFillColor(CGColor(gray: 0, alpha: 1))
-            context.fill(CGRect(origin: .zero, size: canvasSize))
+        let screenOpacity = layout.screenOpacity
+        if !reusedScreen, !renderedWithMetal {
+            if let resources {
+                drawBackdrop(resources.backdrop, in: context)
+            } else {
+                // Inside a morph the card moves, so its shadow does too.
+                drawBackdrop(plainBackdrop, in: context)
+                drawCardShadow(for: layout, in: context)
+            }
         }
 
         var renderedScreen = reusedScreen || renderedWithMetal
-        if !reusedScreen, !renderedWithMetal, let screenImage = Self.makeImage(from: screenFrame, colorSpace: colorSpace) {
+        if !reusedScreen, !renderedWithMetal, !sampleRects.isEmpty,
+           let screenImage = Self.makeImage(from: screenFrame, colorSpace: colorSpace) {
             // Motion blur by temporal supersampling: while the virtual camera
             // is moving, average several sub-frame camera states across the
             // frame's shutter interval. Pans smear linearly, zooms radially,
             // and settled frames pay for a single draw. The viewport timeline
             // runs on the gapless output clock, so the shutter is always
             // exactly one output frame - no per-call time tracking needed.
-            context.saveGState()
-            context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
-            context.clip()
-            for (sample, drawRect) in sampleRects.enumerated() {
-                // Drawing sample i at alpha 1/(i+1) keeps the buffer equal to
-                // the running average of all samples so far.
-                context.setAlpha(1 / CGFloat(sample + 1))
-                context.draw(screenImage, in: flipped(drawRect))
+            if settled != nil {
+                context.saveGState()
+                context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
+                context.clip()
+                for (sample, drawRect) in sampleRects.enumerated() {
+                    // Drawing sample i at alpha 1/(i+1) keeps the buffer equal to
+                    // the running average of all samples so far.
+                    context.setAlpha(1 / CGFloat(sample + 1))
+                    context.draw(screenImage, in: flipped(drawRect))
+                }
+                context.restoreGState()
+            } else {
+                drawMorphingScreen(screenImage, editorTime: editorTime, opacity: screenOpacity, in: context)
             }
-            context.restoreGState()
             renderedScreen = true
         }
 
@@ -902,23 +1040,31 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         }
         if !shouldCacheScreen { screenLayerCache.invalidate() }
 
-        // Pointer motion is resolved independently from viewport shutter
-        // blur. Its interaction magnification and tilt stay anchored at the
-        // recorded artwork anchor point, while the final point still passes
-        // through the same viewport transform and rounded-card clip as the
-        // source pixels.
-        drawPointer(editorTime: editorTime, in: context)
+        // Card-space overlays fade with the screen when a layout hides it.
+        overlayOpacity = screenOpacity
+        if screenOpacity > 0.001 {
+            // Pointer motion is resolved independently from viewport shutter
+            // blur. Its interaction magnification and tilt stay anchored at the
+            // recorded artwork anchor point, while the final point still passes
+            // through the same viewport transform and rounded-card clip as the
+            // source pixels.
+            drawPointer(editorTime: editorTime, in: context)
 
-        // The keystroke caption stays in card space - pinned to its edge and
-        // unaffected by the zoom transform, like a broadcast lower third.
-        drawKeystrokeCaption(at: sourceTime, in: context)
+            // The keystroke caption stays in card space - pinned to its edge and
+            // unaffected by the zoom transform, like a broadcast lower third.
+            drawKeystrokeCaption(at: sourceTime, in: context)
 
-        // The speed badge is card-space chrome too, paced by editor time
-        // so its chevrons sweep at the same rate as the preview's.
-        drawSpeedBadge(at: editorTime, in: context)
+            // The speed badge is card-space chrome too, paced by editor time
+            // so its chevrons sweep at the same rate as the preview's.
+            drawSpeedBadge(at: editorTime, in: context)
+        }
 
-        if let cameraFrame, layout.bubbleRect.width > 0 {
-            drawCameraBubble(cameraFrame, in: context)
+        if let cameraFrame, layout.bubbleRect.width > 0, layout.cameraOpacity > 0.001 {
+            if let resources {
+                drawCameraBubble(cameraFrame, resources: resources, in: context)
+            } else {
+                drawMorphingCamera(cameraFrame, editorTime: editorTime, in: context)
+            }
         }
 
         // The subtitle bar lives in canvas space - over the background too,
@@ -926,23 +1072,213 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         drawSubtitleBar(at: sourceTime, in: context)
     }
 
+    private func drawBackdrop(_ backdrop: CGImage?, in context: CGContext) {
+        if let backdrop {
+            context.draw(backdrop, in: CGRect(origin: .zero, size: canvasSize))
+        } else {
+            context.setFillColor(CGColor(gray: 0, alpha: 1))
+            context.fill(CGRect(origin: .zero, size: canvasSize))
+        }
+    }
+
+    /// The moving card's shadow, rendered small and drawn up to size.
+    private func drawCardShadow(for layout: RecordingStudioLayout, in context: CGContext) {
+        let opacity = layout.screenOpacity
+        guard opacity > 0.001, style.shadow > 0.01, style.background != .none,
+              let shadowContext = morphShadowContext else { return }
+        let scale = Self.morphShadowScale
+        let minDimension = min(canvasSize.width, canvasSize.height)
+        let blur = minDimension * 0.045 * style.shadow
+        let small = CGRect(x: 0, y: 0, width: shadowContext.width, height: shadowContext.height)
+        shadowContext.clear(small)
+        shadowContext.saveGState()
+        shadowContext.scaleBy(x: 1 / scale, y: 1 / scale)
+        // Shadows ignore the CTM, so their blur and offset are scaled by hand.
+        shadowContext.setShadow(
+            offset: CGSize(width: 0, height: -blur * 0.35 / scale),
+            blur: blur / scale,
+            color: CGColor(gray: 0, alpha: 0.55 * style.shadow * opacity)
+        )
+        shadowContext.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
+        shadowContext.setFillColor(CGColor(gray: 0, alpha: opacity))
+        shadowContext.fillPath()
+        shadowContext.restoreGState()
+        guard let image = shadowContext.makeImage() else { return }
+        context.saveGState()
+        context.interpolationQuality = .medium
+        context.draw(image, in: CGRect(x: 0, y: 0, width: small.width * scale, height: small.height * scale))
+        context.restoreGState()
+    }
+
+    /// A morph frame's screen pass: the backdrop with the card's shadow
+    /// where the card is now, and the card itself as the clip.
+    private func submitMorphMetal(
+        screenFrame: CVPixelBuffer,
+        sampleRects: [CGRect],
+        layout: RecordingStudioLayout,
+        into destination: CVPixelBuffer
+    ) -> StudioMetalScreenRenderer.Submission? {
+        guard !sampleRects.isEmpty, !forceCoreGraphics, !metalFailed, !morphRenderersFailed,
+              StudioMetalScreenRenderer.shouldAccelerate(screenFrame: screenFrame, sampleRects: sampleRects)
+        else { return nil }
+        morphRendererIndex = (morphRendererIndex + 1) % morphRenderers.count
+        if morphRenderers[morphRendererIndex] == nil {
+            morphRenderers[morphRendererIndex] = StudioMetalScreenRenderer(
+                canvasSize: canvasSize, backdrop: plainBackdrop,
+                cardPath: roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius), colorSpace: colorSpace
+            )
+        }
+        guard let renderer = morphRenderers[morphRendererIndex] else {
+            morphRenderersFailed = true
+            return nil
+        }
+        let submitStart = CFAbsoluteTimeGetCurrent()
+        defer { metalSeconds += CFAbsoluteTimeGetCurrent() - submitStart }
+        let redrawn = renderer.redraw(
+            backdrop: { context in
+                drawBackdrop(plainBackdrop, in: context)
+                drawCardShadow(for: layout, in: context)
+            },
+            clip: { context in
+                context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
+                context.setFillColor(CGColor(gray: 1, alpha: layout.screenOpacity))
+                context.fillPath()
+            }
+        )
+        guard redrawn,
+              let submission = renderer.submit(screenFrame: screenFrame, sampleRects: sampleRects, into: destination)
+        else {
+            morphRenderersFailed = true
+            return nil
+        }
+        return submission
+    }
+
+    /// The most samples a morphing layer averages. The Core Graphics path
+    /// pays for every one, and a morph is over in a fraction of a second.
+    private static let maxMorphSamples = 8
+
+    private func morphSampleTimes(at editorTime: TimeInterval, rect: (TimeInterval) -> CGRect) -> [TimeInterval] {
+        let times = timing.sampleTimes(at: editorTime, frameRect: rect)
+        guard times.count > Self.maxMorphSamples else { return times }
+        guard Self.maxMorphSamples > 1 else { return [editorTime] }
+        return (0..<Self.maxMorphSamples).map { index in
+            times[index * (times.count - 1) / (Self.maxMorphSamples - 1)]
+        }
+    }
+
+    /// The screen while its card moves: each shutter sample is clipped to
+    /// the card as it stood at that instant and the samples are summed at
+    /// equal weight, so the card's edges blur along with its pixels.
+    private func drawMorphingScreen(
+        _ screenImage: CGImage,
+        editorTime: TimeInterval,
+        opacity: CGFloat,
+        in context: CGContext
+    ) {
+        let times = morphSampleTimes(at: editorTime, rect: screenDrawRect(at:))
+        guard !times.isEmpty else { return }
+        context.saveGState()
+        context.setAlpha(opacity)
+        context.beginTransparencyLayer(auxiliaryInfo: nil)
+        context.setBlendMode(.plusLighter)
+        for time in times {
+            let sample = frameLayout(at: time).layout
+            context.saveGState()
+            context.setAlpha(1 / CGFloat(times.count))
+            context.addPath(roundedPath(for: sample.cardRect, radius: sample.cardCornerRadius))
+            context.clip()
+            context.draw(screenImage, in: flipped(sample.frameRect(for: viewportFrame(at: time))))
+            context.restoreGState()
+        }
+        context.endTransparencyLayer()
+        context.restoreGState()
+    }
+
+    /// The camera while a layout morph moves or reshapes it, drawn from
+    /// scratch: aspect-filled into each shutter sample's rect, clipped to
+    /// where it is mid-shutter. A running average needs no offscreen layer,
+    /// which at canvas size costs more than the draws themselves.
+    private func drawMorphingCamera(_ cameraFrame: CVPixelBuffer, editorTime: TimeInterval, in context: CGContext) {
+        guard let cameraImage = Self.makeImage(from: cameraFrame, colorSpace: colorSpace) else { return }
+        let opacity = layout.cameraOpacity
+        // A running average can't also carry a fade, so a fading camera
+        // draws once, mid-shutter.
+        var times = opacity < 0.999
+            ? [editorTime]
+            : timing.sampleTimes(at: editorTime) { self.frameLayout(at: $0).layout.bubbleRect }
+        if times.count > Self.maxMorphCameraSamples {
+            times = (0..<Self.maxMorphCameraSamples).map { index in
+                times[index * (times.count - 1) / (Self.maxMorphCameraSamples - 1)]
+            }
+        }
+        let bubble = layout.bubbleRect
+        guard !times.isEmpty, bubble.width > 0, bubble.height > 0 else { return }
+        let imageSize = CGSize(width: cameraImage.width, height: cameraImage.height)
+        let minDimension = min(canvasSize.width, canvasSize.height)
+        let path = roundedPath(for: bubble, radius: layout.bubbleCornerRadius)
+
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: -minDimension * 0.009),
+            blur: minDimension * 0.022,
+            color: CGColor(gray: 0, alpha: 0.35 * opacity)
+        )
+        context.addPath(path)
+        context.setFillColor(CGColor(gray: 0, alpha: opacity))
+        context.fillPath()
+        context.restoreGState()
+
+        context.saveGState()
+        context.addPath(path)
+        context.clip()
+        context.interpolationQuality = .medium
+        for (index, time) in times.enumerated() {
+            let sample = frameLayout(at: time).layout.bubbleRect
+            guard sample.width > 0, sample.height > 0 else { continue }
+            let scale = max(sample.width / imageSize.width, sample.height / imageSize.height)
+            let fillSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+            let fillRect = CGRect(
+                x: sample.midX - fillSize.width / 2,
+                y: sample.midY - fillSize.height / 2,
+                width: fillSize.width,
+                height: fillSize.height
+            )
+            // Sample i at 1/(i+1) keeps the running average.
+            context.setAlpha(index == 0 ? opacity : 1 / CGFloat(index + 1))
+            context.draw(cameraImage, in: flipped(fillRect))
+        }
+        context.restoreGState()
+
+        context.addPath(roundedPath(for: bubble.insetBy(dx: 0.5, dy: 0.5), radius: layout.bubbleCornerRadius))
+        context.setStrokeColor(CGColor(gray: 1, alpha: 0.25 * opacity))
+        context.setLineWidth(max(1, minDimension * 0.0018))
+        context.strokePath()
+    }
+
+    private static let maxMorphCameraSamples = 4
+
     private func submitMetal(
         screenFrame: CVPixelBuffer,
         sampleRects: [CGRect],
+        settled: RecordingCameraLayout?,
+        layout: RecordingStudioLayout,
         into destination: CVPixelBuffer
     ) -> StudioMetalScreenRenderer.Submission? {
-        guard !forceCoreGraphics, !metalFailed,
+        // Morph frames move the card clip every frame; Core Graphics draws them.
+        guard let settled, !sampleRects.isEmpty, !forceCoreGraphics, !metalFailed,
               StudioMetalScreenRenderer.shouldAccelerate(screenFrame: screenFrame, sampleRects: sampleRects)
         else { return nil }
-        if metalRenderer == nil {
-            metalRenderer = StudioMetalScreenRenderer(
-                canvasSize: canvasSize, backdrop: backdrop,
+        let resources = resources(for: settled, layout: layout)
+        if resources.metalRenderer == nil {
+            resources.metalRenderer = StudioMetalScreenRenderer(
+                canvasSize: canvasSize, backdrop: resources.backdrop,
                 cardPath: roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius), colorSpace: colorSpace
             )
         }
         let submitStart = CFAbsoluteTimeGetCurrent()
         defer { metalSeconds += CFAbsoluteTimeGetCurrent() - submitStart }
-        guard let submission = metalRenderer?.submit(
+        guard let submission = resources.metalRenderer?.submit(
             screenFrame: screenFrame, sampleRects: sampleRects, into: destination
         ) else {
             metalFailed = true
@@ -952,35 +1288,39 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     }
 
     /// Shadow + hairline border match the live preview's bubble styling.
-    /// The bubble sits over moving video, so it composites every frame -
-    /// but its geometry is fixed for the export: the blurred shadow renders
-    /// once, the clipped camera layer once per camera frame, and each output
-    /// frame only blits them 1:1.
-    private func drawCameraBubble(_ cameraFrame: CVPixelBuffer, in context: CGContext) {
-        if bubbleContentSource !== cameraFrame {
-            bubbleContentImage = renderBubbleContent(cameraFrame)
-            bubbleContentSource = bubbleContentImage == nil ? nil : cameraFrame
+    /// The camera sits over moving video, so it composites every frame -
+    /// but while a layout is settled its geometry is fixed: the blurred
+    /// shadow renders once, the clipped camera layer once per camera frame,
+    /// and each output frame only blits them 1:1.
+    private func drawCameraBubble(_ cameraFrame: CVPixelBuffer, resources: LayoutResources, in context: CGContext) {
+        if resources.bubbleContentSource !== cameraFrame {
+            resources.bubbleContentImage = renderBubbleContent(cameraFrame, resources: resources)
+            resources.bubbleContentSource = resources.bubbleContentImage == nil ? nil : cameraFrame
         }
-        guard let content = bubbleContentImage else { return }
-        if let shadow = bubbleShadow {
+        guard let content = resources.bubbleContentImage else { return }
+        if let shadow = bubbleShadow(for: resources) {
             context.draw(shadow.image, in: shadow.rect)
         }
-        context.draw(content, in: bubbleContentRect)
+        context.draw(content, in: bubbleContentRect(for: resources.layout))
     }
 
     /// The bubble in bottom-up canvas pixels, grown to whole pixels so its
     /// cached layer blits without resampling.
-    private var bubbleContentRect: CGRect { flipped(layout.bubbleRect).integral }
+    private func bubbleContentRect(for layout: RecordingStudioLayout) -> CGRect {
+        flipped(layout.bubbleRect).integral
+    }
 
-    private lazy var bubbleShadow: (image: CGImage, rect: CGRect)? = {
+    private func bubbleShadow(for resources: LayoutResources) -> (image: CGImage, rect: CGRect)? {
+        if let cached = resources.bubbleShadow { return cached }
+        let layout = resources.layout
         let minDimension = min(canvasSize.width, canvasSize.height)
         let blur = minDimension * 0.022
         let offset = minDimension * 0.009
-        let rect = bubbleContentRect
+        let rect = bubbleContentRect(for: layout)
             .insetBy(dx: -(blur * 2 + offset), dy: -(blur * 2 + offset))
             .intersection(CGRect(origin: .zero, size: canvasSize))
             .integral
-        guard let image = renderLayer(covering: rect, draw: { context in
+        let image = renderLayer(covering: rect, draw: { context in
             context.setShadow(
                 offset: CGSize(width: 0, height: -offset),
                 blur: blur,
@@ -989,15 +1329,23 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             context.addPath(roundedPath(for: layout.bubbleRect, radius: layout.bubbleCornerRadius))
             context.setFillColor(CGColor(gray: 0, alpha: 1))
             context.fillPath()
-        }) else { return nil }
-        return (image, rect)
-    }()
+        })
+        let shadow = image.map { ($0, rect) }
+        resources.bubbleShadow = .some(shadow)
+        return shadow
+    }
 
-    private lazy var cameraScaler: StudioCameraBubbleScaler? = forceCoreGraphics
-        ? nil
-        : StudioCameraBubbleScaler(size: bubbleContentRect.size, colorSpace: colorSpace)
+    private func cameraScaler(for resources: LayoutResources) -> StudioCameraBubbleScaler? {
+        if let cached = resources.cameraScaler { return cached }
+        let scaler = forceCoreGraphics
+            ? nil
+            : StudioCameraBubbleScaler(size: bubbleContentRect(for: resources.layout).size, colorSpace: colorSpace)
+        resources.cameraScaler = .some(scaler)
+        return scaler
+    }
 
-    private func renderBubbleContent(_ cameraFrame: CVPixelBuffer) -> CGImage? {
+    private func renderBubbleContent(_ cameraFrame: CVPixelBuffer, resources: LayoutResources) -> CGImage? {
+        let layout = resources.layout
         let bubble = layout.bubbleRect
         let imageSize = CGSize(width: CVPixelBufferGetWidth(cameraFrame), height: CVPixelBufferGetHeight(cameraFrame))
         guard imageSize.width > 0, imageSize.height > 0 else { return nil }
@@ -1010,10 +1358,10 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             height: fillSize.height
         )
         let minDimension = min(canvasSize.width, canvasSize.height)
-        let layerRect = bubbleContentRect
+        let layerRect = bubbleContentRect(for: layout)
         // The GPU scales straight into the layer's pixel box, so the draw
         // below is 1:1; Core Graphics resamples the full frame otherwise.
-        let scaledCamera = cameraScaler?.scale(
+        let scaledCamera = cameraScaler(for: resources)?.scale(
             cameraFrame,
             fillRect: fillRect.offsetBy(dx: -layerRect.minX, dy: -(canvasSize.height - layerRect.maxY))
         )
@@ -1129,6 +1477,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             && !card.insetBy(dx: 0, dy: radius).contains(paddedBounds)
 
         context.saveGState()
+        context.setAlpha(overlayOpacity)
         if needsClip {
             context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
             context.clip()
@@ -1166,7 +1515,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         }
 
         if let artworkPlacement {
-            context.setAlpha(CGFloat(min(max(pointer.opacity, 0), 1)))
+            context.setAlpha(CGFloat(min(max(pointer.opacity, 0), 1)) * overlayOpacity)
             context.concatenate(artworkPlacement.transform)
             context.draw(artworkPlacement.image, in: artworkPlacement.rect)
         }
@@ -1216,7 +1565,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         let pillRect = flipped(CGRect(origin: origin, size: pillSize))
 
         context.saveGState()
-        context.setAlpha(CGFloat(caption.opacity))
+        context.setAlpha(CGFloat(caption.opacity) * overlayOpacity)
         context.translateBy(x: pillRect.midX, y: pillRect.midY)
         context.scaleBy(x: CGFloat(caption.scale), y: CGFloat(caption.scale))
         context.translateBy(x: -pillRect.midX, y: -pillRect.midY)
@@ -1271,7 +1620,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         let badgeRect = flipped(CGRect(origin: origin, size: badgeSize))
 
         context.saveGState()
-        context.setAlpha(CGFloat(badge.opacity))
+        context.setAlpha(CGFloat(badge.opacity) * overlayOpacity)
         context.translateBy(x: badgeRect.midX, y: badgeRect.midY)
         context.scaleBy(x: CGFloat(badge.scale), y: CGFloat(badge.scale))
         context.translateBy(x: -badgeRect.midX, y: -badgeRect.midY)
@@ -1512,9 +1861,10 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         return context.makeImage()
     }
 
+    /// The background, plus the card's shadow when `layout` is given.
     private static func renderBackdrop(
         canvasSize: CGSize,
-        layout: RecordingStudioLayout,
+        layout: RecordingStudioLayout?,
         style: RecordingStudioStyle,
         colorSpace: CGColorSpace
     ) -> CGImage? {
@@ -1591,7 +1941,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
 
         // Card shadow: static, so it lives in the backdrop. The filled shape
         // is fully covered by video pixels every frame.
-        if style.shadow > 0.01, style.background != .none {
+        if let layout, style.shadow > 0.01, style.background != .none {
             let minDimension = min(canvasSize.width, canvasSize.height)
             let blur = minDimension * 0.045 * style.shadow
             let cardRect = CGRect(
