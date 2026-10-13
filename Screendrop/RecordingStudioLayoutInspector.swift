@@ -187,13 +187,13 @@ private struct StudioCameraLayoutTile: View {
     let action: () -> Void
 
     @State private var isHovering = false
-    private static let radius: CGFloat = 10
+    private static let radius: CGFloat = 12
     private static let ringGap: CGFloat = 3
 
     var body: some View {
         Button(action: action) {
             VStack(spacing: 7) {
-                StudioCameraLayoutScene(layout: layout, isSelected: isSelected)
+                StudioCameraLayoutScene(layout: layout, isSelected: isSelected, outerRadius: Self.radius)
                     .aspectRatio(aspectRatio, contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: Self.radius, style: .continuous))
                     .overlay {
@@ -240,12 +240,15 @@ private struct StudioCameraLayoutTileButtonStyle: ButtonStyle {
 struct StudioCameraLayoutScene: View {
     let layout: RecordingCameraLayout
     var isSelected = false
+    /// The tile's corner radius; whatever sits inset from the tile's edge
+    /// rounds concentrically with it.
+    var outerRadius: CGFloat = 12
 
     @Environment(\.colorScheme) private var colorScheme
 
     private static let style: RecordingStudioStyle = {
         var style = RecordingStudioStyle(background: .none)
-        style.padding = 0.1
+        style.padding = 0.08
         style.cornerRadius = 0.06
         style.camera.roundness = 0.3
         style.camera.shrinksDuringZoom = false
@@ -271,14 +274,19 @@ struct StudioCameraLayoutScene: View {
                 backdrop
 
                 if frame.screenOpacity > 0.001 {
-                    MiniatureWindow(radius: base.cardCornerRadius, isDark: isDark)
+                    MiniatureWindow(radius: concentricRadius(for: frame.screenRect, in: size), isDark: isDark)
                         .frame(width: frame.screenRect.width, height: frame.screenRect.height)
                         .offset(x: frame.screenRect.minX, y: frame.screenRect.minY)
                 }
 
                 let camera = frame.cameraRect
                 if frame.cameraOpacity > 0.001, camera.width > 0 {
-                    MiniatureCamera(radius: frame.cameraCornerRadius, isDark: isDark)
+                    MiniatureCamera(
+                        radius: layout.kind == .pictureInPicture
+                            ? frame.cameraCornerRadius
+                            : concentricRadius(for: camera, in: size),
+                        isDark: isDark
+                    )
                         .frame(width: camera.width, height: camera.height)
                         .modifier(SelectionBounce(isSelected: isSelected))
                         .offset(x: camera.minX, y: camera.minY)
@@ -290,6 +298,13 @@ struct StudioCameraLayoutScene: View {
     }
 
     private var isDark: Bool { colorScheme == .dark }
+
+    /// Outer radius = inner radius + padding, so a shape inset from the
+    /// tile's edge keeps the tile's curve.
+    private func concentricRadius(for rect: CGRect, in size: CGSize) -> CGFloat {
+        let inset = min(rect.minX, rect.minY, size.width - rect.maxX, size.height - rect.maxY)
+        return max(2, outerRadius - max(0, inset))
+    }
 
     private var backdrop: some View {
         LinearGradient(
@@ -377,7 +392,7 @@ private struct MiniatureWindow: View {
     }
 }
 
-/// The camera: a person against a warm wall, cropped by the camera's shape
+/// The camera: a person against a plain grey wall, cropped by the camera's shape
 /// like a real webcam, with the export's light rim and soft shadow.
 private struct MiniatureCamera: View {
     let radius: CGFloat
@@ -392,8 +407,8 @@ private struct MiniatureCamera: View {
             ZStack {
                 LinearGradient(
                     colors: isDark
-                        ? [Color(red: 0.47, green: 0.40, blue: 0.37), Color(red: 0.32, green: 0.27, blue: 0.26)]
-                        : [Color(red: 0.84, green: 0.76, blue: 0.70), Color(red: 0.66, green: 0.57, blue: 0.53)],
+                        ? [Color(white: 0.42), Color(white: 0.28)]
+                        : [Color(white: 0.8), Color(white: 0.63)],
                     startPoint: .top,
                     endPoint: .bottom
                 )
