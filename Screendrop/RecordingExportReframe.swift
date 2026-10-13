@@ -129,9 +129,6 @@ nonisolated struct ReframeTrack: Sendable {
     private static let deadZoneFraction: CGFloat = 0.28
     /// Low-pass time constant for camera moves, in seconds.
     private static let smoothingTau: Double = 0.45
-    /// How quickly the crop hands over to a zoom cue's anchor as the
-    /// zoom magnification ramps in.
-    private static let zoomHandoffSpan: Double = 0.2
     /// The action is kept at least this far (as a fraction of the visible
     /// crop) inside its edges.
     private static let focusMargin: CGFloat = 0.12
@@ -201,11 +198,18 @@ nonisolated struct ReframeTrack: Sendable {
 
         let smoothing = 1 - exp(-dt / Self.smoothingTau)
         let correctionSmoothing = 1 - exp(-dt / Self.correctionTau)
-        var center = CGPoint(x: 0.5, y: 0.5)
+        // Three stages, each fed only by the one before - nothing feeds
+        // back, so the stages can't fight and the crop can't oscillate:
+        //  1. a calm dead-zone follow of the action, framed for no zoom;
+        //  2. kept inside the window a zoom shows;
+        //  3. an eased correction that keeps the action inside the crop.
+        var follow = CGPoint(x: 0.5, y: 0.5)
         if let initial = focus(0) {
-            center = initial
+            follow = initial
         }
         var correction = CGPoint.zero
+        let restVisibleX = min(1, visibleFraction.width)
+        let restVisibleY = min(1, visibleFraction.height)
 
         for step in 0..<stepCount {
             let time = Double(step) * dt
@@ -219,27 +223,41 @@ nonisolated struct ReframeTrack: Sendable {
 
             let focusPoint = focus(time) ?? viewport.anchor
 
-            // Dead-zone follow: only move enough to keep the focus inside
-            // the central window of the visible crop, then low-pass it.
-            var target = center
-            let windowX = visibleX * Self.deadZoneFraction
-            let windowY = visibleY * Self.deadZoneFraction
-            if focusPoint.x > center.x + windowX { target.x = focusPoint.x - windowX }
-            if focusPoint.x < center.x - windowX { target.x = focusPoint.x + windowX }
-            if focusPoint.y > center.y + windowY { target.y = focusPoint.y - windowY }
-            if focusPoint.y < center.y - windowY { target.y = focusPoint.y + windowY }
-            center.x += (target.x - center.x) * smoothing
-            center.y += (target.y - center.y) * smoothing
+            // 1. Dead-zone follow: only move enough to keep the focus inside
+            // the central window of the unzoomed crop, then low-pass it.
+            var target = follow
+            let windowX = restVisibleX * Self.deadZoneFraction
+            let windowY = restVisibleY * Self.deadZoneFraction
+            if focusPoint.x > follow.x + windowX { target.x = focusPoint.x - windowX }
+            if focusPoint.x < follow.x - windowX { target.x = focusPoint.x + windowX }
+            if focusPoint.y > follow.y + windowY { target.y = focusPoint.y - windowY }
+            if focusPoint.y < follow.y - windowY { target.y = focusPoint.y + windowY }
+            // Stay where the unzoomed crop can actually go, so the follow
+            // never winds up past an edge and lags coming back.
+            target.x = min(max(target.x, restVisibleX / 2), 1 - restVisibleX / 2)
+            target.y = min(max(target.y, restVisibleY / 2), 1 - restVisibleY / 2)
+            follow.x += (target.x - follow.x) * smoothing
+            follow.y += (target.y - follow.y) * smoothing
 
-            // A zoom cue brings its own smoothed camera; hand the crop to
-            // it as the magnification ramps so the two never disagree.
-            let handoff = min(max((magnification - 1) / Self.zoomHandoffSpan, 0), 1)
+            // 2. A zoom shows a window 1/magnification wide around its
+            // anchor. The crop stays inside that window, as near the follow
+            // as it can: at 1x the window is the whole frame and nothing
+            // moves, and as the zoom grows the window closes in and carries
+            // the crop to the target. Blending toward the anchor instead
+            // would drag the crop to the zoom's resting center (where every
+            // zoom's anchor starts) and back out - a visible zigzag.
+            func framedAxis(_ follow: CGFloat, anchor: CGFloat, visible: CGFloat) -> CGFloat {
+                let halfWindow = 1 / (2 * CGFloat(magnification))
+                let low = anchor - halfWindow + visible / 2
+                let high = max(low, anchor + halfWindow - visible / 2)
+                return min(max(follow, low), high)
+            }
             let framed = CGPoint(
-                x: center.x + (viewport.anchor.x - center.x) * handoff,
-                y: center.y + (viewport.anchor.y - center.y) * handoff
+                x: framedAxis(follow.x, anchor: viewport.anchor.x, visible: visibleX),
+                y: framedAxis(follow.y, anchor: viewport.anchor.y, visible: visibleY)
             )
 
-            // How far the framing must slide to keep the action inside the
+            // 3. How far the framing must slide to keep the action inside the
             // crop, eased in and out rather than snapped.
             let reachX = max(0, visibleX / 2 - visibleX * Self.focusMargin)
             let reachY = max(0, visibleY / 2 - visibleY * Self.focusMargin)
@@ -247,8 +265,8 @@ nonisolated struct ReframeTrack: Sendable {
                 x: min(max(framed.x, focusPoint.x - reachX), focusPoint.x + reachX) - framed.x,
                 y: min(max(framed.y, focusPoint.y - reachY), focusPoint.y + reachY) - framed.y
             )
-            correction.x += (needed.x - correction.x) * correctionSmoothing
-            correction.y += (needed.y - correction.y) * correctionSmoothing
+            correction.x = Self.eased(correction.x, toward: needed.x, by: correctionSmoothing)
+            correction.y = Self.eased(correction.y, toward: needed.y, by: correctionSmoothing)
             var anchor = CGPoint(x: framed.x + correction.x, y: framed.y + correction.y)
 
             // Never show past the content edge.
@@ -259,12 +277,6 @@ nonisolated struct ReframeTrack: Sendable {
             if visibleX >= 1 { anchor.x = 0.5 }
             if visibleY >= 1 { anchor.y = 0.5 }
 
-            // Keep the follow camera continuous through zoom handoffs; the
-            // correction stays separate so it can ease back out.
-            if handoff < 1 {
-                center = CGPoint(x: anchor.x - correction.x, y: anchor.y - correction.y)
-            }
-
             frames.append(ViewportFrame(magnification: magnification, anchor: anchor))
         }
 
@@ -274,6 +286,16 @@ nonisolated struct ReframeTrack: Sendable {
             frames: frames,
             duration: duration
         )
+    }
+
+    /// Eases a correction in, but never past what is needed: once the need
+    /// shrinks below it (or flips), it matches exactly. The need moves
+    /// continuously, so matching it is smooth, and the crop can't overshoot
+    /// and swing back.
+    private static func eased(_ current: CGFloat, toward needed: CGFloat, by amount: CGFloat) -> CGFloat {
+        let next = current + (needed - current) * amount
+        if needed * next < 0 || abs(next) > abs(needed) { return needed }
+        return next
     }
 
     /// Where the action is at an editor time: a Fixed zoom's own target
