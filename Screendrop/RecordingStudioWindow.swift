@@ -561,6 +561,10 @@ private struct StudioCanvasComposition: View {
                 }
             }
             .frame(width: canvasSize.width, height: canvasSize.height)
+            // The canvas animates layout changes itself, frame by frame. An
+            // animated edit from the inspector would otherwise also spring
+            // the card and camera toward each frame, overshooting the morph.
+            .transaction { $0.animation = nil }
         }
         .frame(width: canvasSize.width, height: canvasSize.height)
         .onChange(of: model.cameraLayoutTimeline) { old, _ in
@@ -1262,6 +1266,7 @@ private struct StudioCameraBubble: View {
                         y: min(canvas.width, canvas.height) * 0.009
                     )
                     .opacity(framedOpacity)
+                    .animation(.easeOut(duration: 0.15), value: isCutoutReady)
                     .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
                     .onHover { isHovering = $0 }
                     .pointerStyle(isMovable ? (dragOffset == nil ? PointerStyle.grabIdle : .grabActive) : nil)
@@ -1278,9 +1283,7 @@ private struct StudioCameraBubble: View {
                     StudioCameraCutoutView(
                         player: model.cameraPlayer,
                         parameters: cutoutParameters(rect: rect, radius: radius, cutout: cutout),
-                        onReady: {
-                            withAnimation(.easeOut(duration: 0.15)) { isCutoutReady = true }
-                        }
+                        onReady: { isCutoutReady = true }
                     )
                     .frame(width: rect.width, height: rect.height)
                     .allowsHitTesting(false)
