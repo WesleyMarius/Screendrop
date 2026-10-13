@@ -327,7 +327,8 @@ struct StudioCameraLayoutScene: View {
                     MiniatureWindow(
                         radius: concentricRadius(for: window, in: size),
                         isDark: isDark,
-                        pointer: pointer(in: window, clearOf: floats || layout.kind == .cutout ? camera : nil)
+                        pointer: pointer(in: window, clearOf: occupied(camera)),
+                        textEnd: textEnd(in: window, clearOf: occupied(camera))
                     )
                     .frame(width: window.width, height: window.height)
                     .offset(x: window.minX, y: window.minY)
@@ -364,14 +365,34 @@ struct StudioCameraLayoutScene: View {
         return CGRect(x: minX, y: minY, width: round(rect.maxX) - minX, height: round(rect.maxY) - minY)
     }
 
-    /// The pointer's tip, as a fraction of the window: in the content beside
-    /// the sidebar, and on the far side from a camera standing over the
-    /// window - above a cutout's shoulders.
+    /// What a camera standing over the window covers: a cutout only its
+    /// person, mid-frame. Nil for layouts that set it beside the window.
+    private func occupied(_ camera: CGRect) -> CGRect? {
+        switch layout.kind {
+        case .pictureInPicture: camera
+        case .cutout: camera.insetBy(dx: camera.width / 2 - camera.height * 0.48, dy: 0)
+        default: nil
+        }
+    }
+
+    /// The pointer's tip, as a fraction of the window: below the text, in
+    /// the middle of the content a camera leaves clear.
     private func pointer(in window: CGRect, clearOf camera: CGRect?) -> CGPoint {
-        guard let camera, window.width > 0 else { return CGPoint(x: 0.56, y: 0.5) }
-        let offset = (camera.midX - window.midX) / window.width
-        let x: CGFloat = offset > 0.05 ? 0.4 : (offset < -0.05 ? 0.7 : 0.22)
-        return CGPoint(x: x, y: layout.kind == .cutout ? 0.4 : 0.5)
+        guard window.width > 0, window.height > 0 else { return CGPoint(x: 0.5, y: 0.6) }
+        let contentStart: CGFloat = window.width > window.height * 1.2 ? 0.24 : 0.06
+        var lower = contentStart, upper: CGFloat = 0.94
+        if let camera, camera.intersects(window) {
+            let left = (camera.minX - window.minX) / window.width
+            let right = (camera.maxX - window.minX) / window.width
+            if left - contentStart > upper - right { upper = left } else { lower = max(lower, right) }
+        }
+        return CGPoint(x: (lower + upper) / 2 - 0.03, y: 0.6)
+    }
+
+    /// Text ends a little before a camera standing at the window's right.
+    private func textEnd(in window: CGRect, clearOf camera: CGRect?) -> CGFloat {
+        guard let camera, window.width > 0, camera.intersects(window), camera.midX > window.midX else { return 1 }
+        return (camera.minX - window.minX) / window.width - 0.04
     }
 
     /// Outer radius = inner radius + padding, so a shape inset from the
@@ -413,6 +434,9 @@ private struct MiniatureWindow: View {
     let isDark: Bool
     /// Where the pointer's tip sits, as a fraction of the window.
     let pointer: CGPoint
+    /// Where text has to stop, as a fraction of the window's width, to
+    /// clear a camera standing over it.
+    var textEnd: CGFloat = 1
 
     var body: some View {
         GeometryReader { proxy in
@@ -423,13 +447,13 @@ private struct MiniatureWindow: View {
             let showsSidebar = size.width > size.height * 1.2
             let inset = max(1, (unit * 0.04).rounded())
             let sidebarRadius = max(1, radius - inset)
-            let sidebarWidth = (size.width * 0.27).rounded()
+            let sidebarWidth = (size.width * 0.21).rounded()
             let dot = max(2.25, unit * 0.06)
             // Far enough in that the corner never crowds the first light.
             let lightInset = max(dot * 0.85, (showsSidebar ? sidebarRadius : radius) * 0.5) + (showsSidebar ? inset : 0)
             let line = max(1.25, unit * 0.042)
             let textLeading = (showsSidebar ? inset + sidebarWidth : 0) + max(3, line * 2.6)
-            let textWidth = size.width - textLeading - max(3, line * 2.6)
+            let textWidth = max(line * 4, min(size.width, size.width * textEnd) - textLeading - max(3, line * 2.6))
 
             ZStack(alignment: .topLeading) {
                 isDark ? Color(white: 0.22) : Color.white
@@ -446,12 +470,12 @@ private struct MiniatureWindow: View {
 
                 VStack(alignment: .leading, spacing: line * 1.2) {
                     Capsule()
-                        .fill(Color.primary.opacity(isDark ? 0.26 : 0.17))
+                        .fill(Color.primary.opacity(isDark ? 0.32 : 0.22))
                         .frame(width: textWidth * 0.46, height: line * 1.35)
                     VStack(alignment: .leading, spacing: line * 0.9) {
                         ForEach([0.88, 0.66], id: \.self) { fraction in
                             Capsule()
-                                .fill(Color.primary.opacity(isDark ? 0.12 : 0.085))
+                                .fill(Color.primary.opacity(isDark ? 0.17 : 0.12))
                                 .frame(width: textWidth * fraction, height: line)
                         }
                     }
@@ -558,7 +582,7 @@ private struct MiniatureCutout: View {
     let isDark: Bool
 
     var body: some View {
-        StudioPersonSilhouette()
+        StudioPersonSilhouette(scale: 0.46)
             .fill(LinearGradient(
                 colors: isDark
                     ? [Color(white: 0.6), Color(white: 0.52)]
@@ -571,30 +595,29 @@ private struct MiniatureCutout: View {
 }
 
 /// Head and shoulders, drawn the way Apple's person glyph is: a round head
-/// over domed shoulders, framed in a 16:9 camera picture. The picture
-/// aspect-fills the frame as the camera itself does, so a thin card shows
-/// the same person closer up, cropped at its sides, never a stretched one,
-/// and the frame's bottom edge always crops the shoulders.
+/// over domed shoulders. One scale everywhere - by the frame's height,
+/// capped by its width - and anchored to the bottom, so a thin card shows
+/// the same person with wall above rather than a stretched one, and the
+/// frame's bottom edge always crops the shoulders.
 struct StudioPersonSilhouette: Shape {
-    var pictureAspect: CGFloat = 16 / 9
+    /// The head's diameter as a share of the frame's height.
+    var scale: CGFloat = 0.36
 
     func path(in rect: CGRect) -> Path {
         guard rect.width > 0, rect.height > 0 else { return Path() }
-        let fill = max(rect.width / pictureAspect, rect.height)
-        let picture = CGRect(
-            x: rect.midX - fill * pictureAspect / 2, y: rect.midY - fill / 2,
-            width: fill * pictureAspect, height: fill
+        let head = min(rect.height * scale, rect.width * 0.42)
+        let center = CGPoint(
+            x: rect.midX,
+            y: min(rect.minY + rect.height * 0.41, rect.maxY - head * 1.6)
         )
-        let head = picture.height * 0.36
-        let center = CGPoint(x: picture.midX, y: picture.minY + picture.height * 0.41)
-        let shouldersTop = center.y + head * 0.5 + head * 0.13
+        let shouldersTop = center.y + head * 0.63
         var path = Path(ellipseIn: CGRect(
             x: center.x - head / 2, y: center.y - head / 2, width: head, height: head
         ))
         path.addPath(Path(
             roundedRect: CGRect(
                 x: center.x - head * 0.95, y: shouldersTop,
-                width: head * 1.9, height: picture.maxY - shouldersTop + head
+                width: head * 1.9, height: rect.maxY - shouldersTop + head
             ),
             cornerRadius: head * 0.82,
             style: .continuous
