@@ -371,14 +371,21 @@ nonisolated final class StudioCameraMatteTrack: @unchecked Sendable {
     func matte(at time: TimeInterval) -> StudioCameraMatte? {
         condition.lock()
         defer { condition.unlock() }
+        // Before waiting too: the track may be waiting for room.
+        releaseMattes(before: time)
         while completedThrough < time, !isFinished, !isCancelled {
             condition.wait()
         }
-        if let index = mattes.firstIndex(where: { $0.time >= time }), index > 0 {
-            mattes.removeFirst(index)
-            condition.broadcast()
-        }
+        releaseMattes(before: time)
         return mattes.first.flatMap { $0.time == time ? $0.matte : nil }
+    }
+
+    /// Call holding `condition`.
+    private func releaseMattes(before time: TimeInterval) {
+        let count = mattes.prefix { $0.time < time }.count
+        guard count > 0 else { return }
+        mattes.removeFirst(count)
+        condition.broadcast()
     }
 
     func cancel() {
