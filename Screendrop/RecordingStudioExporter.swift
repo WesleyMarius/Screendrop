@@ -1113,6 +1113,42 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         drawSubtitleBar(at: sourceTime, in: context)
     }
 
+    /// Casts `path`'s shadow without drawing `path` itself. Filling a shape
+    /// to get its shadow also leaves the shape, and its antialiased edge
+    /// then shows through whatever is composited over it: a dark outline
+    /// whose strength changes with the edge's sub-pixel position, so it
+    /// flickers as the card or camera moves. The shape is filled off to
+    /// the left of everything visible and the shadow offset back by the
+    /// same distance. `offset` and `blur` are in base (device) units, which
+    /// shadows use whatever the CTM; `baseUnitsPerPoint` converts the
+    /// user-space shift when the context is scaled.
+    nonisolated static func castShadow(
+        of path: CGPath,
+        in context: CGContext,
+        offset: CGSize,
+        blur: CGFloat,
+        color: CGColor,
+        baseUnitsPerPoint: CGFloat = 1
+    ) {
+        let visible = context.boundingBoxOfClipPath
+        let shape = path.boundingBoxOfPath
+        guard !shape.isNull, !visible.isNull else { return }
+        // Far enough that the shape and its antialiasing clear the visible
+        // area; the shadow lands exactly where it would have.
+        let shift = (shape.maxX - visible.minX + 2).rounded(.up)
+        context.saveGState()
+        context.translateBy(x: -shift, y: 0)
+        context.setShadow(
+            offset: CGSize(width: offset.width + shift * baseUnitsPerPoint, height: offset.height),
+            blur: blur,
+            color: color
+        )
+        context.addPath(path)
+        context.setFillColor(CGColor(gray: 0, alpha: 1))
+        context.fillPath()
+        context.restoreGState()
+    }
+
     private func drawBackdrop(_ backdrop: CGImage?, in context: CGContext) {
         if let backdrop {
             context.draw(backdrop, in: CGRect(origin: .zero, size: canvasSize))
@@ -1135,14 +1171,14 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         shadowContext.saveGState()
         shadowContext.scaleBy(x: 1 / scale, y: 1 / scale)
         // Shadows ignore the CTM, so their blur and offset are scaled by hand.
-        shadowContext.setShadow(
+        Self.castShadow(
+            of: roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius),
+            in: shadowContext,
             offset: CGSize(width: 0, height: -blur * 0.35 / scale),
             blur: blur / scale,
-            color: CGColor(gray: 0, alpha: 0.55 * style.shadow * opacity)
+            color: CGColor(gray: 0, alpha: 0.55 * style.shadow * opacity),
+            baseUnitsPerPoint: 1 / scale
         )
-        shadowContext.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
-        shadowContext.setFillColor(CGColor(gray: 0, alpha: opacity))
-        shadowContext.fillPath()
         shadowContext.restoreGState()
         guard let image = shadowContext.makeImage() else { return }
         context.saveGState()
@@ -1259,16 +1295,13 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         let minDimension = min(canvasSize.width, canvasSize.height)
         let path = roundedPath(for: bubble, radius: layout.bubbleCornerRadius)
 
-        context.saveGState()
-        context.setShadow(
+        Self.castShadow(
+            of: path,
+            in: context,
             offset: CGSize(width: 0, height: -minDimension * 0.009),
             blur: minDimension * 0.022,
             color: CGColor(gray: 0, alpha: 0.35 * opacity)
         )
-        context.addPath(path)
-        context.setFillColor(CGColor(gray: 0, alpha: opacity))
-        context.fillPath()
-        context.restoreGState()
 
         context.saveGState()
         context.addPath(path)
@@ -1362,14 +1395,13 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             .intersection(CGRect(origin: .zero, size: canvasSize))
             .integral
         let image = renderLayer(covering: rect, draw: { context in
-            context.setShadow(
+            Self.castShadow(
+                of: roundedPath(for: layout.bubbleRect, radius: layout.bubbleCornerRadius),
+                in: context,
                 offset: CGSize(width: 0, height: -offset),
                 blur: blur,
                 color: CGColor(gray: 0, alpha: 0.35)
             )
-            context.addPath(roundedPath(for: layout.bubbleRect, radius: layout.bubbleCornerRadius))
-            context.setFillColor(CGColor(gray: 0, alpha: 1))
-            context.fillPath()
         })
         let shadow = image.map { ($0, rect) }
         resources.bubbleShadow = .some(shadow)
@@ -1980,8 +2012,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             }
         }
 
-        // Card shadow: static, so it lives in the backdrop. The filled shape
-        // is fully covered by video pixels every frame.
+        // Card shadow: static, so it lives in the backdrop. Only the shadow:
+        // the card's own shape would show through its antialiased edge.
         if let layout, style.shadow > 0.01, style.background != .none {
             let minDimension = min(canvasSize.width, canvasSize.height)
             let blur = minDimension * 0.045 * style.shadow
@@ -1996,16 +2028,13 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
                 ? CGPath(roundedRect: cardRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
                 : CGPath(rect: cardRect, transform: nil)
 
-            context.saveGState()
-            context.setShadow(
+            castShadow(
+                of: path,
+                in: context,
                 offset: CGSize(width: 0, height: -blur * 0.35),
                 blur: blur,
                 color: CGColor(gray: 0, alpha: 0.55 * style.shadow)
             )
-            context.addPath(path)
-            context.setFillColor(CGColor(gray: 0, alpha: 1))
-            context.fillPath()
-            context.restoreGState()
         }
 
         return context.makeImage()
