@@ -716,19 +716,18 @@ private extension CGRect {
     }
 }
 
-// MARK: - Following the action in a cropped card
+// MARK: - Zooming inside a cropped card
 
-/// A fill split shows only part of the screen recording, so it needs its
-/// own crop-and-follow camera (ReframeTrack) to keep the action - the
-/// pointer, or a Fixed zoom's target - in view. One is built per fill
-/// split on the timeline; everywhere else the ordinary viewport applies,
-/// and morphs blend from one camera to the other with the layout.
-nonisolated struct RecordingCameraLayoutFollow: Sendable {
-    private let tracks: [RecordingCameraLayout: ReframeTrack]
+/// A fill split shows only a slice of the screen recording. Its camera is
+/// the same zoom timeline as everywhere else - one spring moving the zoom
+/// and the framing together - built for that narrower slice, so a zoom
+/// centres its target in what the card actually shows. Unzoomed it rests
+/// still, exactly like the full-width card. Morphs blend between cameras
+/// along with the layout.
+nonisolated struct RecordingCameraLayoutZoom: Sendable {
+    private let timelines: [RecordingCameraLayout: ViewportTimeline]
 
-    static let none = RecordingCameraLayoutFollow(tracks: [:])
-
-    var isEmpty: Bool { tracks.isEmpty }
+    static let none = RecordingCameraLayoutZoom(timelines: [:])
 
     /// `canvasSize` through `contentCropRect` must describe the resting
     /// layout exactly as the compositor builds it.
@@ -741,10 +740,10 @@ nonisolated struct RecordingCameraLayoutFollow: Sendable {
         contentCropRect: CGRect,
         showsCamera: Bool,
         layoutTimeline: RecordingCameraLayoutTimeline,
-        viewportTimeline: ViewportTimeline,
-        duration: TimeInterval,
-        focus: (TimeInterval) -> CGPoint?
-    ) -> RecordingCameraLayoutFollow {
+        cues: [ZoomCue],
+        capture: PointerCaptureFile,
+        clipTimeline: RecordingClipTimeline
+    ) -> RecordingCameraLayoutZoom {
         let fills = Set(layoutTimeline.layouts.filter { $0.kind == .split && $0.screenFit == .fill })
         guard showsCamera, !fills.isEmpty, canvasSize.width > 0, canvasSize.height > 0 else { return .none }
         let base = RecordingStudioLayout.make(
@@ -756,7 +755,7 @@ nonisolated struct RecordingCameraLayoutFollow: Sendable {
             contentCropRect: contentCropRect
         )
         let resolver = RecordingCameraLayoutResolver(base: base, style: style, showsCamera: true)
-        var tracks: [RecordingCameraLayout: ReframeTrack] = [:]
+        var timelines: [RecordingCameraLayout: ViewportTimeline] = [:]
         for layout in fills {
             let applied = base.applying(resolver.frame(for: layout))
             guard applied.contentFillSize.width > 0, applied.contentFillSize.height > 0 else { continue }
@@ -764,37 +763,34 @@ nonisolated struct RecordingCameraLayoutFollow: Sendable {
                 width: applied.cardRect.width / applied.contentFillSize.width,
                 height: applied.cardRect.height / applied.contentFillSize.height
             )
-            // A card that still shows the whole recording needs no follow.
+            // A card that still shows the whole recording uses the ordinary camera.
             guard visible.width < 0.999 || visible.height < 0.999 else { continue }
-            tracks[layout] = ReframeTrack.follow(
-                visibleFraction: visible,
-                sourceAspect: base.contentFillSize.height > 0
-                    ? base.contentFillSize.width / base.contentFillSize.height
-                    : 1,
-                viewportTimeline: viewportTimeline,
-                duration: duration,
-                focus: focus
+            timelines[layout] = ViewportTimeline.build(
+                cues: cues,
+                capture: capture,
+                clipTimeline: clipTimeline,
+                visibleFraction: visible
             )
         }
-        return RecordingCameraLayoutFollow(tracks: tracks)
+        return RecordingCameraLayoutZoom(timelines: timelines)
     }
 
-    /// The virtual camera at an editor time: the follow camera of a fill
-    /// split, `base` elsewhere, blended across a morph.
+    /// The camera at an editor time: a fill split's own zoom timeline while
+    /// one shows, `base` elsewhere, blended across a morph.
     func viewport(
         at time: TimeInterval,
         state: RecordingCameraLayoutTimeline.State,
         base: (TimeInterval) -> ViewportFrame
     ) -> ViewportFrame {
-        guard !tracks.isEmpty else { return base(time) }
+        guard !timelines.isEmpty else { return base(time) }
         func camera(for layout: RecordingCameraLayout) -> ViewportFrame {
-            tracks[layout]?.frame(at: time) ?? base(time)
+            timelines[layout]?.frame(at: time) ?? base(time)
         }
         switch state {
         case .settled(let layout):
             return camera(for: layout)
         case .transition(let from, let to, let progress):
-            guard tracks[from] != nil || tracks[to] != nil else { return base(time) }
+            guard timelines[from] != nil || timelines[to] != nil else { return base(time) }
             let a = camera(for: from)
             let b = camera(for: to)
             let t = RecordingCameraLayoutTimeline.ease(progress)

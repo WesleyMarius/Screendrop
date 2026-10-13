@@ -81,7 +81,7 @@ final class RecordingStudioModel {
             if oldValue.camera.layout != style.camera.layout {
                 rebuildCameraLayoutTimeline()
             } else if oldValue.camera != style.camera || oldValue.padding != style.padding {
-                rebuildLayoutFollow()
+                rebuildLayoutZoom()
             }
             scheduleProjectSave()
         }
@@ -160,7 +160,7 @@ final class RecordingStudioModel {
     var videoCropRect = CropRectEditor.unit {
         didSet {
             scheduleProjectSave()
-            if oldValue != videoCropRect { rebuildLayoutFollow() }
+            if oldValue != videoCropRect { rebuildLayoutZoom() }
         }
     }
     private(set) var isCroppingVideo = false
@@ -169,9 +169,9 @@ final class RecordingStudioModel {
     /// The preview's copy of the reframe camera, kept current with every
     /// edit that would change the exported crop.
     private(set) var previewReframe: ReframeTrack?
-    /// Follow cameras for fill splits, which show only part of the screen.
-    /// Shared by the preview and the export.
-    private(set) var layoutFollow = RecordingCameraLayoutFollow.none
+    /// The zoom cameras of fill splits, which show only a slice of the
+    /// screen. Shared by the preview and the export.
+    private(set) var layoutZoom = RecordingCameraLayoutZoom.none
     private var reframeFocusTimeline: PointerTimeline?
     private var reframeFocusResolved = false
     private(set) var subtitleCues: [RecordingSubtitleCue] = []
@@ -1166,7 +1166,7 @@ final class RecordingStudioModel {
         }
     }
 
-    private func rebuildCameraLayoutTimeline() {
+    private func rebuildCameraLayoutTimeline(rebuildsZoom: Bool = true) {
         let next = RecordingCameraLayoutTimeline.build(
             defaultLayout: style.camera.layout,
             cues: cameraLayoutCues,
@@ -1175,7 +1175,7 @@ final class RecordingStudioModel {
         if next != cameraLayoutTimeline {
             cameraLayoutTimeline = next
         }
-        rebuildLayoutFollow()
+        if rebuildsZoom { rebuildLayoutZoom() }
     }
 
     private func replaceLayoutCues(_ cues: [RecordingCameraLayoutCue]) {
@@ -1360,8 +1360,9 @@ final class RecordingStudioModel {
 
     private func rebuildViewportTimeline() {
         // Layout cues live on the same edited timeline, so every cut,
-        // trim or speed change that moves zooms moves them too.
-        rebuildCameraLayoutTimeline()
+        // trim or speed change that moves zooms moves them too. The fill
+        // splits' zoom cameras rebuild below, with the preview reframe.
+        rebuildCameraLayoutTimeline(rebuildsZoom: false)
         guard sourceDuration > 0 else {
             viewportTimeline = .identity
             return
@@ -2052,31 +2053,19 @@ final class RecordingStudioModel {
             reframe: reframe,
             fitContentAspect: fitContentAspect,
             usesUniformPadding: exportAspect == .original,
-            layoutFollow: makeLayoutFollow(reframe: reframe)
+            layoutZoom: makeLayoutZoom(reframe: reframe)
         )
     }
 
-    /// Where the action is: a Fixed zoom's target while one is on, the
-    /// recorded pointer otherwise.
-    private func followFocus() -> (TimeInterval) -> CGPoint? {
-        let focusTimeline = reframeFocusPointer()
-        return ReframeTrack.focus(
-            cues: zoomEnabled ? zoomCues : [],
-            clipTimeline: clipTimeline
-        ) { editorTime in
-            focusTimeline?.location(at: editorTime)
-        }
-    }
-
-    /// Follow cameras for the fill splits on the timeline, on the export
+    /// The zoom camera of each fill split on the timeline, on the export
     /// canvas exactly as the compositor lays it out.
-    private func makeLayoutFollow(reframe: ReframeTrack?) -> RecordingCameraLayoutFollow {
+    private func makeLayoutZoom(reframe: ReframeTrack?) -> RecordingCameraLayoutZoom {
         guard showsCameraLayer, sourceDuration > 0 else { return .none }
         let fitContentAspect: CGFloat? =
             (exportAspect == .original || exportAspectMode == .fit) && videoSize.height > 0
                 ? videoSize.width / videoSize.height
                 : nil
-        return RecordingCameraLayoutFollow.build(
+        return RecordingCameraLayoutZoom.build(
             canvasSize: basePreviewCanvasSize,
             style: style,
             usesUniformPadding: exportAspect == .original,
@@ -2085,15 +2074,15 @@ final class RecordingStudioModel {
             contentCropRect: videoCropRect,
             showsCamera: true,
             layoutTimeline: cameraLayoutTimeline,
-            viewportTimeline: zoomEnabled ? viewportTimeline : .identity,
-            duration: duration,
-            focus: followFocus()
+            cues: zoomEnabled ? zoomCues : [],
+            capture: pointerCapture,
+            clipTimeline: clipTimeline
         )
     }
 
-    private func rebuildLayoutFollow() {
+    private func rebuildLayoutZoom() {
         guard isLoaded else { return }
-        layoutFollow = makeLayoutFollow(reframe: previewReframe)
+        layoutZoom = makeLayoutZoom(reframe: previewReframe)
     }
 
     /// The crop-and-follow camera for non-original aspect exports. Focus
@@ -2101,14 +2090,16 @@ final class RecordingStudioModel {
     /// whether or not the cursor is drawn synthetically.
     private func makeReframeTrack() -> ReframeTrack? {
         guard exportAspect != .original, exportAspectMode == .fill else { return nil }
+        let focusTimeline = reframeFocusPointer()
         let effectiveViewport = zoomEnabled ? viewportTimeline : .identity
         return ReframeTrack.build(
             preset: exportAspect,
             sourceSize: videoSize,
             viewportTimeline: effectiveViewport,
-            duration: duration,
-            focus: followFocus()
-        )
+            duration: duration
+        ) { editorTime in
+            focusTimeline?.location(at: editorTime)
+        }
     }
 
     /// The focus source is immutable per session, so it resolves once.
@@ -2132,7 +2123,7 @@ final class RecordingStudioModel {
     private func rebuildPreviewReframe() {
         guard isLoaded else { return }
         previewReframe = makeReframeTrack()
-        layoutFollow = makeLayoutFollow(reframe: previewReframe)
+        layoutZoom = makeLayoutZoom(reframe: previewReframe)
     }
 
     // MARK: - Preview canvas
@@ -2182,7 +2173,7 @@ final class RecordingStudioModel {
     func previewViewportFrame(at time: TimeInterval) -> ViewportFrame {
         let base = isCroppingVideo
             ? previewReframe?.frame(at: time) ?? viewportFrame(at: time)
-            : layoutFollow.viewport(at: time, state: cameraLayoutTimeline.state(at: time)) { time in
+            : layoutZoom.viewport(at: time, state: cameraLayoutTimeline.state(at: time)) { time in
                 previewReframe?.frame(at: time) ?? viewportFrame(at: time)
             }
         return RecordingVideoCropGeometry.viewport(base, crop: previewVideoCropRect)

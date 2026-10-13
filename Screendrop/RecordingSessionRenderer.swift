@@ -138,20 +138,15 @@ enum RecordingSessionRenderer {
 
         let aspect = document?.exportAspectPreset ?? .original
         let aspectMode = document?.exportAspectContentMode ?? .fill
-        let focus = ReframeTrack.focus(
-            cues: zoomEnabled ? zoomCues : [],
-            clipTimeline: clipTimeline
-        ) { editorTime in
-            pointerTimeline?.location(at: editorTime)
-        }
         let reframe: ReframeTrack? = aspectMode == .fill
             ? ReframeTrack.build(
                 preset: aspect,
                 sourceSize: canvasSize,
                 viewportTimeline: viewportTimeline,
-                duration: clipTimeline.duration,
-                focus: focus
-            )
+                duration: clipTimeline.duration
+            ) { editorTime in
+                pointerTimeline?.location(at: editorTime)
+            }
             : nil
         let fitContentAspect: CGFloat? =
             (aspect == .original || aspectMode == .fit) && canvasSize.height > 0
@@ -165,7 +160,7 @@ enum RecordingSessionRenderer {
             )
             : aspect.canvasSize(for: canvasSize)
         let videoCropRect = document?.normalizedVideoCropRect ?? CGRect(x: 0, y: 0, width: 1, height: 1)
-        let layoutFollow = RecordingCameraLayoutFollow.build(
+        let layoutZoom = RecordingCameraLayoutZoom.build(
             canvasSize: exportCanvasSize,
             style: style,
             usesUniformPadding: aspect == .original,
@@ -174,9 +169,9 @@ enum RecordingSessionRenderer {
             contentCropRect: videoCropRect,
             showsCamera: style.camera.isVisible,
             layoutTimeline: cameraLayoutTimeline,
-            viewportTimeline: viewportTimeline,
-            duration: clipTimeline.duration,
-            focus: focus
+            cues: zoomEnabled ? zoomCues : [],
+            capture: capture,
+            clipTimeline: clipTimeline
         )
 
         return RecordingStudioExporter.Configuration(
@@ -211,7 +206,7 @@ enum RecordingSessionRenderer {
             reframe: reframe,
             fitContentAspect: fitContentAspect,
             usesUniformPadding: aspect == .original,
-            layoutFollow: layoutFollow
+            layoutZoom: layoutZoom
         )
     }
 

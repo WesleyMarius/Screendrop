@@ -130,6 +130,27 @@ nonisolated struct ZoomCue: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+/// How much of the recording a card shows at 1x along each axis. A
+/// viewport at magnification m sees `fraction / m` of the recording, so its
+/// half-extent on an axis is `fraction / (2m)`; the whole frame is (1, 1).
+nonisolated struct VisibleFraction: Sendable {
+    let width: Double
+    let height: Double
+
+    init(_ size: CGSize) {
+        width = min(max(Double(size.width), 0.000_1), 1)
+        height = min(max(Double(size.height), 0.000_1), 1)
+    }
+
+    /// The tighter axis, for limits measured in viewport widths.
+    var narrowest: Double { min(width, height) }
+
+    func halfExtents(magnification: Double) -> (x: Double, y: Double) {
+        let base = 1 / (2 * max(magnification, 1))
+        return (base * width, base * height)
+    }
+}
+
 /// One sampled state of the virtual camera.
 nonisolated struct ViewportFrame: Sendable, Equatable {
     var magnification: Double
@@ -271,11 +292,18 @@ nonisolated struct ViewportTimeline: Sendable {
     ///   target is active is resolved through the clip's speed (via
     ///   `clipTimeline.sourceTime(at:)`), so a sped-up clip plays its video
     ///   faster without the pan/zoom itself moving any faster.
+    /// - Parameter visibleFraction: How much of the recording's width and
+    ///   height the card shows at 1x. The whole frame (1, 1) everywhere but a
+    ///   split whose screen fills its card, which crops the recording; there
+    ///   the same spring frames the narrower window, so source bounds and
+    ///   keep-in-view margins measure that window instead of the full frame.
     static func build(
         cues: [ZoomCue],
         capture: PointerCaptureFile,
-        clipTimeline: RecordingClipTimeline
+        clipTimeline: RecordingClipTimeline,
+        visibleFraction: CGSize = CGSize(width: 1, height: 1)
     ) -> ViewportTimeline {
+        let visible = VisibleFraction(visibleFraction)
         let duration = clipTimeline.duration
         guard duration.isFinite, duration > 0 else { return .identity }
 
@@ -288,7 +316,8 @@ nonisolated struct ViewportTimeline: Sendable {
             && activityTargetsByCueID[cue.id] == nil {
             activityTargetsByCueID[cue.id] = activityTargets(
                 for: cue,
-                samples: activitySamples
+                samples: activitySamples,
+                visible: visible
             )
         }
         let pressEvents = activitySamples.filter { $0.kind == .press }
@@ -332,7 +361,8 @@ nonisolated struct ViewportTimeline: Sendable {
                 rawTarget,
                 magnification: targetMagnification,
                 anchorMode: active?.anchorMode ?? .pinnedAnchor,
-                boundsBias: active?.boundsBias ?? 0
+                boundsBias: active?.boundsBias ?? 0,
+                visible: visible
             )
             let targetHalfExtent = 1 / (2 * targetMagnification)
             // Comfort widening only reshapes the spring's pursuit target:
@@ -344,7 +374,7 @@ nonisolated struct ViewportTimeline: Sendable {
                 targetAnchor.y - anchorYSpring.position
             )
             let pursuitMagnification = remainingTravel > 0.000_1
-                ? min(targetMagnification, max(1, travelComfortWidths / remainingTravel))
+                ? min(targetMagnification, max(1, travelComfortWidths * visible.narrowest / remainingTravel))
                 : targetMagnification
             let pursuitHalfExtent = 1 / (2 * pursuitMagnification)
 
@@ -367,7 +397,8 @@ nonisolated struct ViewportTimeline: Sendable {
             let magnification = max(1, 1 / (2 * safeHalfExtent))
             var anchor = clampToFrame(
                 CGPoint(x: anchorXSpring.position, y: anchorYSpring.position),
-                magnification: magnification
+                magnification: magnification,
+                visible: visible
             )
 
             // Pointer tracking normally gives the spring enough time to
@@ -385,7 +416,8 @@ nonisolated struct ViewportTimeline: Sendable {
                         press.point,
                         from: anchor,
                         magnification: magnification,
-                        interiorMargin: interiorMargin
+                        interiorMargin: interiorMargin,
+                        visible: visible
                     )
                     // Keep the spring and rendered state coherent so releasing
                     // the safety constraint cannot create a snap-back frame.
@@ -467,7 +499,8 @@ nonisolated struct ViewportTimeline: Sendable {
     /// movement cannot make the camera continually revise its destination.
     private static func activityTargets(
         for cue: ZoomCue,
-        samples: [PointerSample]
+        samples: [PointerSample],
+        visible: VisibleFraction
     ) -> [ActivityTarget] {
         var cueSamples = samples.filter { $0.time >= cue.start && $0.time <= cue.end }
         if cueSamples.isEmpty {
@@ -480,8 +513,8 @@ nonisolated struct ViewportTimeline: Sendable {
         guard let first = cueSamples.first else { return [] }
 
         let magnification = max(cue.zoom, 1)
-        let horizontalLimit = 0.5 / magnification
-        let verticalLimit = 0.7 / magnification
+        let horizontalLimit = 0.5 * visible.width / magnification
+        let verticalLimit = 0.7 * visible.height / magnification
         var group = ActivityGroup(sample: first)
         var groups: [ActivityGroup] = []
 
@@ -624,19 +657,20 @@ nonisolated struct ViewportTimeline: Sendable {
         _ point: CGPoint,
         magnification: Double,
         anchorMode: ZoomAnchorMode,
-        boundsBias: Double
+        boundsBias: Double,
+        visible: VisibleFraction
     ) -> CGPoint {
         let rawCenteredTarget = normalized(point)
         guard anchorMode != .pinnedAnchor else {
-            return clampToFrame(rawCenteredTarget, magnification: magnification)
+            return clampToFrame(rawCenteredTarget, magnification: magnification, visible: visible)
         }
 
-        let halfExtent = 1 / (2 * max(magnification, 1))
+        let halfExtent = visible.halfExtents(magnification: magnification)
         // This anchor keeps the subject at its original unzoomed screen
         // position: screen = 0.5 + magnification * (subject - viewportAnchor).
         let screenPositionPreservingTarget = CGPoint(
-            x: halfExtent + rawCenteredTarget.x * (1 - 2 * halfExtent),
-            y: halfExtent + rawCenteredTarget.y * (1 - 2 * halfExtent)
+            x: halfExtent.x + rawCenteredTarget.x * (1 - 2 * halfExtent.x),
+            y: halfExtent.y + rawCenteredTarget.y * (1 - 2 * halfExtent.y)
         )
         let bias = unit(boundsBias)
         let blended = CGPoint(
@@ -645,15 +679,19 @@ nonisolated struct ViewportTimeline: Sendable {
             y: rawCenteredTarget.y
                 + (screenPositionPreservingTarget.y - rawCenteredTarget.y) * bias
         )
-        return clampToFrame(blended, magnification: magnification)
+        return clampToFrame(blended, magnification: magnification, visible: visible)
     }
 
     /// Final safety invariant: the viewport never exposes space beyond source.
-    private static func clampToFrame(_ point: CGPoint, magnification: Double) -> CGPoint {
-        let halfExtent = 1 / (2 * max(magnification, 1))
+    private static func clampToFrame(
+        _ point: CGPoint,
+        magnification: Double,
+        visible: VisibleFraction
+    ) -> CGPoint {
+        let halfExtent = visible.halfExtents(magnification: magnification)
         return CGPoint(
-            x: min(max(point.x, halfExtent), 1 - halfExtent),
-            y: min(max(point.y, halfExtent), 1 - halfExtent)
+            x: min(max(point.x, halfExtent.x), 1 - halfExtent.x),
+            y: min(max(point.y, halfExtent.y), 1 - halfExtent.y)
         )
     }
 
@@ -665,12 +703,13 @@ nonisolated struct ViewportTimeline: Sendable {
         _ point: CGPoint,
         from anchor: CGPoint,
         magnification: Double,
-        interiorMargin: Double
+        interiorMargin: Double,
+        visible: VisibleFraction
     ) -> CGPoint {
-        let halfExtent = 1 / (2 * max(magnification, 1))
-        let safeHalfExtent = halfExtent * unit(interiorMargin)
+        let halfExtents = visible.halfExtents(magnification: magnification)
 
-        func constrainedAxis(point: Double, anchor: Double) -> Double {
+        func constrainedAxis(point: Double, anchor: Double, halfExtent: Double) -> Double {
+            let safeHalfExtent = halfExtent * unit(interiorMargin)
             let sourceMinimum = halfExtent
             let sourceMaximum = 1 - halfExtent
             let safeMinimum = max(sourceMinimum, point - safeHalfExtent)
@@ -688,8 +727,8 @@ nonisolated struct ViewportTimeline: Sendable {
         }
 
         return CGPoint(
-            x: constrainedAxis(point: point.x, anchor: anchor.x),
-            y: constrainedAxis(point: point.y, anchor: anchor.y)
+            x: constrainedAxis(point: point.x, anchor: anchor.x, halfExtent: halfExtents.x),
+            y: constrainedAxis(point: point.y, anchor: anchor.y, halfExtent: halfExtents.y)
         )
     }
 
