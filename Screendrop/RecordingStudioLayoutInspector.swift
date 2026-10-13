@@ -177,8 +177,8 @@ struct StudioCameraLayoutPicker: View {
     }
 }
 
-/// One layout in the picker: a tiny scene above its name. Unpicked scenes
-/// rest muted; the picked one comes into colour and its camera bounces in.
+/// One layout in the picker: a tiny scene above its name. Every scene
+/// looks the same; the ring marks the picked one, and its camera bounces in.
 private struct StudioCameraLayoutTile: View {
     let layout: RecordingCameraLayout
     let title: String
@@ -187,7 +187,7 @@ private struct StudioCameraLayoutTile: View {
     let action: () -> Void
 
     @State private var isHovering = false
-    private static let radius: CGFloat = 12
+    private static let radius: CGFloat = 10
     private static let ringGap: CGFloat = 3
 
     var body: some View {
@@ -200,7 +200,6 @@ private struct StudioCameraLayoutTile: View {
                         RoundedRectangle(cornerRadius: Self.radius, style: .continuous)
                             .strokeBorder(Color.primary.opacity(isHovering && !isSelected ? 0.16 : 0.07), lineWidth: 0.5)
                     }
-                    .saturation(isSelected ? 1 : isHovering ? 0.7 : 0.25)
                     .padding(Self.ringGap)
                     .overlay {
                         RoundedRectangle(cornerRadius: Self.radius + Self.ringGap, style: .continuous)
@@ -242,7 +241,7 @@ struct StudioCameraLayoutScene: View {
     var isSelected = false
     /// The tile's corner radius; whatever sits inset from the tile's edge
     /// rounds concentrically with it.
-    var outerRadius: CGFloat = 12
+    var outerRadius: CGFloat = 10
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -344,8 +343,11 @@ private struct MiniatureWindow: View {
         GeometryReader { proxy in
             let size = proxy.size
             let unit = min(size.width, size.height)
-            let bar = max(4, unit * 0.14)
-            let dot = bar * 0.42
+            let dot = max(2.5, unit * 0.06)
+            // Far enough in that the window's corner never clips the first
+            // light, however round it is.
+            let lightInset = max(dot * 0.9, radius * 0.45)
+            let bar = max(unit * 0.14, lightInset * 2 + dot)
             let line = max(1.5, unit * 0.045)
             let showsSidebar = size.width > size.height * 0.9
 
@@ -359,8 +361,8 @@ private struct MiniatureWindow: View {
                         Circle().fill(color).frame(width: dot, height: dot)
                     }
                 }
-                .padding(.leading, bar * 0.45)
-                .frame(height: bar)
+                .padding(.leading, lightInset)
+                .padding(.top, lightInset)
 
                 HStack(alignment: .top, spacing: 0) {
                     if showsSidebar {
