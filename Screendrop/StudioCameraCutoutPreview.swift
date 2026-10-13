@@ -120,8 +120,8 @@ final class StudioCameraCutoutLayerView: NSView, AVPlayerItemOutputPullDelegate 
         updateDrawableSize()
     }
 
-    override func layout() {
-        super.layout()
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
         updateDrawableSize()
     }
 
