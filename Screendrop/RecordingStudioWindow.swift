@@ -1236,55 +1236,61 @@ private struct StudioCameraBubble: View {
                     .transition(.opacity)
             }
 
-            StudioPlayerLayerView(player: model.cameraPlayer, gravity: .resizeAspectFill)
-                .frame(width: rect.width, height: rect.height)
-                .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: radius, style: .continuous)
-                        .strokeBorder(.white.opacity(0.25), lineWidth: 1)
-                }
-                .overlay {
-                    if isActive {
-                        // Nested radius: the ring sits `hoverRingPadding` outside.
-                        RoundedRectangle(
-                            cornerRadius: radius + Self.hoverRingPadding,
-                            style: .continuous
-                        )
-                        .strokeBorder(Palette.highlight, lineWidth: 2)
-                        .padding(-Self.hoverRingPadding)
-                        .allowsHitTesting(false)
+            ZStack(alignment: .topLeading) {
+                StudioPlayerLayerView(player: model.cameraPlayer, gravity: .resizeAspectFill)
+                    .frame(width: rect.width, height: rect.height)
+                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: radius, style: .continuous)
+                            .strokeBorder(.white.opacity(0.25), lineWidth: 1)
                     }
-                }
-                .shadow(
-                    color: .black.opacity(0.35),
-                    radius: min(canvas.width, canvas.height) * 0.022,
-                    y: min(canvas.width, canvas.height) * 0.009
-                )
-                .opacity(framedOpacity)
-                .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-                .onHover { isHovering = $0 }
-                .pointerStyle(isMovable ? (dragOffset == nil ? PointerStyle.grabIdle : .grabActive) : nil)
-                // Swallow clicks so they don't toggle playback underneath.
-                .onTapGesture {}
-                .gesture(dragGesture, including: isMovable ? .all : .none)
-                .help(isMovable ? "Drag the camera to another corner" : "")
-                // A camera the layout places (full frame, split) lets clicks
-                // through to the canvas, which plays and pauses.
-                .allowsHitTesting(isMovable)
-                .offset(x: rect.minX, y: rect.minY)
+                    .overlay {
+                        if isActive {
+                            // Nested radius: the ring sits `hoverRingPadding` outside.
+                            RoundedRectangle(
+                                cornerRadius: radius + Self.hoverRingPadding,
+                                style: .continuous
+                            )
+                            .strokeBorder(Palette.highlight, lineWidth: 2)
+                            .padding(-Self.hoverRingPadding)
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .shadow(
+                        color: .black.opacity(0.35),
+                        radius: min(canvas.width, canvas.height) * 0.022,
+                        y: min(canvas.width, canvas.height) * 0.009
+                    )
+                    .opacity(framedOpacity)
+                    .contentShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+                    .onHover { isHovering = $0 }
+                    .pointerStyle(isMovable ? (dragOffset == nil ? PointerStyle.grabIdle : .grabActive) : nil)
+                    // Swallow clicks so they don't toggle playback underneath.
+                    .onTapGesture {}
+                    .gesture(dragGesture, including: isMovable ? .all : .none)
+                    .help(isMovable ? "Drag the camera to another corner" : "")
+                    // A camera the layout places (full frame, split) lets clicks
+                    // through to the canvas, which plays and pauses.
+                    .allowsHitTesting(isMovable)
+                    .offset(x: rect.minX, y: rect.minY)
 
-            if showsCutout {
-                StudioCameraCutoutView(
-                    player: model.cameraPlayer,
-                    parameters: cutoutParameters(rect: rect, radius: radius, cutout: cutout),
-                    onReady: {
-                        withAnimation(.easeOut(duration: 0.15)) { isCutoutReady = true }
-                    }
-                )
-                .frame(width: rect.width, height: rect.height)
-                .allowsHitTesting(false)
-                .offset(x: rect.minX, y: rect.minY)
+                if showsCutout {
+                    StudioCameraCutoutView(
+                        player: model.cameraPlayer,
+                        parameters: cutoutParameters(rect: rect, radius: radius, cutout: cutout),
+                        onReady: {
+                            withAnimation(.easeOut(duration: 0.15)) { isCutoutReady = true }
+                        }
+                    )
+                    .frame(width: rect.width, height: rect.height)
+                    .allowsHitTesting(false)
+                    .offset(x: rect.minX, y: rect.minY)
+                }
             }
+            .frame(width: canvas.width, height: canvas.height, alignment: .topLeading)
+            // A cutout can stand wider than the canvas, which crops it as
+            // the export does.
+            .clipShape(StudioCanvasClip(clips: showsCutout))
         }
         .frame(width: canvas.width, height: canvas.height, alignment: .topLeading)
         .onChange(of: showsCutout) { _, shows in
@@ -1329,6 +1335,17 @@ private struct StudioCameraBubble: View {
                 dragOffset = nil
                 onDrop(dropped, corner(for: dropped))
             }
+    }
+}
+
+/// The canvas when `clips`; otherwise far past it, so a corner camera
+/// dragged over the edge still shows whole. One shape either way keeps the
+/// camera's player layer in place when a cutout comes and goes.
+private struct StudioCanvasClip: Shape {
+    var clips: Bool
+
+    func path(in rect: CGRect) -> Path {
+        Path(clips ? rect : rect.insetBy(dx: -100_000, dy: -100_000))
     }
 }
 
