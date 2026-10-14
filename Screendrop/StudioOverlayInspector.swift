@@ -493,14 +493,6 @@ struct StudioImageInspectorControls: View {
     @Bindable var model: RecordingStudioModel
     let image: RecordingImageOverlay
 
-    private static let spots: [(title: String, point: CGPoint)] = [
-        ("Top Left", CGPoint(x: 0.15, y: 0.15)),
-        ("Top Right", CGPoint(x: 0.85, y: 0.15)),
-        ("Center", CGPoint(x: 0.5, y: 0.5)),
-        ("Bottom Left", CGPoint(x: 0.15, y: 0.85)),
-        ("Bottom Right", CGPoint(x: 0.85, y: 0.85))
-    ]
-
     var body: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
             VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
@@ -556,40 +548,6 @@ struct StudioImageInspectorControls: View {
                     )
                 }
             }
-
-            VStack(alignment: .leading, spacing: InspectorMetrics.groupLabelSpacing) {
-                InspectorGroupLabel("Position")
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 5), spacing: 4) {
-                    ForEach(Self.spots, id: \.title) { spot in
-                        InspectorTile(
-                            title: spot.title,
-                            aspectRatio: 1.4,
-                            isSelected: abs(image.center.x - spot.point.x) < 0.005 && abs(image.center.y - spot.point.y) < 0.005
-                        ) {
-                            edit("Move Image") { $0.center = spot.point }
-                        } content: {
-                            Rectangle()
-                                .fill(Color.primary.opacity(0.05))
-                                .overlay {
-                                    GeometryReader { proxy in
-                                        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                                            .fill(Palette.secondaryLabel)
-                                            .frame(width: proxy.size.width * 0.28, height: proxy.size.height * 0.28)
-                                            .position(x: proxy.size.width * spot.point.x, y: proxy.size.height * spot.point.y)
-                                    }
-                                }
-                        }
-                    }
-                }
-                InspectorFieldPair {
-                    InspectorSlider("X", value: centerBinding(\.x), range: 0...1, format: .percent())
-                } trailing: {
-                    InspectorSlider("Y", value: centerBinding(\.y), range: 0...1, format: .percent())
-                }
-                InspectorHint(image.isAnimated
-                    ? "The GIF loops for as long as its block lasts. Drag it, or its corner, on the paused canvas."
-                    : "Drag the image, or its corner, on the paused canvas.")
-            }
         }
     }
 
@@ -603,13 +561,6 @@ struct StudioImageInspectorControls: View {
         Binding(
             get: { CGFloat(image[keyPath: keyPath]) },
             set: { value in edit(action) { $0[keyPath: keyPath] = Double(value) } }
-        )
-    }
-
-    private func centerBinding(_ axis: WritableKeyPath<CGPoint, CGFloat>) -> Binding<CGFloat> {
-        Binding(
-            get: { image.center[keyPath: axis] },
-            set: { value in edit("Move Image") { $0.center[keyPath: axis] = value } }
         )
     }
 }
