@@ -41,6 +41,14 @@ struct StudioTimelineDock: View {
     /// Files being dragged over the tracks: which tracks they'll land on,
     /// and when.
     @State private var mediaDrop: StudioMediaDrop?
+    /// The height the tracks were given by dragging the dock's top edge,
+    /// kept across projects and launches; 0 shows every track.
+    @AppStorage("StudioTimelineTracksHeight") private var storedTracksHeight: Double = 0
+    /// The tracks' height when a resize drag began.
+    @State private var resizeBase: CGFloat?
+    /// How far the tracks are scrolled down, which the gutter follows.
+    @State private var scrollY: CGFloat = 0
+    @State private var verticalScrollPosition = ScrollPosition(edge: .top)
     @Namespace private var glass
 
     /// Below this track width the opened + shows bare glyphs, so the edit
@@ -81,6 +89,68 @@ struct StudioTimelineDock: View {
             Rectangle()
                 .fill(Color(nsColor: .separatorColor).opacity(0.45))
                 .frame(height: 0.5)
+        }
+        .overlay(alignment: .top) { resizeHandle }
+    }
+
+    // MARK: Height
+
+    /// Every track, with the room after the last.
+    private var fullTracksHeight: CGFloat {
+        StudioTimelineMetrics.scrollingLanesHeight(tracks: tracks)
+    }
+
+    /// The height the tracks get: what the dock was dragged to, never more
+    /// than every track needs and never less than the clips.
+    private var visibleTracksHeight: CGFloat {
+        let full = fullTracksHeight
+        guard storedTracksHeight > 0 else { return full }
+        return min(full, max(StudioTimelineMetrics.minimumTracksHeight, CGFloat(storedTracksHeight)))
+    }
+
+    /// The dock's top edge trades height between the preview and the
+    /// tracks, following the pointer exactly. A double-click opens it back
+    /// up to every track.
+    private var resizeHandle: some View {
+        Color.clear
+            .frame(height: 7)
+            .contentShape(Rectangle())
+            .pointerStyle(.frameResize(position: .top))
+            .gesture(
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { value in
+                        let base = resizeBase ?? visibleTracksHeight
+                        if resizeBase == nil { resizeBase = base }
+                        let full = fullTracksHeight
+                        let height = min(full, max(StudioTimelineMetrics.minimumTracksHeight, base - value.translation.height))
+                        // Dragged all the way open means "every track", so a
+                        // track that appears later still shows.
+                        storedTracksHeight = height >= full - 0.5 ? 0 : Double(height)
+                        keepClipsInView(height: height)
+                    }
+                    .onEnded { _ in resizeBase = nil }
+            )
+            .onTapGesture(count: 2) {
+                withAnimation(.fold) { storedTracksHeight = 0 }
+            }
+            .help("Drag to resize the timeline. Double-click to show every track.")
+            .offset(y: -3)
+    }
+
+    /// Shrinking the tracks scrolls them so the clips stay on screen.
+    private func keepClipsInView(height: CGFloat) {
+        var top: CGFloat = 0
+        for track in tracks {
+            if track == .clips { break }
+            top += track.height + StudioTimelineMetrics.trackSpacing
+        }
+        let bottom = top + StudioTrack.clips.height
+        if scrollY > top {
+            scrollY = top
+            verticalScrollPosition.scrollTo(y: top)
+        } else if scrollY + height < bottom {
+            scrollY = bottom - height
+            verticalScrollPosition.scrollTo(y: bottom - height)
         }
     }
 
@@ -306,22 +376,28 @@ struct StudioTimelineDock: View {
     /// One glyph per track beside its row, over a hairline that keeps the
     /// column apart from the tracks.
     private var trackGutter: some View {
-        VStack(spacing: StudioTimelineMetrics.trackSpacing) {
+        VStack(spacing: 0) {
             Color.clear
-                .frame(height: StudioTimelineMetrics.headerHeight)
-            ForEach(tracks) { track in
-                Image(systemName: track.systemImage)
-                    .font(.system(size: 11.5, weight: .regular))
-                    .foregroundStyle(Palette.secondaryLabel)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: track.height)
-                    .contentShape(Rectangle())
-                    .help(track.title)
-                    .accessibilityLabel(track.title)
+                .frame(height: StudioTimelineMetrics.headerHeight + StudioTimelineMetrics.trackSpacing)
+            // The glyphs ride the tracks' vertical scroll, so each stays
+            // beside its row in a short timeline.
+            VStack(spacing: StudioTimelineMetrics.trackSpacing) {
+                ForEach(tracks) { track in
+                    Image(systemName: track.systemImage)
+                        .font(.system(size: 11.5, weight: .regular))
+                        .foregroundStyle(Palette.secondaryLabel)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: track.height)
+                        .contentShape(Rectangle())
+                        .help(track.title)
+                        .accessibilityLabel(track.title)
+                }
             }
+            .offset(y: -scrollY)
+            .frame(height: visibleTracksHeight, alignment: .top)
+            .clipped()
         }
         .frame(width: StudioTimelineMetrics.gutterWidth)
-        .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks), alignment: .top)
         .overlay(alignment: .trailing) {
             Rectangle()
                 .fill(Palette.hairline)
@@ -356,7 +432,21 @@ struct StudioTimelineDock: View {
                 .contentShape(Rectangle())
                 .gesture(scrubGesture(scale: scale, scrollX: scrollX))
 
-                scrollingLanes(scale: scale)
+                // The ruler stays put while the tracks scroll under it when
+                // the dock is shorter than they are.
+                ScrollView(.vertical) {
+                    scrollingLanes(scale: scale)
+                }
+                .scrollPosition($verticalScrollPosition)
+                .scrollBounceBehavior(.basedOnSize)
+                .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                    geometry.contentOffset.y
+                } action: { _, offset in
+                    if abs(offset - scrollY) > 0.01 {
+                        scrollY = offset
+                    }
+                }
+                .frame(height: visibleTracksHeight)
             }
             // Hovering anywhere over the timeline - ruler, clips or zoom
             // lane - skims the preview to that moment.
@@ -404,7 +494,7 @@ struct StudioTimelineDock: View {
                 }
             ))
         }
-        .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks))
+        .frame(height: StudioTimelineMetrics.headerHeight + StudioTimelineMetrics.trackSpacing + visibleTracksHeight)
         .alert(
             "Some files weren't added",
             isPresented: Binding(
@@ -722,13 +812,12 @@ private enum StudioTimelineMetrics {
     /// web editor leaves - which the gutter's line runs through and the
     /// horizontal scroller uses while scrolling.
     static let scrollerGutter: CGFloat = 6
+    /// The shortest the tracks get when the dock is dragged down: the clips
+    /// and the space around them.
+    static let minimumTracksHeight: CGFloat = 64
 
     static func scrollingLanesHeight(tracks: [StudioTrack]) -> CGFloat {
         tracks.reduce(scrollerGutter) { $0 + $1.height + trackSpacing }
-    }
-
-    static func lanesHeight(tracks: [StudioTrack]) -> CGFloat {
-        headerHeight + trackSpacing + scrollingLanesHeight(tracks: tracks)
     }
 }
 
