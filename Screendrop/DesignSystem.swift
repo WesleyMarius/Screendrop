@@ -51,6 +51,10 @@ enum Palette {
     /// sit under, with `onLayoutCue` marks.
     static let layoutCue = Color(nsColor: .systemYellow)
     static let onLayoutCue = Color.black.opacity(0.78)
+    /// Text and pixelated regions on the timeline, apart from the cues
+    /// that move the camera; both carry white marks.
+    static let textCue = Color(nsColor: .systemPurple)
+    static let effectCue = Color(nsColor: .systemGray)
     /// Recording, and actions that remove something.
     static let record = Color(nsColor: .systemRed)
     static let success = Color(nsColor: .systemGreen)

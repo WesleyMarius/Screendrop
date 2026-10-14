@@ -200,6 +200,16 @@ final class RecordingStudioModel {
     /// The default layout and every cue resolved along editor time.
     private(set) var cameraLayoutTimeline = RecordingCameraLayoutTimeline.constant(RecordingCameraLayout())
     var selectedLayoutCueID: UUID?
+    /// Text over the recording, on the source clock. Later texts draw on
+    /// top of earlier ones.
+    private(set) var textOverlays: [RecordingTextOverlay] = []
+    var selectedTextID: UUID?
+    /// Pixelated or blurred regions of the recorded picture, on the source
+    /// clock.
+    private(set) var redactions: [RecordingRedaction] = []
+    var selectedRedactionID: UUID?
+    /// What the screen player's composition filters each frame through.
+    let redactionPreview = RecordingRedactionPreviewSource()
     private(set) var clipTimeline = RecordingClipTimeline(segments: []) {
         didSet {
             if clipTimeline != oldValue {
@@ -284,6 +294,15 @@ final class RecordingStudioModel {
     private(set) var undoRevision = 0
     private var zoomEditSnapshot: [ZoomCue]?
     private var layoutEditSnapshot: [RecordingCameraLayoutCue]?
+    private var textEditSnapshot: [RecordingTextOverlay]?
+    private var redactionEditSnapshot: [RecordingRedaction]?
+    /// Re-renders the paused frame after a region changes, at most once a
+    /// display frame however fast a drag reports.
+    private var redactionRefreshTask: Task<Void, Never>?
+    /// Ends an inspector edit once its control has rested, so a slider
+    /// sweep or a run of typing undoes as one step.
+    private var textCoalesceTask: Task<Void, Never>?
+    private var redactionCoalesceTask: Task<Void, Never>?
     /// The document as of the last explicit save. Everything the user does
     /// after that lives in memory and in the autosaved draft until they save
     /// again, which is what makes the close prompt meaningful.
@@ -498,6 +517,9 @@ final class RecordingStudioModel {
         zoomEnabled = document.zoomEnabled
         zoomCues = document.zoomCues
         cameraLayoutCues = (document.cameraLayoutCues ?? []).sorted { $0.start < $1.start }
+        textOverlays = document.textOverlays ?? []
+        redactions = document.redactions ?? []
+        redactionPreview.update(redactions: redactions, clipTimeline: clipTimeline)
         // A project that never chose its own settings inherits whatever
         // was picked last, so "export as MP4" sticks across recordings.
         exportSettings = document.exportSettings ?? RecordingExportPreferences.lastSettings
@@ -565,6 +587,12 @@ final class RecordingStudioModel {
         editUndoManager.removeAllActions()
         zoomEditSnapshot = nil
         layoutEditSnapshot = nil
+        textEditSnapshot = nil
+        redactionEditSnapshot = nil
+        redactionRefreshTask?.cancel()
+        redactionRefreshTask = nil
+        textCoalesceTask?.cancel()
+        redactionCoalesceTask?.cancel()
         lastSavedDocument = nil
         pointerCapture = PointerCaptureFile()
         pointerTimeline = .empty
@@ -575,6 +603,8 @@ final class RecordingStudioModel {
         recordedPressTimes.removeAll()
         zoomCues.removeAll()
         cameraLayoutCues.removeAll()
+        textOverlays.removeAll()
+        redactions.removeAll()
         subtitleCues.removeAll()
         transcriptWords.removeAll()
         subtitleTimeline = .empty
@@ -736,6 +766,8 @@ final class RecordingStudioModel {
         selectedClipID = id
         selectedCueID = nil
         selectedLayoutCueID = nil
+        selectedTextID = nil
+        selectedRedactionID = nil
     }
 
     func selectZoomCue(id: UUID) {
@@ -743,6 +775,8 @@ final class RecordingStudioModel {
         selectedCueID = id
         selectedClipID = nil
         selectedLayoutCueID = nil
+        selectedTextID = nil
+        selectedRedactionID = nil
     }
 
     func selectLayoutCue(id: UUID) {
@@ -750,6 +784,18 @@ final class RecordingStudioModel {
         selectedLayoutCueID = id
         selectedCueID = nil
         selectedClipID = nil
+        selectedTextID = nil
+        selectedRedactionID = nil
+    }
+
+    /// Lets go of whatever is selected on the timeline, like clicking
+    /// empty canvas.
+    func clearTimelineSelection() {
+        selectedCueID = nil
+        selectedClipID = nil
+        selectedLayoutCueID = nil
+        selectedTextID = nil
+        selectedRedactionID = nil
     }
 
     func undo() {
@@ -903,7 +949,14 @@ final class RecordingStudioModel {
             )
         }
 
-        screenPlayer.replaceCurrentItem(with: AVPlayerItem(asset: playbackAsset))
+        let item = AVPlayerItem(asset: playbackAsset)
+        // Regions are filtered into the picture before the card draws it,
+        // so the preview's zoom and crop carry them exactly as the export's.
+        redactionPreview.update(redactions: redactions, clipTimeline: clipTimeline)
+        if !redactions.isEmpty {
+            item.videoComposition = redactionPreview.makeVideoComposition(for: playbackAsset)
+        }
+        screenPlayer.replaceCurrentItem(with: item)
         updatePlaybackVolume()
         screenPlayer.actionAtItemEnd = .pause
         currentTime = min(max(editorTime, 0), duration)
@@ -1096,6 +1149,8 @@ final class RecordingStudioModel {
         selectedCueID = cue.id
         selectedClipID = nil
         selectedLayoutCueID = nil
+        selectedTextID = nil
+        selectedRedactionID = nil
     }
 
     func removeZoomCue(id: UUID) {
@@ -1359,6 +1414,287 @@ final class RecordingStudioModel {
         replaceLayoutCues(cues)
     }
 
+    // MARK: - Text
+
+    var selectedText: RecordingTextOverlay? {
+        textOverlays.first { $0.id == selectedTextID }
+    }
+
+    var textTimelineBlocks: [RecordingOverlayTimelineBlock<RecordingTextOverlay>] {
+        RecordingOverlayTimelineBlock.blocks(for: textOverlays, clipTimeline: clipTimeline) {
+            ($0.start, $0.end)
+        }
+    }
+
+    /// The texts showing at an editor time, bottom to top.
+    func texts(atEditorTime time: TimeInterval) -> [RecordingTextOverlay] {
+        guard !textOverlays.isEmpty, clipTimeline.location(at: time) != nil else { return [] }
+        let sourceTime = clipTimeline.sourceTime(at: time)
+        return textOverlays.filter { $0.isActive(atSourceTime: sourceTime) }
+    }
+
+    func selectText(id: UUID) {
+        guard textOverlays.contains(where: { $0.id == id }) else { return }
+        clearTimelineSelection()
+        selectedTextID = id
+    }
+
+    /// Adds a text at the playhead, three seconds long.
+    func addText(atEditorTime time: TimeInterval) {
+        let range = sourceRange(startingAt: time, length: RecordingTextOverlay.defaultDuration,
+                                minimum: RecordingTextOverlay.minimumDuration)
+        guard let range else { return }
+        insertText(RecordingTextOverlay(start: range.lowerBound, end: range.upperBound))
+    }
+
+    /// Adds a text over a range dragged across the text track. Times are
+    /// editor time and need not be ordered.
+    func addText(fromEditorTime editorStart: TimeInterval, toEditorTime editorEnd: TimeInterval) {
+        guard let range = sourceRange(fromEditorTime: editorStart, toEditorTime: editorEnd,
+                                      minimum: RecordingTextOverlay.minimumDuration) else { return }
+        insertText(RecordingTextOverlay(start: range.lowerBound, end: range.upperBound))
+    }
+
+    private func insertText(_ overlay: RecordingTextOverlay) {
+        applyTexts(textOverlays + [overlay], actionName: "Add Text")
+        selectText(id: overlay.id)
+    }
+
+    func removeText(id: UUID) {
+        applyTexts(textOverlays.filter { $0.id != id }, actionName: "Remove Text")
+        if selectedTextID == id { selectedTextID = nil }
+    }
+
+    /// Opens a continuous edit (a drag, or typing); `endTextEdit` registers
+    /// it as one undo step.
+    func beginTextEdit() {
+        if textEditSnapshot == nil { textEditSnapshot = textOverlays }
+    }
+
+    func endTextEdit(actionName: String = "Edit Text") {
+        guard let previous = textEditSnapshot else { return }
+        textEditSnapshot = nil
+        guard previous != textOverlays else { return }
+        registerUndo(actionName) { target in
+            target.applyTexts(previous, actionName: actionName)
+        }
+    }
+
+    /// Applies an edited text during a continuous edit, keeping it inside
+    /// the recording.
+    func setText(_ overlay: RecordingTextOverlay) {
+        guard let index = textOverlays.firstIndex(where: { $0.id == overlay.id }) else { return }
+        var texts = textOverlays
+        var updated = overlay
+        let range = clampedSourceRange(start: overlay.start, end: overlay.end, minimum: RecordingTextOverlay.minimumDuration)
+        updated.start = range.lowerBound
+        updated.end = range.upperBound
+        updated.fontSize = min(max(updated.fontSize, RecordingTextOverlay.fontSizeRange.lowerBound),
+                               RecordingTextOverlay.fontSizeRange.upperBound)
+        updated.center = CGPoint(x: min(max(updated.center.x, 0), 1), y: min(max(updated.center.y, 0), 1))
+        texts[index] = updated
+        replaceTexts(texts)
+    }
+
+    /// Applies an inspector edit; edits that follow each other closely,
+    /// like a slider sweep or typing, undo together.
+    func editText(_ overlay: RecordingTextOverlay, actionName: String) {
+        beginTextEdit()
+        setText(overlay)
+        textCoalesceTask?.cancel()
+        textCoalesceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            self?.endTextEdit(actionName: actionName)
+        }
+    }
+
+    /// Applies an edited text as its own undo step.
+    func updateText(_ overlay: RecordingTextOverlay, actionName: String) {
+        beginTextEdit()
+        setText(overlay)
+        endTextEdit(actionName: actionName)
+    }
+
+    private func replaceTexts(_ texts: [RecordingTextOverlay]) {
+        textOverlays = texts
+        scheduleProjectSave()
+    }
+
+    private func applyTexts(_ texts: [RecordingTextOverlay], actionName: String) {
+        guard texts != textOverlays else { return }
+        let previous = textOverlays
+        registerUndo(actionName) { target in
+            target.applyTexts(previous, actionName: actionName)
+        }
+        replaceTexts(texts)
+        if let selectedTextID, !texts.contains(where: { $0.id == selectedTextID }) {
+            self.selectedTextID = nil
+        }
+    }
+
+    // MARK: - Pixelate
+
+    var selectedRedaction: RecordingRedaction? {
+        redactions.first { $0.id == selectedRedactionID }
+    }
+
+    var redactionTimelineBlocks: [RecordingOverlayTimelineBlock<RecordingRedaction>] {
+        RecordingOverlayTimelineBlock.blocks(for: redactions, clipTimeline: clipTimeline) {
+            ($0.start, $0.end)
+        }
+    }
+
+    /// The regions showing at an editor time.
+    func redactions(atEditorTime time: TimeInterval) -> [RecordingRedaction] {
+        guard !redactions.isEmpty, clipTimeline.location(at: time) != nil else { return [] }
+        let sourceTime = clipTimeline.sourceTime(at: time)
+        return redactions.filter { $0.start <= sourceTime && sourceTime < $0.end }
+    }
+
+    func selectRedaction(id: UUID) {
+        guard redactions.contains(where: { $0.id == id }) else { return }
+        clearTimelineSelection()
+        selectedRedactionID = id
+    }
+
+    /// Pixelates the middle of the picture from the playhead for three
+    /// seconds; the region is then moved and sized on the canvas.
+    func addRedaction(atEditorTime time: TimeInterval, style: RecordingRedaction.Style = .pixelate) {
+        guard let range = sourceRange(startingAt: time, length: RecordingRedaction.defaultDuration,
+                                      minimum: RecordingRedaction.minimumDuration) else { return }
+        var redaction = RecordingRedaction(start: range.lowerBound, end: range.upperBound)
+        redaction.style = style
+        applyRedactions(redactions + [redaction], actionName: style == .blur ? "Add Blur" : "Add Pixelate")
+        selectRedaction(id: redaction.id)
+    }
+
+    func removeRedaction(id: UUID) {
+        applyRedactions(redactions.filter { $0.id != id }, actionName: "Remove Pixelate")
+        if selectedRedactionID == id { selectedRedactionID = nil }
+    }
+
+    func beginRedactionEdit() {
+        if redactionEditSnapshot == nil { redactionEditSnapshot = redactions }
+    }
+
+    func endRedactionEdit(actionName: String = "Edit Pixelate") {
+        guard let previous = redactionEditSnapshot else { return }
+        redactionEditSnapshot = nil
+        guard previous != redactions else { return }
+        registerUndo(actionName) { target in
+            target.applyRedactions(previous, actionName: actionName)
+        }
+    }
+
+    /// Applies an edited region during a continuous edit, keeping it inside
+    /// the recording and the picture.
+    func setRedaction(_ redaction: RecordingRedaction) {
+        guard let index = redactions.firstIndex(where: { $0.id == redaction.id }) else { return }
+        var updated = redaction
+        let range = clampedSourceRange(start: redaction.start, end: redaction.end, minimum: RecordingRedaction.minimumDuration)
+        updated.start = range.lowerBound
+        updated.end = range.upperBound
+        updated.rect = RecordingRedaction.clamped(redaction.rect)
+        updated.amount = min(max(updated.amount, 0), 1)
+        var all = redactions
+        all[index] = updated
+        replaceRedactions(all)
+    }
+
+    func editRedaction(_ redaction: RecordingRedaction, actionName: String) {
+        beginRedactionEdit()
+        setRedaction(redaction)
+        redactionCoalesceTask?.cancel()
+        redactionCoalesceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            self?.endRedactionEdit(actionName: actionName)
+        }
+    }
+
+    func updateRedaction(_ redaction: RecordingRedaction, actionName: String) {
+        beginRedactionEdit()
+        setRedaction(redaction)
+        endRedactionEdit(actionName: actionName)
+    }
+
+    private func replaceRedactions(_ all: [RecordingRedaction]) {
+        let wasEmpty = redactions.isEmpty
+        redactions = all
+        redactionPreview.update(redactions: all, clipTimeline: clipTimeline)
+        if let item = screenPlayer.currentItem {
+            if all.isEmpty {
+                item.videoComposition = nil
+            } else if wasEmpty {
+                item.videoComposition = redactionPreview.makeVideoComposition(for: item.asset)
+            }
+        }
+        scheduleRedactionRefresh()
+        scheduleProjectSave()
+    }
+
+    private func applyRedactions(_ all: [RecordingRedaction], actionName: String) {
+        guard all != redactions else { return }
+        let previous = redactions
+        registerUndo(actionName) { target in
+            target.applyRedactions(previous, actionName: actionName)
+        }
+        replaceRedactions(all)
+        if let selectedRedactionID, !all.contains(where: { $0.id == selectedRedactionID }) {
+            self.selectedRedactionID = nil
+        }
+    }
+
+    /// The player renders a paused frame once, so a region edited while
+    /// paused needs the frame drawn again. A fresh composition makes the
+    /// player re-render; the seek puts the same moment back on screen.
+    private func scheduleRedactionRefresh() {
+        guard !isPlaying, redactionRefreshTask == nil else { return }
+        redactionRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard let self, !Task.isCancelled else { return }
+            self.redactionRefreshTask = nil
+            guard !self.isPlaying, let item = self.screenPlayer.currentItem else { return }
+            if !self.redactions.isEmpty {
+                item.videoComposition = self.redactionPreview.makeVideoComposition(for: item.asset)
+            }
+            self.movePlayers(to: self.displayTime)
+        }
+    }
+
+    // MARK: - Overlay ranges
+
+    /// A source range `length` long from the recording moment under an
+    /// editor time, kept inside the recording.
+    private func sourceRange(
+        startingAt editorTime: TimeInterval,
+        length: TimeInterval,
+        minimum: TimeInterval
+    ) -> ClosedRange<TimeInterval>? {
+        guard sourceDuration >= minimum else { return nil }
+        let source = clipTimeline.sourceTime(at: min(max(editorTime, 0), duration))
+        let start = min(max(0, source), sourceDuration - minimum)
+        return start...min(sourceDuration, start + length)
+    }
+
+    private func sourceRange(
+        fromEditorTime editorStart: TimeInterval,
+        toEditorTime editorEnd: TimeInterval,
+        minimum: TimeInterval
+    ) -> ClosedRange<TimeInterval>? {
+        guard sourceDuration >= minimum else { return nil }
+        let low = clipTimeline.sourceTime(at: min(editorStart, editorEnd))
+        let high = clipTimeline.sourceTime(at: max(editorStart, editorEnd))
+        return clampedSourceRange(start: low, end: high, minimum: minimum)
+    }
+
+    private func clampedSourceRange(start: TimeInterval, end: TimeInterval, minimum: TimeInterval) -> ClosedRange<TimeInterval> {
+        let lower = min(max(0, start), max(0, sourceDuration - minimum))
+        let upper = min(max(end, lower + minimum), sourceDuration)
+        return lower...max(lower, upper)
+    }
+
     var visibleRecordedPressTimes: [TimeInterval] {
         recordedPressTimes.compactMap { clipTimeline.editorTime(forSourceTime: $0) }
     }
@@ -1441,6 +1777,8 @@ final class RecordingStudioModel {
             zoomEnabled: zoomEnabled,
             zoomCues: zoomCues.filter { !$0.isImplicit },
             cameraLayoutCues: cameraLayoutCues.isEmpty ? nil : cameraLayoutCues,
+            textOverlays: textOverlays.isEmpty ? nil : textOverlays,
+            redactions: redactions.isEmpty ? nil : redactions,
             clipTimeline: clipTimeline,
             exportSettings: exportSettings,
             showsClickEffects: showsClickEffects,
@@ -2100,7 +2438,9 @@ final class RecordingStudioModel {
             reframe: reframe,
             fitContentAspect: fitContentAspect,
             usesUniformPadding: exportAspect == .original,
-            motionTimeline: makeMotionTimeline(reframe: reframe)
+            motionTimeline: makeMotionTimeline(reframe: reframe),
+            textOverlays: textOverlays,
+            redactions: redactions
         )
     }
 

@@ -106,6 +106,24 @@ struct StudioTimelineDock: View {
                 .disabled(!model.isLoaded)
                 .glassEffectID("split", in: glass)
 
+                GlassIconButton(systemImage: "textformat", help: "Add Text at Playhead") {
+                    withAnimation(.morphIfAllowed) {
+                        model.pause()
+                        model.addText(atEditorTime: model.currentTime)
+                    }
+                }
+                .disabled(!model.isLoaded)
+                .glassEffectID("text", in: glass)
+
+                GlassIconButton(systemImage: "squareshape.split.3x3", help: "Pixelate Part of the Picture") {
+                    withAnimation(.morphIfAllowed) {
+                        model.pause()
+                        model.addRedaction(atEditorTime: model.currentTime)
+                    }
+                }
+                .disabled(!model.isLoaded)
+                .glassEffectID("pixelate", in: glass)
+
                 if canDeleteSelection {
                     GlassIconButton(systemImage: "trash", help: "Delete Selection (⌫)") {
                         deleteSelection()
@@ -407,8 +425,22 @@ struct StudioTimelineDock: View {
                 scale: scale,
                 visibleRange: scale.visibleRange(scrollX: scrollX)
             )
-        case .text, .overlay, .audio:
-            // Nothing lives on these tracks yet; a press scrubs, as on the
+        case .text:
+            StudioTextLane(
+                model: model,
+                scale: scale,
+                visibleRange: scale.visibleRange(scrollX: scrollX),
+                onScrubbing: { isScrubbing = $0 }
+            )
+        case .overlay:
+            StudioRedactionLane(
+                model: model,
+                scale: scale,
+                visibleRange: scale.visibleRange(scrollX: scrollX),
+                onScrubbing: { isScrubbing = $0 }
+            )
+        case .audio:
+            // Nothing lives on this track yet; a press scrubs, as on the
             // ruler, and lets go of whatever was selected.
             Color.clear
                 .contentShape(Rectangle())
@@ -424,15 +456,17 @@ struct StudioTimelineDock: View {
             model.zoomEnabled && model.zoomTimelineBlocks.isEmpty ? "Drag across to add a zoom" : nil
         case .layouts:
             model.cameraLayoutCues.isEmpty ? "Drag across to change the camera layout" : nil
-        case .text, .overlay, .clips, .audio:
+        case .text:
+            model.textOverlays.isEmpty ? "Drag across to add text" : nil
+        case .overlay:
+            model.redactions.isEmpty ? "Pixelate part of the picture from the toolbar" : nil
+        case .clips, .audio:
             nil
         }
     }
 
     private func deselectAll() {
-        model.selectedCueID = nil
-        model.selectedClipID = nil
-        model.selectedLayoutCueID = nil
+        model.clearTimelineSelection()
     }
 
     private var clipLane: some View {
@@ -540,12 +574,18 @@ struct StudioTimelineDock: View {
     }
 
     private var canDeleteSelection: Bool {
-        model.selectedCueID != nil || model.selectedLayoutCueID != nil || model.canDeleteSelectedClip
+        model.selectedCueID != nil || model.selectedLayoutCueID != nil
+            || model.selectedTextID != nil || model.selectedRedactionID != nil
+            || model.canDeleteSelectedClip
     }
 
     private func deleteSelection() {
         withAnimation(.morphIfAllowed) {
-            if let cueID = model.selectedCueID {
+            if let textID = model.selectedTextID {
+                model.removeText(id: textID)
+            } else if let redactionID = model.selectedRedactionID {
+                model.removeRedaction(id: redactionID)
+            } else if let cueID = model.selectedCueID {
                 model.removeZoomCue(id: cueID)
             } else if let cueID = model.selectedLayoutCueID {
                 model.removeLayoutCue(id: cueID)
@@ -1047,9 +1087,7 @@ private struct StudioZoomLane: View {
                                 dragStartTime = time
                                 // A click on empty lane lets go of whatever
                                 // was selected, like clicking empty canvas.
-                                model.selectedCueID = nil
-                                model.selectedClipID = nil
-                                model.selectedLayoutCueID = nil
+                                model.clearTimelineSelection()
                             }
                             guard let startTime = dragStartTime else { return }
 
@@ -1533,9 +1571,7 @@ private struct StudioLayoutLane: View {
                             if dragStartTime == nil {
                                 model.pause()
                                 dragStartTime = time
-                                model.selectedCueID = nil
-                                model.selectedClipID = nil
-                                model.selectedLayoutCueID = nil
+                                model.clearTimelineSelection()
                             }
                             guard let startTime = dragStartTime else { return }
                             if pendingRange == nil,
@@ -1823,5 +1859,404 @@ private struct StudioLayoutCueBlock: View {
                         model.endLayoutCueEdit(actionName: "Resize Layout")
                     }
             )
+    }
+}
+
+// MARK: - Text and pixelate tracks
+
+/// Text blocks. Dragging across empty track adds a text over the dragged
+/// range; a click scrubs, as on the zoom lane.
+private struct StudioTextLane: View {
+    @Bindable var model: RecordingStudioModel
+    let scale: StudioTimelineScale
+    let visibleRange: ClosedRange<TimeInterval>
+    let onScrubbing: (Bool) -> Void
+
+    private static let dragCreateThreshold: CGFloat = 4
+
+    @State private var dragStartTime: TimeInterval?
+    @State private var pendingRange: ClosedRange<TimeInterval>?
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            guard scale.pointsPerSecond > 0 else { return }
+                            let time = scale.time(forX: value.location.x)
+                            if dragStartTime == nil {
+                                model.pause()
+                                dragStartTime = time
+                                model.clearTimelineSelection()
+                            }
+                            guard let startTime = dragStartTime else { return }
+                            if pendingRange == nil,
+                               abs(value.location.x - scale.x(for: startTime)) < Self.dragCreateThreshold {
+                                onScrubbing(true)
+                                model.seek(to: time)
+                                return
+                            }
+                            onScrubbing(false)
+                            pendingRange = min(startTime, time)...max(startTime, time)
+                        }
+                        .onEnded { _ in
+                            onScrubbing(false)
+                            if let range = pendingRange, range.upperBound - range.lowerBound > 0.05 {
+                                withAnimation(.morphIfAllowed) {
+                                    model.addText(fromEditorTime: range.lowerBound, toEditorTime: range.upperBound)
+                                }
+                            }
+                            dragStartTime = nil
+                            pendingRange = nil
+                        }
+                )
+
+            if let pendingRange {
+                StudioPendingBlock(range: pendingRange, scale: scale, tint: Palette.textCue)
+            }
+
+            ForEach(visibleBlocks) { block in
+                StudioOverlayBlock(
+                    block: block,
+                    scale: scale,
+                    isSelected: model.selectedTextID == block.item.id,
+                    tint: Palette.textCue,
+                    systemImage: "textformat",
+                    title: block.item.text.isEmpty ? "Text" : block.item.text
+                        .replacingOccurrences(of: "\n", with: " "),
+                    isHatched: false,
+                    onSelect: { model.selectText(id: block.item.id) },
+                    onBegin: {
+                        model.selectText(id: block.item.id)
+                        model.beginTextEdit()
+                    },
+                    onEdit: { base, start, end in
+                        var edited = base
+                        edited.start = start
+                        edited.end = end
+                        model.setText(edited)
+                    },
+                    onEnd: { kind in
+                        model.endTextEdit(actionName: kind == .move ? "Move Text" : "Resize Text")
+                    },
+                    sourceRange: { ($0.start, $0.end) },
+                    model: model
+                ) {
+                    Button("Delete Text", systemImage: "trash", role: .destructive) {
+                        withAnimation(.morphIfAllowed) { model.removeText(id: block.item.id) }
+                    }
+                }
+                .transition(.blurPop)
+            }
+        }
+        .contextMenu {
+            Button("Add Text at Playhead", systemImage: "textformat") {
+                withAnimation(.morphIfAllowed) { model.addText(atEditorTime: model.currentTime) }
+            }
+        }
+    }
+
+    private var visibleBlocks: [RecordingOverlayTimelineBlock<RecordingTextOverlay>] {
+        model.textTimelineBlocks.filter {
+            $0.editorEnd >= visibleRange.lowerBound && $0.editorStart <= visibleRange.upperBound
+        }
+    }
+}
+
+/// Pixelate and blur blocks, on the Images and Effects track. A click on
+/// empty track scrubs.
+private struct StudioRedactionLane: View {
+    @Bindable var model: RecordingStudioModel
+    let scale: StudioTimelineScale
+    let visibleRange: ClosedRange<TimeInterval>
+    let onScrubbing: (Bool) -> Void
+
+    @State private var isScrubbing = false
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            if !isScrubbing {
+                                isScrubbing = true
+                                onScrubbing(true)
+                                model.pause()
+                                model.clearTimelineSelection()
+                            }
+                            model.seek(to: scale.time(forX: value.location.x))
+                        }
+                        .onEnded { _ in
+                            isScrubbing = false
+                            onScrubbing(false)
+                        }
+                )
+
+            ForEach(visibleBlocks) { block in
+                let redaction = block.item
+                StudioOverlayBlock(
+                    block: block,
+                    scale: scale,
+                    isSelected: model.selectedRedactionID == redaction.id,
+                    tint: Palette.effectCue,
+                    systemImage: redaction.style.systemImage,
+                    title: redaction.style.title,
+                    isHatched: true,
+                    onSelect: { model.selectRedaction(id: redaction.id) },
+                    onBegin: {
+                        model.selectRedaction(id: redaction.id)
+                        model.beginRedactionEdit()
+                    },
+                    onEdit: { base, start, end in
+                        var edited = base
+                        edited.start = start
+                        edited.end = end
+                        model.setRedaction(edited)
+                    },
+                    onEnd: { kind in
+                        model.endRedactionEdit(actionName: kind == .move ? "Move Pixelate" : "Resize Pixelate")
+                    },
+                    sourceRange: { ($0.start, $0.end) },
+                    model: model
+                ) {
+                    Menu("Style") {
+                        ForEach(RecordingRedaction.Style.allCases) { style in
+                            Toggle(style.title, isOn: Binding(
+                                get: { redaction.style == style },
+                                set: { _ in
+                                    var edited = redaction
+                                    edited.style = style
+                                    model.updateRedaction(edited, actionName: "Change Pixelate Style")
+                                }
+                            ))
+                        }
+                    }
+                    Divider()
+                    Button("Delete \(redaction.style.title)", systemImage: "trash", role: .destructive) {
+                        withAnimation(.morphIfAllowed) { model.removeRedaction(id: redaction.id) }
+                    }
+                }
+                .transition(.blurPop)
+            }
+        }
+        .contextMenu {
+            Button("Pixelate at Playhead", systemImage: "squareshape.split.3x3") {
+                withAnimation(.morphIfAllowed) { model.addRedaction(atEditorTime: model.currentTime) }
+            }
+            Button("Blur at Playhead", systemImage: "drop.halffull") {
+                withAnimation(.morphIfAllowed) { model.addRedaction(atEditorTime: model.currentTime, style: .blur) }
+            }
+        }
+    }
+
+    private var visibleBlocks: [RecordingOverlayTimelineBlock<RecordingRedaction>] {
+        model.redactionTimelineBlocks.filter {
+            $0.editorEnd >= visibleRange.lowerBound && $0.editorStart <= visibleRange.upperBound
+        }
+    }
+}
+
+/// The dashed block a drag across an empty track would create.
+private struct StudioPendingBlock: View {
+    let range: ClosedRange<TimeInterval>
+    let scale: StudioTimelineScale
+    let tint: Color
+
+    var body: some View {
+        let lowX = scale.x(for: range.lowerBound)
+        let highX = scale.x(for: range.upperBound)
+        let shape = RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+        shape
+            .fill(tint.opacity(0.22))
+            .overlay {
+                shape.strokeBorder(tint.opacity(0.85), style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+            }
+            .frame(width: max(2, highX - lowX), height: StudioZoomLaneMetrics.blockHeight)
+            .offset(x: lowX, y: StudioZoomLaneMetrics.blockInset)
+            .allowsHitTesting(false)
+    }
+}
+
+/// One text or effect on its track: a tinted block naming what it is, moved
+/// by dragging its body and resized by its edges. Unlike zooms and
+/// layouts, these may overlap, so a block never parks against another.
+private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: View>: View {
+    enum EditKind { case move, leading, trailing }
+
+    let block: RecordingOverlayTimelineBlock<Item>
+    let scale: StudioTimelineScale
+    let isSelected: Bool
+    let tint: Color
+    let systemImage: String
+    let title: String
+    /// Effects carry light stripes, so they read apart from images.
+    let isHatched: Bool
+    let onSelect: () -> Void
+    let onBegin: () -> Void
+    /// The item as the drag found it, and its new source range.
+    let onEdit: (Item, TimeInterval, TimeInterval) -> Void
+    let onEnd: (EditKind) -> Void
+    let sourceRange: (Item) -> (start: TimeInterval, end: TimeInterval)
+    let model: RecordingStudioModel
+    @ViewBuilder let menu: () -> MenuContent
+
+    /// Frozen at drag start; the live block re-derives on every update.
+    private struct DragBase {
+        let item: Item
+        let editorStart: TimeInterval
+        let editorEnd: TimeInterval
+    }
+
+    @State private var dragBase: DragBase?
+    @State private var isHovering = false
+
+    private var showsHandles: Bool {
+        isSelected || isHovering || dragBase != nil
+    }
+
+    var body: some View {
+        if scale.pointsPerSecond > 0 {
+            content
+        }
+    }
+
+    private var content: some View {
+        let width = min(
+            scale.contentWidth,
+            max(16, CGFloat(block.editorEnd - block.editorStart) * scale.pointsPerSecond)
+        )
+        let x = min(max(scale.x(for: block.editorStart), 0), max(0, scale.contentWidth - width))
+        let shape = RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+
+        return label(width: width)
+            .frame(width: width, height: StudioZoomLaneMetrics.blockHeight, alignment: .leading)
+            .background {
+                shape.fill(tint.opacity(isSelected ? 1 : 0.86))
+                    .overlay {
+                        if isHatched {
+                            Canvas { context, size in
+                                var path = Path()
+                                var stripeX: CGFloat = -size.height
+                                while stripeX < size.width {
+                                    path.move(to: CGPoint(x: stripeX, y: size.height))
+                                    path.addLine(to: CGPoint(x: stripeX + size.height, y: 0))
+                                    stripeX += 12
+                                }
+                                context.stroke(path, with: .color(.white.opacity(0.12)), lineWidth: 6)
+                            }
+                            .clipShape(shape)
+                        }
+                    }
+            }
+            .overlay {
+                shape
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [.white.opacity(0.32), .white.opacity(0.04)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1
+                    )
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .leading) {
+                if showsHandles { resizeHandle(.leading).transition(.opacity) }
+            }
+            .overlay(alignment: .trailing) {
+                if showsHandles { resizeHandle(.trailing).transition(.opacity) }
+            }
+            .overlay {
+                if isSelected {
+                    shape
+                        .strokeBorder(Color.white.opacity(0.95), lineWidth: 2)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .contentShape(shape)
+            .brightness(isHovering && !isSelected ? 0.05 : 0)
+            .onHover { isHovering = $0 }
+            .motion(.morphQuick, value: showsHandles)
+            .motion(.morphQuick, value: isSelected)
+            .offset(x: x, y: StudioZoomLaneMetrics.blockInset)
+            .gesture(dragGesture(.move))
+            .onTapGesture(perform: onSelect)
+            .contextMenu { menu() }
+            .help("\(title). Drag to move, drag an edge to resize, right-click for options.")
+    }
+
+    @ViewBuilder
+    private func label(width: CGFloat) -> some View {
+        if width >= 30 {
+            HStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 9, weight: .bold))
+                    .opacity(0.8)
+                if width >= 56 {
+                    Text(title)
+                        .font(.system(size: 10, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, StudioZoomLaneMetrics.handleWidth)
+            .frame(maxWidth: width, alignment: .leading)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private func dragGesture(_ kind: EditKind) -> some Gesture {
+        // Global coordinates: the block moves under the pointer, so local
+        // translations would chase their own updates and jitter.
+        DragGesture(minimumDistance: kind == .move ? 2 : 0, coordinateSpace: .global)
+            .onChanged { value in
+                if dragBase == nil {
+                    dragBase = DragBase(item: block.item, editorStart: block.editorStart, editorEnd: block.editorEnd)
+                    model.pause()
+                    onBegin()
+                }
+                guard let dragBase else { return }
+                let delta = Double(value.translation.width) * scale.secondsPerPoint
+                let base = sourceRange(dragBase.item)
+                switch kind {
+                case .move:
+                    let length = base.end - base.start
+                    let blockLength = dragBase.editorEnd - dragBase.editorStart
+                    let editorStart = min(max(0, dragBase.editorStart + delta), max(0, model.duration - blockLength))
+                    let start = min(max(0, model.sourceTime(atEditorTime: editorStart)), max(0, model.sourceDuration - length))
+                    onEdit(dragBase.item, start, start + length)
+                case .leading:
+                    let start = model.sourceTime(atEditorTime: dragBase.editorStart + delta)
+                    onEdit(dragBase.item, min(start, base.end - 0.1), base.end)
+                case .trailing:
+                    let end = model.sourceTime(atEditorTime: dragBase.editorEnd + delta)
+                    onEdit(dragBase.item, base.start, max(end, base.start + 0.1))
+                }
+            }
+            .onEnded { _ in
+                dragBase = nil
+                onEnd(kind)
+            }
+    }
+
+    private func resizeHandle(_ edge: HorizontalEdge) -> some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.001))
+            .frame(width: StudioZoomLaneMetrics.handleWidth, height: StudioZoomLaneMetrics.blockHeight)
+            .overlay {
+                Capsule()
+                    .fill(Color.white.opacity(0.95))
+                    .frame(width: 3, height: 12)
+                    .shadow(color: .black.opacity(0.25), radius: 1)
+            }
+            .contentShape(Rectangle())
+            .pointerStyle(.frameResize(position: edge == .leading ? .leading : .trailing))
+            .gesture(dragGesture(edge == .leading ? .leading : .trailing))
     }
 }

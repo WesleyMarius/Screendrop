@@ -210,7 +210,9 @@ enum RecordingSessionRenderer {
             reframe: reframe,
             fitContentAspect: fitContentAspect,
             usesUniformPadding: aspect == .original,
-            motionTimeline: motionTimeline
+            motionTimeline: motionTimeline,
+            textOverlays: document?.textOverlays ?? [],
+            redactions: document?.redactions ?? []
         )
     }
 

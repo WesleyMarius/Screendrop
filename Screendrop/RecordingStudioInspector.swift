@@ -44,6 +44,8 @@ private enum StudioInspectorContent: Hashable {
     case page(StudioInspectorPage)
     case zoom(UUID)
     case layout(UUID)
+    case text(UUID)
+    case redaction(UUID)
 }
 
 struct StudioInspector: View {
@@ -70,6 +72,14 @@ struct StudioInspector: View {
                 case .layout:
                     if let cue = model.selectedLayoutCue {
                         selectedLayoutPage(for: cue)
+                    }
+                case .text:
+                    if let text = model.selectedText {
+                        selectedTextPage(for: text)
+                    }
+                case .redaction:
+                    if let redaction = model.selectedRedaction {
+                        selectedRedactionPage(for: redaction)
                     }
                 }
             }
@@ -114,6 +124,8 @@ struct StudioInspector: View {
     private var content: StudioInspectorContent {
         if let cue = model.selectedCue { return .zoom(cue.id) }
         if let cue = model.selectedLayoutCue { return .layout(cue.id) }
+        if let text = model.selectedText { return .text(text.id) }
+        if let redaction = model.selectedRedaction { return .redaction(redaction.id) }
         if let page, availablePages.contains(page) { return .page(page) }
         return .look
     }
@@ -571,6 +583,46 @@ struct StudioInspector: View {
                     }
                     InspectorHint("Morphs in at the start of this stretch and back to the default at its end.")
                 }
+            }
+        }
+    }
+
+    // MARK: Text and pixelate
+
+    private func selectedTextPage(for text: RecordingTextOverlay) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            pageHeader(
+                "Text",
+                systemImage: "textformat",
+                backTitle: page?.title ?? "Look",
+                onBack: { model.selectedTextID = nil }
+            ) {
+                InspectorIconButton(systemName: "trash", help: "Remove Text") {
+                    withAnimation(.morphIfAllowed) { model.removeText(id: text.id) }
+                }
+            }
+
+            pageBody {
+                StudioTextInspectorControls(model: model, text: text)
+            }
+        }
+    }
+
+    private func selectedRedactionPage(for redaction: RecordingRedaction) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            pageHeader(
+                redaction.style.title,
+                systemImage: redaction.style.systemImage,
+                backTitle: page?.title ?? "Look",
+                onBack: { model.selectedRedactionID = nil }
+            ) {
+                InspectorIconButton(systemName: "trash", help: "Remove \(redaction.style.title)") {
+                    withAnimation(.morphIfAllowed) { model.removeRedaction(id: redaction.id) }
+                }
+            }
+
+            pageBody {
+                StudioRedactionInspectorControls(model: model, redaction: redaction)
             }
         }
     }

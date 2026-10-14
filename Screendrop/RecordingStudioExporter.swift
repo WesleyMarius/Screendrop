@@ -76,6 +76,10 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         let usesUniformPadding: Bool
         /// Zoom cameras for fill splits, which crop the screen.
         let motionTimeline: RecordingStudioMotionTimeline
+        /// Text over the canvas, on the source clock.
+        var textOverlays: [RecordingTextOverlay] = []
+        /// Regions of the recorded picture to pixelate or blur.
+        var redactions: [RecordingRedaction] = []
 
         init(
             screenURL: URL,
@@ -103,7 +107,9 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             reframe: ReframeTrack? = nil,
             fitContentAspect: CGFloat? = nil,
             usesUniformPadding: Bool = false,
-            motionTimeline: RecordingStudioMotionTimeline = .none
+            motionTimeline: RecordingStudioMotionTimeline = .none,
+            textOverlays: [RecordingTextOverlay] = [],
+            redactions: [RecordingRedaction] = []
         ) {
             self.screenURL = screenURL
             self.cameraURL = cameraURL
@@ -131,6 +137,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             self.fitContentAspect = fitContentAspect
             self.usesUniformPadding = usesUniformPadding
             self.motionTimeline = motionTimeline
+            self.textOverlays = textOverlays
+            self.redactions = redactions
         }
     }
 
@@ -368,7 +376,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             reframe: configuration.reframe,
             fitContentAspect: configuration.fitContentAspect,
             usesUniformPadding: configuration.usesUniformPadding,
-            motionTimeline: configuration.motionTimeline
+            motionTimeline: configuration.motionTimeline,
+            textOverlays: configuration.textOverlays
         )
 
         // A cutout's mattes are made ahead of the frames that show them, on
@@ -399,6 +408,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
                 adaptor: adaptor,
                 compositor: compositor,
                 cameraFeed: cameraFeed,
+                redactionFilter: RecordingRedactionFrameFilter(redactions: configuration.redactions),
                 clipTimeline: clipTimeline,
                 timing: timing,
                 cancelFlag: cancelFlag,
@@ -442,6 +452,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         adaptor: AVAssetWriterInputPixelBufferAdaptor,
         compositor: StudioFrameCompositor,
         cameraFeed: CameraFrameFeed?,
+        redactionFilter: RecordingRedactionFrameFilter?,
         clipTimeline: RecordingClipTimeline,
         timing: RecordingExportTiming,
         cancelFlag: CancelFlag,
@@ -525,7 +536,10 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             // Ticks before the first source frame show it early rather than
             // emitting black; a capture with no frames at all has nothing to
             // render.
-            guard let sourceBuffer = currentBuffer ?? pending?.buffer else { break }
+            guard let decodedBuffer = currentBuffer ?? pending?.buffer else { break }
+            // Pixelated regions belong to the recorded picture, so they are
+            // filtered in before the frame is laid out on the canvas.
+            let sourceBuffer = redactionFilter?.apply(to: decodedBuffer, atSourceTime: sourceTime) ?? decodedBuffer
 
             guard let pool = adaptor.pixelBufferPool else {
                 throw ExportError.writerFailed(nil)
@@ -793,6 +807,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let karaokeTimeline: KaraokeTimeline?
     private let reframe: ReframeTrack?
     private let motionTimeline: RecordingStudioMotionTimeline
+    private let textOverlays: [RecordingTextOverlay]
     private var artworkImageCache: [String: CGImage] = [:]
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
@@ -837,9 +852,11 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         reframe: ReframeTrack? = nil,
         fitContentAspect: CGFloat? = nil,
         usesUniformPadding: Bool = false,
-        motionTimeline: RecordingStudioMotionTimeline = .none
+        motionTimeline: RecordingStudioMotionTimeline = .none,
+        textOverlays: [RecordingTextOverlay] = []
     ) {
         self.canvasSize = canvasSize
+        self.textOverlays = textOverlays
         self.videoCropRect = RecordingVideoCropGeometry.normalized(videoCropRect)
         self.style = style
         let baseLayout = RecordingStudioLayout.make(
@@ -981,6 +998,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         editorTime: TimeInterval, sourceTime: TimeInterval
     ) -> ComposedFrameState? {
         guard !bypassFrameCache, settled != nil, sampleRects.count <= 1 else { return nil }
+        // Text animates on its own clock, so a frame showing any is drawn
+        // fresh rather than matched against the last one.
+        guard !textOverlays.contains(where: { $0.isActive(atSourceTime: sourceTime) }) else { return nil }
         let showsScreen = layout.screenOpacity > 0.001
         let showsCamera = layout.cameraOpacity > 0.001 && layout.bubbleRect.width > 0
         let subtitle = subtitleTimeline?.text(at: sourceTime)
@@ -1259,9 +1279,25 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             }
         }
 
+        // Text sits on the canvas above the camera, under the subtitles.
+        drawTextOverlays(at: sourceTime, in: context)
+
         // The subtitle bar lives in canvas space - over the background too,
         // not just the card - and above everything else, camera included.
         drawSubtitleBar(at: sourceTime, in: context)
+    }
+
+    private func drawTextOverlays(at sourceTime: TimeInterval, in context: CGContext) {
+        let active = textOverlays.filter { $0.isActive(atSourceTime: sourceTime) }
+        guard !active.isEmpty else { return }
+        context.saveGState()
+        // The shared renderer works top-down, like the preview's canvas.
+        context.translateBy(x: 0, y: canvasSize.height)
+        context.scaleBy(x: 1, y: -1)
+        for overlay in active {
+            RecordingTextOverlayRenderer.draw(overlay, atSourceTime: sourceTime, canvasSize: canvasSize, in: context)
+        }
+        context.restoreGState()
     }
 
     /// Casts `path`'s shadow without drawing `path` itself. Filling a shape

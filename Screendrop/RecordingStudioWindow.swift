@@ -119,7 +119,11 @@ private struct RecordingStudioContent: View {
         }
         .onDeleteCommand {
             withAnimation(.morphIfAllowed) {
-                if let selectedCueID = model.selectedCueID {
+                if let textID = model.selectedTextID {
+                    model.removeText(id: textID)
+                } else if let redactionID = model.selectedRedactionID {
+                    model.removeRedaction(id: redactionID)
+                } else if let selectedCueID = model.selectedCueID {
                     model.removeZoomCue(id: selectedCueID)
                 } else if let selectedLayoutCueID = model.selectedLayoutCueID {
                     model.removeLayoutCue(id: selectedLayoutCueID)
@@ -569,6 +573,19 @@ private struct StudioCanvasComposition: View {
                     .opacity(layout.cameraOpacity)
                 }
 
+                // Text sits on the canvas above the camera and under the
+                // subtitles, as in the export.
+                if !isEditingVideoCrop {
+                    let texts = model.texts(atEditorTime: model.displayTime)
+                    if !texts.isEmpty {
+                        StudioTextOverlayCanvas(
+                            texts: texts,
+                            sourceTime: model.sourceTime(atEditorTime: model.displayTime),
+                            canvasSize: canvasSize
+                        )
+                    }
+                }
+
                 if let subtitle = model.subtitleText(at: model.displayTime) {
                     StudioSubtitleBarView(
                         text: subtitle,
@@ -585,6 +602,26 @@ private struct StudioCanvasComposition: View {
                         layout: layout,
                         canvasSize: canvasSize
                     )
+                }
+
+                // Regions and texts can be picked and arranged while paused;
+                // playing, a click on the picture still means pause.
+                if !isEditingVideoCrop, !model.isPlaying {
+                    if layout.screenOpacity > 0.5 {
+                        let regions = model.redactions(atEditorTime: model.displayTime)
+                        if !regions.isEmpty {
+                            StudioRedactionEditingLayer(
+                                model: model,
+                                redactions: regions,
+                                pictureRect: layout.frameRect(for: state),
+                                canvasSize: canvasSize
+                            )
+                        }
+                    }
+                    let texts = model.texts(atEditorTime: model.displayTime)
+                    if !texts.isEmpty {
+                        StudioTextEditingLayer(model: model, texts: texts, canvasSize: canvasSize)
+                    }
                 }
             }
             .frame(width: canvasSize.width, height: canvasSize.height)
