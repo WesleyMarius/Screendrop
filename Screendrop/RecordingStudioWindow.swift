@@ -445,7 +445,19 @@ private struct StudioCanvasComposition: View {
     private struct LayoutMorph: Equatable {
         let id = UUID()
         let from: RecordingCameraLayoutFrame
+        let fromViewport: ViewportFrame
         let start: Date
+    }
+
+    /// The viewport last drawn, which a morph starts from. A reference, so
+    /// recording it while drawing doesn't draw the canvas again.
+    private final class ShownViewport {
+        private(set) var frame = ViewportFrame.identity
+
+        func show(_ frame: ViewportFrame) -> ViewportFrame {
+            self.frame = frame
+            return frame
+        }
     }
 
     private static let editMorphDuration: TimeInterval = 0.45
@@ -456,6 +468,7 @@ private struct StudioCanvasComposition: View {
     /// for that pass would drop a cutout's layer, and its readiness with
     /// it, so the framed camera would show in full all the way to a split.
     @State private var shownTimeline: RecordingCameraLayoutTimeline?
+    @State private var shownViewport = ShownViewport()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var baseLayout: RecordingStudioLayout {
@@ -499,22 +512,31 @@ private struct StudioCanvasComposition: View {
 
         TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !model.isPlaying && layoutMorph == nil)) { context in
             let target = targetFrame(resolver, timeline: shownTimeline ?? model.cameraLayoutTimeline)
+            let progress = layoutMorph.map { morph in
+                CGFloat(RecordingCameraLayoutTimeline.ease(
+                    context.date.timeIntervalSince(morph.start) / Self.editMorphDuration
+                ))
+            } ?? 1
             let frame = layoutMorph.map { morph in
-                RecordingCameraLayoutFrame.interpolate(
-                    morph.from,
-                    target,
-                    progress: CGFloat(RecordingCameraLayoutTimeline.ease(
-                        context.date.timeIntervalSince(morph.start) / Self.editMorphDuration
-                    ))
-                )
+                RecordingCameraLayoutFrame.interpolate(morph.from, target, progress: progress)
             } ?? target
             let layout = resolver.base.applying(frame)
             let zoomTarget = zoomTargetCue
             // While a zoom's target is on show the frame stays unzoomed, so
             // the target reads against the whole picture.
-            let state = isEditingVideoCrop || zoomTarget != nil
+            let viewport = isEditingVideoCrop || zoomTarget != nil
                 ? ViewportFrame.identity
                 : model.previewViewportFrame(at: model.displayTime)
+            // The viewport follows an edit as soon as the model has it: a
+            // split's side-aligned crop in a card still the old width would
+            // slide the screen off one side. It holds until the morph
+            // starts, then blends along with the card.
+            let isEditPending = shownTimeline != nil && shownTimeline != model.cameraLayoutTimeline
+            let state = shownViewport.show(
+                isEditPending
+                    ? shownViewport.frame
+                    : layoutMorph.map { $0.fromViewport.blended(to: viewport, progress) } ?? viewport
+            )
 
             ZStack {
                 StudioBackgroundView(style: model.previewBackground ?? model.style.background)
@@ -597,7 +619,7 @@ private struct StudioCanvasComposition: View {
     }
 
     private func startMorph(from: RecordingCameraLayoutFrame) {
-        let morph = LayoutMorph(from: from, start: Date())
+        let morph = LayoutMorph(from: from, fromViewport: shownViewport.frame, start: Date())
         layoutMorph = morph
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(Self.editMorphDuration))
@@ -1356,6 +1378,18 @@ private struct StudioCanvasClip: Shape {
 
     func path(in rect: CGRect) -> Path {
         Path(clips ? rect : rect.insetBy(dx: -100_000, dy: -100_000))
+    }
+}
+
+private extension ViewportFrame {
+    func blended(to other: ViewportFrame, _ t: CGFloat) -> ViewportFrame {
+        ViewportFrame(
+            magnification: magnification + (other.magnification - magnification) * Double(t),
+            anchor: CGPoint(
+                x: anchor.x + (other.anchor.x - anchor.x) * t,
+                y: anchor.y + (other.anchor.y - anchor.y) * t
+            )
+        )
     }
 }
 
