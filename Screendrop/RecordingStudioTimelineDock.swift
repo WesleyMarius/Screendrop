@@ -36,8 +36,13 @@ struct StudioTimelineDock: View {
     /// The playhead is being dragged along the ruler, the clips or an
     /// empty track, which opens its head into the time readout.
     @State private var isScrubbing = false
+    /// The + has opened into the things that can be added.
+    @State private var isAddOpen = false
     @Namespace private var glass
 
+    /// Below this track width the opened + shows bare glyphs, so the edit
+    /// tools never run under the transport.
+    private static let addLabelsMinimumWidth: CGFloat = 820
     /// Step per zoom button press / keyboard shortcut.
     private static let zoomStep: Double = 1.6
     /// How close to the viewport edge the playhead may drift before the
@@ -92,7 +97,7 @@ struct StudioTimelineDock: View {
     /// Changes when a contextual tool appears or leaves, so the clusters
     /// morph once per change rather than on every model update.
     private var clusterKey: [Bool] {
-        [canDeleteSelection, model.hasClipEdits, model.canUndo, model.canRedo, zoom > 1.0001]
+        [canDeleteSelection, isAddOpen, model.canUndo, model.canRedo, zoom > 1.0001]
     }
 
     private var editCluster: some View {
@@ -107,34 +112,7 @@ struct StudioTimelineDock: View {
                 .disabled(!model.isLoaded)
                 .glassEffectID("split", in: glass)
 
-                GlassIconButton(systemImage: "textformat", help: "Add Text at Playhead") {
-                    withAnimation(.morphIfAllowed) {
-                        model.pause()
-                        model.addText(atEditorTime: model.currentTime)
-                    }
-                }
-                .disabled(!model.isLoaded)
-                .glassEffectID("text", in: glass)
-
-                GlassIconButton(systemImage: "squareshape.split.3x3", help: "Pixelate Part of the Picture") {
-                    withAnimation(.morphIfAllowed) {
-                        model.pause()
-                        model.addRedaction(atEditorTime: model.currentTime)
-                    }
-                }
-                .disabled(!model.isLoaded)
-                .glassEffectID("pixelate", in: glass)
-
-                GlassIconButton(
-                    systemImage: "photo.badge.plus",
-                    help: model.mediaDirectoryURL == nil
-                        ? "Save this recording as a project to add images and audio"
-                        : "Add Images, GIFs or Audio at Playhead"
-                ) {
-                    pickMedia()
-                }
-                .disabled(!model.canImportMedia)
-                .glassEffectID("media", in: glass)
+                addTools
 
                 if canDeleteSelection {
                     GlassIconButton(systemImage: "trash", help: "Delete Selection (⌫)") {
@@ -157,24 +135,78 @@ struct StudioTimelineDock: View {
                 .keyboardShortcut("z", modifiers: [.command, .shift])
                 .disabled(!model.canRedo)
                 .glassEffectID("redo", in: glass)
-
-                if model.hasClipEdits {
-                    GlassIconButton(systemImage: "arrow.counterclockwise", help: "Reset All Clip Edits…") {
-                        isResetClipsConfirmationPresented = true
-                    }
-                    .glassEffectID("reset", in: glass)
-                    .confirmationDialog(
-                        "Reset all clip edits?",
-                        isPresented: $isResetClipsConfirmationPresented
-                    ) {
-                        Button("Reset Clips", role: .destructive) {
-                            withAnimation(.morphIfAllowed) { model.resetClips() }
-                        }
-                    } message: {
-                        Text("Every split, trim, deletion and speed change goes back to the original recording. You can undo this.")
-                    }
-                }
             }
+        }
+        .confirmationDialog(
+            "Reset all clip edits?",
+            isPresented: $isResetClipsConfirmationPresented
+        ) {
+            Button("Reset Clips", role: .destructive) {
+                withAnimation(.morphIfAllowed) { model.resetClips() }
+            }
+        } message: {
+            Text("Every split, trim, deletion and speed change goes back to the original recording. You can undo this.")
+        }
+    }
+
+    /// One + that opens into the things that can be added over the video,
+    /// melting out of it the way Delete grows out of Split, and folding
+    /// back once one is picked. Labels show when the row has room for them.
+    @ViewBuilder
+    private var addTools: some View {
+        GlassIconButton(
+            systemImage: isAddOpen ? "xmark" : "plus",
+            help: isAddOpen ? "Close" : "Add Text, Pixelate or Media"
+        ) {
+            withAnimation(.morphIfAllowed) { isAddOpen.toggle() }
+        }
+        .disabled(!model.isLoaded)
+        .glassEffectID("add", in: glass)
+
+        if isAddOpen {
+            addTool("Text", systemImage: "textformat", help: "Add Text at Playhead") {
+                model.addText(atEditorTime: model.currentTime)
+            }
+            .glassEffectID("text", in: glass)
+
+            addTool("Pixelate", systemImage: "squareshape.split.3x3", help: "Pixelate Part of the Picture") {
+                model.addRedaction(atEditorTime: model.currentTime)
+            }
+            .glassEffectID("pixelate", in: glass)
+
+            addTool(
+                "Media",
+                systemImage: "photo.badge.plus",
+                help: model.mediaDirectoryURL == nil
+                    ? "Save this recording as a project to add images and audio"
+                    : "Add Images, GIFs or Audio at Playhead"
+            ) {
+                pickMedia()
+            }
+            .disabled(!model.canImportMedia)
+            .glassEffectID("media", in: glass)
+        }
+    }
+
+    @ViewBuilder
+    private func addTool(
+        _ title: String,
+        systemImage: String,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        let run = {
+            model.pause()
+            withAnimation(.morphIfAllowed) {
+                isAddOpen = false
+                action()
+            }
+        }
+        if viewportWidth >= Self.addLabelsMinimumWidth {
+            GlassCapsuleButton(title: title, systemImage: systemImage, action: run)
+                .help(help)
+        } else {
+            GlassIconButton(systemImage: systemImage, help: help, action: run)
         }
     }
 
@@ -537,7 +569,10 @@ struct StudioTimelineDock: View {
                 model.setClipSpeed(speed, forClipID: clipID)
             },
             title: model.projectDisplayName,
-            onScrubbing: { isScrubbing = $0 }
+            onScrubbing: { isScrubbing = $0 },
+            // Rarely needed, so it waits in the clips' own menu rather
+            // than taking a place in the tool row.
+            onResetAll: model.hasClipEdits ? { isResetClipsConfirmationPresented = true } : nil
         )
     }
 

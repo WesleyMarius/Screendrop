@@ -36,6 +36,8 @@ struct RecordingClipTimelineView: NSViewRepresentable {
     /// A press on the clips starts (true) or stops (false) moving the
     /// playhead, so the timeline can open the playhead's readout.
     var onScrubbing: ((Bool) -> Void)?
+    /// Offered from the clips' context menu while the cut has edits.
+    var onResetAll: (() -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -72,6 +74,7 @@ struct RecordingClipTimelineView: NSViewRepresentable {
             onSetSpeed: onSetSpeed
         )
         nsView.scrubbingDidChange = onScrubbing
+        nsView.resetRequested = onResetAll
         nsView.update(
             title: title,
             timeline: timeline,
@@ -189,6 +192,7 @@ final class RecordingClipTimelineControl: NSView {
     var stepRequested: ((TimeInterval) -> Void)?
     var speedRequested: ((UUID, Double) -> Void)?
     var scrubbingDidChange: ((Bool) -> Void)?
+    var resetRequested: (() -> Void)?
 
     private enum Edge: Equatable {
         case leading
@@ -499,7 +503,23 @@ final class RecordingClipTimelineControl: NSView {
         delete.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
         delete.isEnabled = timeline.segments.count > 1
         menu.addItem(delete)
+
+        if resetRequested != nil {
+            menu.addItem(.separator())
+            let reset = NSMenuItem(
+                title: "Reset All Clip Edits…",
+                action: #selector(resetFromContextMenu),
+                keyEquivalent: ""
+            )
+            reset.target = self
+            reset.image = NSImage(systemSymbolName: "arrow.counterclockwise", accessibilityDescription: nil)
+            menu.addItem(reset)
+        }
         return menu
+    }
+
+    @objc private func resetFromContextMenu() {
+        resetRequested?()
     }
 
     @objc private func speedFromContextMenu(_ sender: NSMenuItem) {
