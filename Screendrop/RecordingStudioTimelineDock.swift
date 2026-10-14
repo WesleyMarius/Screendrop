@@ -1329,6 +1329,45 @@ private struct StudioZoomLane: View {
     }
 }
 
+/// How a block on a track is painted. At rest it is a soft tint of its
+/// colour with its label in that colour, so a busy timeline stays calm;
+/// selected, it fills solid, which is the selection mark.
+private struct StudioBlockStyle {
+    let tint: NSColor
+    /// Marks on the solid, selected fill.
+    var onTint: Color = .white
+
+    static let zoom = StudioBlockStyle(tint: .controlAccentColor)
+    static let layout = StudioBlockStyle(tint: .systemYellow, onTint: Palette.onLayoutCue)
+    static let text = StudioBlockStyle(tint: .systemPurple)
+    static let image = StudioBlockStyle(tint: .systemTeal)
+    static let effect = StudioBlockStyle(tint: .systemGray)
+    static let audio = StudioBlockStyle(tint: .systemIndigo)
+
+    func fill(isSelected: Bool, isHovering: Bool) -> Color {
+        isSelected ? Color(nsColor: tint) : Color(nsColor: tint).opacity(isHovering ? 0.32 : 0.22)
+    }
+
+    func label(isSelected: Bool) -> Color {
+        isSelected ? onTint : restingLabel
+    }
+
+    /// The tint, deepened on light backgrounds and lifted on dark ones, so
+    /// a label reads on its own soft fill - yellow included.
+    private var restingLabel: Color {
+        let tint = tint
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            var resolved = tint
+            appearance.performAsCurrentDrawingAppearance {
+                resolved = tint.usingColorSpace(.sRGB) ?? tint
+            }
+            return appearance.isDarkAppearance
+                ? resolved.blended(withFraction: 0.2, of: .white) ?? resolved
+                : resolved.blended(withFraction: 0.4, of: .black) ?? resolved
+        })
+    }
+}
+
 private enum StudioZoomLaneMetrics {
     static let laneHeight = StudioTrack.zooms.height
     static let blockCornerRadius: CGFloat = 7
@@ -1396,38 +1435,13 @@ private struct StudioZoomCueBlock: View {
         return label(for: cue, width: width)
             .frame(width: width, height: StudioZoomLaneMetrics.blockHeight)
             .background { blockFill(cue: cue, shape: shape) }
-            .overlay {
-                // A soft top highlight gives the block a little body.
-                shape
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [.white.opacity(cue.isEnabled ? 0.35 : 0.12), .white.opacity(0.04)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: 1
-                    )
-                    .allowsHitTesting(false)
-            }
             .overlay(alignment: .leading) {
                 if showsHandles { resizeHandle(edge: .leading).transition(.opacity) }
             }
             .overlay(alignment: .trailing) {
                 if showsHandles { resizeHandle(edge: .trailing).transition(.opacity) }
             }
-            .overlay {
-                if isSelected {
-                    // Drawn inside the block's edge: blocks at either end of
-                    // the timeline sit against the scroll view's clip, which
-                    // would cut an outside ring off.
-                    shape
-                        .strokeBorder(Color.white.opacity(0.95), lineWidth: 2)
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
-            }
             .contentShape(shape)
-            .brightness(isHovering && !isSelected ? 0.05 : 0)
             .onHover { isHovering = $0 }
             .motion(.morphQuick, value: showsHandles)
             .motion(.morphQuick, value: isSelected)
@@ -1447,20 +1461,23 @@ private struct StudioZoomCueBlock: View {
         if width >= StudioZoomLaneMetrics.minimumLabelledBlockWidth {
             HStack(spacing: 4) {
                 if width >= StudioZoomLaneMetrics.minimumLabelledBlockWidth + 18 {
-                    Image(systemName: cue.anchorMode == .pinnedAnchor ? "scope" : "plus.magnifyingglass")
+                    Image(systemName: cue.anchorMode == .pinnedAnchor ? "scope" : "magnifyingglass")
                         .font(.system(size: 9, weight: .bold))
                 }
                 Text(cue.isEnabled
                     ? InspectorValueFormat.magnification(fractionDigits: 1).displayString(for: cue.zoom)
                     : "Off")
                     .font(.system(size: 10, weight: .semibold, design: .rounded).monospacedDigit())
-                if width >= StudioZoomLaneMetrics.minimumDetailedBlockWidth, cue.isEnabled {
+                // Following the pointer is the default, so only a zoom that
+                // does something else says so.
+                if width >= StudioZoomLaneMetrics.minimumDetailedBlockWidth, cue.isEnabled,
+                   cue.anchorMode != .pointerAnchor {
                     Text(cue.anchorMode.laneTitle)
                         .font(.system(size: 10, weight: .medium))
                         .opacity(0.75)
                 }
             }
-            .foregroundStyle(cue.isEnabled ? Color.white : Color.secondary)
+            .foregroundStyle(cue.isEnabled ? StudioBlockStyle.zoom.label(isSelected: isSelected) : Color.secondary)
             .lineLimit(1)
             .fixedSize()
             .padding(.horizontal, StudioZoomLaneMetrics.handleWidth)
@@ -1471,16 +1488,7 @@ private struct StudioZoomCueBlock: View {
     @ViewBuilder
     private func blockFill(cue: ZoomCue, shape: RoundedRectangle) -> some View {
         if cue.isEnabled {
-            shape.fill(
-                LinearGradient(
-                    colors: [
-                        Palette.highlight.opacity(isSelected ? 1 : 0.88),
-                        Palette.highlight.opacity(isSelected ? 0.86 : 0.72)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
+            shape.fill(StudioBlockStyle.zoom.fill(isSelected: isSelected, isHovering: isHovering))
         } else {
             shape
                 .fill(Color.primary.opacity(0.08))
@@ -1610,9 +1618,8 @@ private struct StudioZoomCueBlock: View {
             .frame(width: StudioZoomLaneMetrics.handleWidth, height: StudioZoomLaneMetrics.blockHeight)
             .overlay {
                 Capsule()
-                    .fill(block.cue.isEnabled ? Color.white.opacity(0.95) : Color.primary.opacity(0.5))
+                    .fill(block.cue.isEnabled ? StudioBlockStyle.zoom.label(isSelected: isSelected) : Color.primary.opacity(0.5))
                     .frame(width: 3, height: 12)
-                    .shadow(color: .black.opacity(0.25), radius: 1)
             }
             .contentShape(Rectangle())
             .pointerStyle(.frameResize(position: edge == .leading ? .leading : .trailing))
@@ -1801,20 +1808,11 @@ private struct StudioLayoutCueBlock: View {
         return label(for: cue, width: width)
             .frame(width: width, height: StudioZoomLaneMetrics.blockHeight)
             .background {
-                shape.fill(
-                    LinearGradient(
-                        colors: [
-                            Palette.layoutCue.opacity(isSelected ? 1 : 0.9),
-                            Palette.layoutCue.opacity(isSelected ? 0.86 : 0.76)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
+                shape.fill(StudioBlockStyle.layout.fill(isSelected: isSelected, isHovering: isHovering))
                 .overlay(alignment: .leading) {
                     // Where the layout is still morphing in.
                     LinearGradient(
-                        colors: [Color.white.opacity(0.45), Color.white.opacity(0)],
+                        colors: [StudioBlockStyle.layout.label(isSelected: isSelected).opacity(0.22), .clear],
                         startPoint: .leading,
                         endPoint: .trailing
                     )
@@ -1823,34 +1821,13 @@ private struct StudioLayoutCueBlock: View {
                     .allowsHitTesting(false)
                 }
             }
-            .overlay {
-                shape
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [.white.opacity(0.4), .white.opacity(0.05)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: 1
-                    )
-                    .allowsHitTesting(false)
-            }
             .overlay(alignment: .leading) {
                 if showsHandles { resizeHandle(edge: .leading).transition(.opacity) }
             }
             .overlay(alignment: .trailing) {
                 if showsHandles { resizeHandle(edge: .trailing).transition(.opacity) }
             }
-            .overlay {
-                if isSelected {
-                    shape
-                        .strokeBorder(Color.white.opacity(0.95), lineWidth: 2)
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
-            }
             .contentShape(shape)
-            .brightness(isHovering && !isSelected ? 0.04 : 0)
             .onHover { isHovering = $0 }
             .motion(.morphQuick, value: showsHandles)
             .motion(.morphQuick, value: isSelected)
@@ -1874,7 +1851,7 @@ private struct StudioLayoutCueBlock: View {
                         .font(.system(size: 10, weight: .semibold))
                 }
             }
-            .foregroundStyle(Palette.onLayoutCue)
+            .foregroundStyle(StudioBlockStyle.layout.label(isSelected: isSelected))
             .lineLimit(1)
             .fixedSize()
             .padding(.horizontal, StudioZoomLaneMetrics.handleWidth)
@@ -1945,7 +1922,7 @@ private struct StudioLayoutCueBlock: View {
             .frame(width: StudioZoomLaneMetrics.handleWidth, height: StudioZoomLaneMetrics.blockHeight)
             .overlay {
                 Capsule()
-                    .fill(Palette.onLayoutCue)
+                    .fill(StudioBlockStyle.layout.label(isSelected: isSelected))
                     .frame(width: 3, height: 12)
             }
             .contentShape(Rectangle())
@@ -2036,7 +2013,7 @@ private struct StudioTextLane: View {
                     block: block,
                     scale: scale,
                     isSelected: model.selectedTextID == block.item.id,
-                    tint: Palette.textCue,
+                    style: .text,
                     systemImage: "textformat",
                     title: block.item.text.isEmpty ? "Text" : block.item.text
                         .replacingOccurrences(of: "\n", with: " "),
@@ -2116,7 +2093,7 @@ private struct StudioRedactionLane: View {
                     block: block,
                     scale: scale,
                     isSelected: model.selectedImageID == overlay.id,
-                    tint: Palette.imageCue,
+                    style: .image,
                     systemImage: overlay.isAnimated ? "photo.stack" : "photo",
                     title: overlay.isAnimated ? "\(overlay.displayName) · GIF" : overlay.displayName,
                     isHatched: false,
@@ -2150,7 +2127,7 @@ private struct StudioRedactionLane: View {
                     block: block,
                     scale: scale,
                     isSelected: model.selectedRedactionID == redaction.id,
-                    tint: Palette.effectCue,
+                    style: .effect,
                     systemImage: redaction.style.systemImage,
                     title: redaction.style.title,
                     isHatched: true,
@@ -2248,7 +2225,7 @@ private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: Vi
     let block: RecordingOverlayTimelineBlock<Item>
     let scale: StudioTimelineScale
     let isSelected: Bool
-    let tint: Color
+    let style: StudioBlockStyle
     let systemImage: String
     let title: String
     /// Effects carry light stripes, so they read apart from images.
@@ -2293,9 +2270,10 @@ private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: Vi
         return label(width: width)
             .frame(width: width, height: StudioZoomLaneMetrics.blockHeight, alignment: .leading)
             .background {
-                shape.fill(tint.opacity(isSelected ? 1 : 0.86))
+                shape.fill(style.fill(isSelected: isSelected, isHovering: isHovering))
                     .overlay {
                         if isHatched {
+                            let stripe = style.label(isSelected: isSelected).opacity(0.1)
                             Canvas { context, size in
                                 var path = Path()
                                 var stripeX: CGFloat = -size.height
@@ -2304,23 +2282,11 @@ private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: Vi
                                     path.addLine(to: CGPoint(x: stripeX + size.height, y: 0))
                                     stripeX += 12
                                 }
-                                context.stroke(path, with: .color(.white.opacity(0.12)), lineWidth: 6)
+                                context.stroke(path, with: .color(stripe), lineWidth: 6)
                             }
                             .clipShape(shape)
                         }
                     }
-            }
-            .overlay {
-                shape
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [.white.opacity(0.32), .white.opacity(0.04)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: 1
-                    )
-                    .allowsHitTesting(false)
             }
             .overlay(alignment: .leading) {
                 if showsHandles { resizeHandle(.leading).transition(.opacity) }
@@ -2328,16 +2294,7 @@ private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: Vi
             .overlay(alignment: .trailing) {
                 if showsHandles { resizeHandle(.trailing).transition(.opacity) }
             }
-            .overlay {
-                if isSelected {
-                    shape
-                        .strokeBorder(Color.white.opacity(0.95), lineWidth: 2)
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
-            }
             .contentShape(shape)
-            .brightness(isHovering && !isSelected ? 0.05 : 0)
             .onHover { isHovering = $0 }
             .motion(.morphQuick, value: showsHandles)
             .motion(.morphQuick, value: isSelected)
@@ -2362,7 +2319,7 @@ private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: Vi
                         .truncationMode(.tail)
                 }
             }
-            .foregroundStyle(.white)
+            .foregroundStyle(style.label(isSelected: isSelected))
             .padding(.horizontal, StudioZoomLaneMetrics.handleWidth)
             .frame(maxWidth: width, alignment: .leading)
             .allowsHitTesting(false)
@@ -2409,9 +2366,8 @@ private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: Vi
             .frame(width: StudioZoomLaneMetrics.handleWidth, height: StudioZoomLaneMetrics.blockHeight)
             .overlay {
                 Capsule()
-                    .fill(Color.white.opacity(0.95))
+                    .fill(style.label(isSelected: isSelected))
                     .frame(width: 3, height: 12)
-                    .shadow(color: .black.opacity(0.25), radius: 1)
             }
             .contentShape(Rectangle())
             .pointerStyle(.frameResize(position: edge == .leading ? .leading : .trailing))
@@ -2497,6 +2453,7 @@ private struct StudioAudioClipBlock: View {
         return ZStack(alignment: .topLeading) {
             StudioWaveform(
                 peaks: peaks,
+                color: StudioBlockStyle.audio.label(isSelected: isSelected).opacity(0.75),
                 from: clip.trimStart,
                 to: clip.trimStart + Double(width / scale.pointsPerSecond)
             )
@@ -2514,7 +2471,7 @@ private struct StudioAudioClipBlock: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
-                .foregroundStyle(.white)
+                .foregroundStyle(StudioBlockStyle.audio.label(isSelected: isSelected))
                 .padding(.horizontal, StudioZoomLaneMetrics.handleWidth)
                 .padding(.top, 2)
                 .frame(maxWidth: width, alignment: .leading)
@@ -2522,32 +2479,15 @@ private struct StudioAudioClipBlock: View {
             }
         }
         .frame(width: width, height: Self.height, alignment: .topLeading)
-        .background { shape.fill(Palette.audioCue.opacity(isSelected ? 1 : 0.86)) }
+        .background { shape.fill(StudioBlockStyle.audio.fill(isSelected: isSelected, isHovering: isHovering)) }
         .clipShape(shape)
-        .overlay {
-            shape
-                .strokeBorder(
-                    LinearGradient(colors: [.white.opacity(0.32), .white.opacity(0.04)], startPoint: .top, endPoint: .bottom),
-                    lineWidth: 1
-                )
-                .allowsHitTesting(false)
-        }
         .overlay(alignment: .leading) {
             if showsHandles { resizeHandle(.leading).transition(.opacity) }
         }
         .overlay(alignment: .trailing) {
             if showsHandles { resizeHandle(.trailing).transition(.opacity) }
         }
-        .overlay {
-            if isSelected {
-                shape
-                    .strokeBorder(Color.white.opacity(0.95), lineWidth: 2)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
-        }
         .contentShape(shape)
-        .brightness(isHovering && !isSelected ? 0.05 : 0)
         .onHover { isHovering = $0 }
         .motion(.morphQuick, value: showsHandles)
         .motion(.morphQuick, value: isSelected)
@@ -2599,9 +2539,8 @@ private struct StudioAudioClipBlock: View {
             .frame(width: StudioZoomLaneMetrics.handleWidth, height: Self.height)
             .overlay {
                 Capsule()
-                    .fill(Color.white.opacity(0.95))
+                    .fill(StudioBlockStyle.audio.label(isSelected: isSelected))
                     .frame(width: 3, height: 14)
-                    .shadow(color: .black.opacity(0.25), radius: 1)
             }
             .contentShape(Rectangle())
             .pointerStyle(.frameResize(position: edge == .leading ? .leading : .trailing))
@@ -2612,6 +2551,7 @@ private struct StudioAudioClipBlock: View {
 /// Rounded bars of an audio file's loudness between two file times.
 private struct StudioWaveform: View {
     let peaks: [Float]
+    let color: Color
     let from: TimeInterval
     let to: TimeInterval
 
@@ -2639,7 +2579,7 @@ private struct StudioWaveform: View {
                 )
                 x += bar + gap
             }
-            context.fill(path, with: .color(.white.opacity(0.8)))
+            context.fill(path, with: .color(color))
         }
         .allowsHitTesting(false)
     }
