@@ -2,7 +2,7 @@
 //  RecordingStudioTimelineDock.swift
 //  Screendrop
 //
-//  The Studio timeline: a glass control row over the lanes. Edit tools sit
+//  The Studio timeline: a glass control row over the tracks. Edit tools sit
 //  on the left, transport in the middle, timeline zoom on the right - each a
 //  cluster of glass shapes in its own container. Tools that only mean
 //  something in context are born out of their neighbour when they start to
@@ -10,6 +10,10 @@
 //  once something is selected, Reset appears beside Undo once the cut has
 //  edits, and the fit chip grows out of the zoom buttons once the lanes are
 //  zoomed.
+//
+//  Under the row the tracks follow the web editor: a gutter of glyphs names
+//  each track, every track is a flat full-width row, and the ruler labels
+//  its major ticks from their leading edge.
 //
 
 import AppKit
@@ -28,6 +32,9 @@ struct StudioTimelineDock: View {
     @State private var isResetClipsConfirmationPresented = false
     /// The pointer's position over the lanes, in viewport points.
     @State private var skimX: CGFloat?
+    /// The playhead is being dragged along the ruler, the clips or an
+    /// empty track, which opens its head into the time readout.
+    @State private var isScrubbing = false
     @Namespace private var glass
 
     /// Step per zoom button press / keyboard shortcut.
@@ -45,11 +52,16 @@ struct StudioTimelineDock: View {
     }
 
     var body: some View {
-        VStack(spacing: StudioTimelineMetrics.rowSpacing) {
+        VStack(spacing: StudioTimelineMetrics.controlSpacing) {
             controlRow
-            lanes
+                .padding(.horizontal, 16)
+            // The tracks run from the gutter at the leading edge to the
+            // trailing edge, like the web editor's.
+            HStack(alignment: .top, spacing: 0) {
+                trackGutter
+                lanes
+            }
         }
-        .padding(.horizontal, 16)
         .padding(.top, 10)
         .padding(.bottom, 14)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -211,7 +223,43 @@ struct StudioTimelineDock: View {
         }
     }
 
-    // MARK: Lanes
+    // MARK: Tracks
+
+    /// The tracks top to bottom: what goes over the picture above the clips,
+    /// what changes the camera below them, sound last. Layouts arrange the
+    /// camera, so a recording without one has no layout track.
+    private var tracks: [StudioTrack] {
+        var tracks: [StudioTrack] = [.text, .overlay, .clips, .zooms]
+        if model.hasCameraVideo { tracks.append(.layouts) }
+        tracks.append(.audio)
+        return tracks
+    }
+
+    /// One glyph per track beside its row, over a hairline that keeps the
+    /// column apart from the tracks.
+    private var trackGutter: some View {
+        VStack(spacing: StudioTimelineMetrics.trackSpacing) {
+            Color.clear
+                .frame(height: StudioTimelineMetrics.headerHeight)
+            ForEach(tracks) { track in
+                Image(systemName: track.systemImage)
+                    .font(.system(size: 11.5, weight: .regular))
+                    .foregroundStyle(Palette.secondaryLabel)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: track.height)
+                    .contentShape(Rectangle())
+                    .help(track.title)
+                    .accessibilityLabel(track.title)
+            }
+        }
+        .frame(width: StudioTimelineMetrics.gutterWidth)
+        .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks), alignment: .top)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Palette.hairline)
+                .frame(width: 1)
+        }
+    }
 
     private var lanes: some View {
         GeometryReader { proxy in
@@ -223,10 +271,10 @@ struct StudioTimelineDock: View {
                 zoom: zoom
             )
 
-            VStack(spacing: StudioTimelineMetrics.rowSpacing) {
+            VStack(spacing: StudioTimelineMetrics.trackSpacing) {
                 // Clicking or dragging along the ruler, or the strip above
                 // it, moves the playhead there.
-                VStack(spacing: StudioTimelineMetrics.rowSpacing) {
+                VStack(spacing: 0) {
                     Color.clear
                         .frame(height: StudioTimelineMetrics.playheadLaneHeight)
 
@@ -238,13 +286,7 @@ struct StudioTimelineDock: View {
                     .frame(height: StudioTimelineMetrics.rulerHeight)
                 }
                 .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { value in
-                            model.pause()
-                            model.seek(to: scale.time(forX: value.location.x + scrollX))
-                        }
-                )
+                .gesture(scrubGesture(scale: scale, scrollX: scrollX))
 
                 scrollingLanes(scale: scale)
             }
@@ -269,7 +311,8 @@ struct StudioTimelineDock: View {
                     scale: scale,
                     scrollX: scrollX,
                     skimX: skimX,
-                    showsSkim: !model.isPlaying
+                    showsSkim: !model.isPlaying,
+                    isScrubbing: isScrubbing
                 ) { time in
                     model.pause()
                     model.seek(to: time)
@@ -280,61 +323,53 @@ struct StudioTimelineDock: View {
                 clampZoom()
             }
         }
-        .frame(height: StudioTimelineMetrics.lanesHeight(showsLayoutLane: showsLayoutLane))
+        .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks))
         .onChange(of: model.duration) { _, _ in clampZoom() }
         .onChange(of: model.currentTime) { _, time in followPlayhead(to: time) }
     }
 
-    /// The two lanes that carry real edit targets live in a horizontal scroll
-    /// view sized to the zoomed timeline. The ruler, playhead and lane chrome
-    /// stay viewport-sized and redraw against `scrollX` instead - a rounded
-    /// rectangle or Canvas tens of thousands of points wide would be a single
+    /// Press-and-drag that moves the playhead, for the ruler and for tracks
+    /// with nothing under the pointer. `offset` turns the gesture's x into
+    /// timeline x: the viewport's scroll for the ruler, zero inside the
+    /// scrolled tracks.
+    private func scrubGesture(
+        scale: StudioTimelineScale,
+        scrollX offset: CGFloat,
+        deselects: Bool = false
+    ) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if !isScrubbing {
+                    isScrubbing = true
+                    model.pause()
+                    if deselects { deselectAll() }
+                }
+                model.seek(to: scale.time(forX: value.location.x + offset))
+            }
+            .onEnded { _ in isScrubbing = false }
+    }
+
+    /// The tracks that carry real edit targets live in a horizontal scroll
+    /// view sized to the zoomed timeline. The ruler, playhead and track
+    /// grounds stay viewport-sized and redraw against `scrollX` instead - a
+    /// shape or Canvas tens of thousands of points wide would be a single
     /// oversized layer, while an AppKit view only ever draws its visible rect.
     private func scrollingLanes(scale: StudioTimelineScale) -> some View {
         ZStack(alignment: .topLeading) {
-            VStack(spacing: StudioTimelineMetrics.rowSpacing) {
-                Color.clear
-                    .frame(height: StudioTimelineMetrics.clipLaneHeight)
-                StudioZoomLaneBackground(
-                    showsHint: model.zoomEnabled && model.zoomTimelineBlocks.isEmpty
-                )
-                    .frame(height: StudioTimelineMetrics.zoomLaneHeight)
-                if showsLayoutLane {
-                    StudioLayoutLaneBackground(showsHint: model.cameraLayoutCues.isEmpty)
-                        .frame(height: StudioTimelineMetrics.layoutLaneHeight)
+            VStack(spacing: StudioTimelineMetrics.trackSpacing) {
+                ForEach(tracks) { track in
+                    StudioTrackGround(hint: hint(for: track))
+                        .frame(height: track.height)
                 }
                 Color.clear
                     .frame(height: StudioTimelineMetrics.scrollerGutter)
             }
 
             ScrollView(.horizontal) {
-                VStack(spacing: StudioTimelineMetrics.rowSpacing) {
-                    clipLane
-                        .frame(
-                            width: scale.contentWidth,
-                            height: StudioTimelineMetrics.clipLaneHeight
-                        )
-
-                    StudioZoomLane(
-                        model: model,
-                        scale: scale,
-                        visibleRange: scale.visibleRange(scrollX: scrollX)
-                    )
-                    .frame(
-                        width: scale.contentWidth,
-                        height: StudioTimelineMetrics.zoomLaneHeight
-                    )
-
-                    if showsLayoutLane {
-                        StudioLayoutLane(
-                            model: model,
-                            scale: scale,
-                            visibleRange: scale.visibleRange(scrollX: scrollX)
-                        )
-                        .frame(
-                            width: scale.contentWidth,
-                            height: StudioTimelineMetrics.layoutLaneHeight
-                        )
+                VStack(spacing: StudioTimelineMetrics.trackSpacing) {
+                    ForEach(tracks) { track in
+                        laneContent(for: track, scale: scale)
+                            .frame(width: scale.contentWidth, height: track.height)
                     }
 
                     Color.clear
@@ -352,12 +387,52 @@ struct StudioTimelineDock: View {
                 }
             }
         }
-        .frame(height: StudioTimelineMetrics.scrollingLanesHeight(showsLayoutLane: showsLayoutLane))
+        .frame(height: StudioTimelineMetrics.scrollingLanesHeight(tracks: tracks))
     }
 
-    /// Layouts arrange the camera, so a recording without one has no lane.
-    private var showsLayoutLane: Bool {
-        model.hasCameraVideo
+    @ViewBuilder
+    private func laneContent(for track: StudioTrack, scale: StudioTimelineScale) -> some View {
+        switch track {
+        case .clips:
+            clipLane
+        case .zooms:
+            StudioZoomLane(
+                model: model,
+                scale: scale,
+                visibleRange: scale.visibleRange(scrollX: scrollX)
+            )
+        case .layouts:
+            StudioLayoutLane(
+                model: model,
+                scale: scale,
+                visibleRange: scale.visibleRange(scrollX: scrollX)
+            )
+        case .text, .overlay, .audio:
+            // Nothing lives on these tracks yet; a press scrubs, as on the
+            // ruler, and lets go of whatever was selected.
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(scrubGesture(scale: scale, scrollX: 0, deselects: true))
+        }
+    }
+
+    /// An empty track explains itself at its leading edge instead of
+    /// reading as dead space.
+    private func hint(for track: StudioTrack) -> String? {
+        switch track {
+        case .zooms:
+            model.zoomEnabled && model.zoomTimelineBlocks.isEmpty ? "Drag across to add a zoom" : nil
+        case .layouts:
+            model.cameraLayoutCues.isEmpty ? "Drag across to change the camera layout" : nil
+        case .text, .overlay, .clips, .audio:
+            nil
+        }
+    }
+
+    private func deselectAll() {
+        model.selectedCueID = nil
+        model.selectedClipID = nil
+        model.selectedLayoutCueID = nil
     }
 
     private var clipLane: some View {
@@ -392,7 +467,9 @@ struct StudioTimelineDock: View {
             },
             onSetSpeed: { clipID, speed in
                 model.setClipSpeed(speed, forClipID: clipID)
-            }
+            },
+            title: model.projectDisplayName,
+            onScrubbing: { isScrubbing = $0 }
         )
     }
 
@@ -480,24 +557,67 @@ struct StudioTimelineDock: View {
 }
 
 private enum StudioTimelineMetrics {
-    static let rowSpacing: CGFloat = 8
+    /// Between the control row and the tracks.
+    static let controlSpacing: CGFloat = 8
+    /// Between one track and the next, as in the web editor.
+    static let trackSpacing: CGFloat = 4
+    static let gutterWidth: CGFloat = 40
     static let playheadLaneHeight: CGFloat = 18
-    static let rulerHeight: CGFloat = 16
-    static let clipLaneHeight: CGFloat = 52
-    static let zoomLaneHeight: CGFloat = 32
-    static let layoutLaneHeight: CGFloat = 32
+    static let rulerHeight: CGFloat = 20
+    /// The playhead's lane and the ruler, above the first track.
+    static let headerHeight = playheadLaneHeight + rulerHeight
     /// Room under the lanes for the horizontal scroller, so it never sits on
     /// top of a zoom block.
     static let scrollerGutter: CGFloat = 8
 
-    static func scrollingLanesHeight(showsLayoutLane: Bool) -> CGFloat {
-        clipLaneHeight + zoomLaneHeight + scrollerGutter + rowSpacing * 2
-            + (showsLayoutLane ? layoutLaneHeight + rowSpacing : 0)
+    static func scrollingLanesHeight(tracks: [StudioTrack]) -> CGFloat {
+        tracks.reduce(scrollerGutter) { $0 + $1.height + trackSpacing }
     }
 
-    static func lanesHeight(showsLayoutLane: Bool) -> CGFloat {
-        playheadLaneHeight + rulerHeight
-            + scrollingLanesHeight(showsLayoutLane: showsLayoutLane) + rowSpacing * 2
+    static func lanesHeight(tracks: [StudioTrack]) -> CGFloat {
+        headerHeight + trackSpacing + scrollingLanesHeight(tracks: tracks)
+    }
+}
+
+/// A row of the timeline, named by its glyph in the gutter.
+private enum StudioTrack: String, Identifiable {
+    case text
+    case overlay
+    case clips
+    case zooms
+    case layouts
+    case audio
+
+    var id: String { rawValue }
+
+    var height: CGFloat {
+        switch self {
+        case .clips: 52
+        case .audio: 36
+        case .text, .overlay, .zooms, .layouts: 30
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .text: "textformat"
+        case .overlay: "square.3.layers.3d"
+        case .clips: "film"
+        case .zooms: "magnifyingglass"
+        case .layouts: "rectangle.inset.bottomright.filled"
+        case .audio: "music.note"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .text: "Text"
+        case .overlay: "Images and Effects"
+        case .clips: "Clips"
+        case .zooms: "Zooms"
+        case .layouts: "Camera Layouts"
+        case .audio: "Audio"
+        }
     }
 }
 
@@ -577,6 +697,9 @@ private struct StudioTimelinePlayhead: View {
     /// The pointer's position while skimming, in viewport points.
     let skimX: CGFloat?
     let showsSkim: Bool
+    /// The playhead is being scrubbed from the ruler, the clips or an empty
+    /// track; the head opens into its readout as if it were dragged.
+    var isScrubbing = false
     let onScrub: (TimeInterval) -> Void
 
     @State private var isHovering = false
@@ -586,8 +709,6 @@ private struct StudioTimelinePlayhead: View {
         static let headSize = CGSize(width: 17, height: 12)
         static let readoutSize = CGSize(width: 56, height: 17)
         static let hitSize = CGSize(width: 28, height: StudioTimelineMetrics.playheadLaneHeight + 4)
-        /// How far the head may overhang the lanes into the dock's margin.
-        static let edgeOverhang: CGFloat = 12
     }
 
     private static let coordinateSpace = "studio.playheadLane"
@@ -600,20 +721,19 @@ private struct StudioTimelinePlayhead: View {
             // tracks the scrolled lanes underneath it.
             let x = scale.x(for: time) - scrollX
             let isVisible = x >= -2 && x <= width + 2
-            let isExpanded = isHovering || isDragging
+            let isExpanded = isHovering || isDragging || isScrubbing
             let head = isExpanded ? Metrics.readoutSize : Metrics.headSize
-            // The stem stays on the true time; near either end the head
-            // slides inward so its readout is never cut off.
-            let headX = min(
-                max(x, head.width / 2 - Metrics.edgeOverhang),
-                width - head.width / 2 + Metrics.edgeOverhang
-            )
+            // The stem stays on the true time and the head centred on it:
+            // at the start it overhangs the track gutter, and only at the
+            // trailing edge, where the tracks meet the inspector, does it
+            // slide inward so its readout is never cut off.
+            let headX = min(x, width - head.width / 2)
             // The head hangs from the top of its lane, so the readout grows
             // downward toward the ruler rather than off the dock.
             let headTop = laneHeight - Metrics.headSize.height - 1
 
             ZStack(alignment: .topLeading) {
-                if showsSkim, let skimX, !isDragging {
+                if showsSkim, let skimX, !isDragging, !isScrubbing {
                     Rectangle()
                         .fill(Color.primary.opacity(0.32))
                         .frame(width: 1, height: max(0, proxy.size.height - laneHeight))
@@ -666,7 +786,7 @@ private struct StudioTimelinePlayhead: View {
             }
         }
         .coordinateSpace(name: Self.coordinateSpace)
-        .motion(.morphQuick, value: isHovering || isDragging)
+        .motion(.morphQuick, value: isHovering || isDragging || isScrubbing)
     }
 }
 
@@ -748,48 +868,52 @@ private struct PlayheadPinShape: Shape {
     }
 }
 
-/// Absolute-time ruler above the clip lane. The ruler itself never scrolls: it
-/// draws only the time span currently on screen, so a deeply zoomed timeline
-/// costs the same to render as a fitted one.
+/// Absolute-time ruler above the tracks, drawn like the web editor's: each
+/// major tick is a hairline the full height of the ruler with its time just
+/// after it, minor ticks stand along the floor, and a hairline closes the
+/// ruler off from the tracks. The ruler itself never scrolls: it draws only
+/// the time span currently on screen, so a deeply zoomed timeline costs the
+/// same to render as a fitted one.
 private struct StudioTimelineRuler: View {
     let duration: Double
     let pointsPerSecond: CGFloat
     let scrollX: CGFloat
 
+    private static let minorTickHeight: CGFloat = 5
+    private static let labelInset = CGPoint(x: 5, y: 2)
+
     var body: some View {
         Canvas { context, size in
+            context.fill(
+                Path(CGRect(x: 0, y: size.height - 1, width: size.width, height: 1)),
+                with: .color(Palette.hairline)
+            )
             guard duration > 0.2, pointsPerSecond > 0, size.width > 60 else { return }
 
             let step = Self.labelStep(forPointsPerSecond: pointsPerSecond)
+            let minorStep = Self.minorStep(for: step)
             let startTime = max(0, Double(scrollX / pointsPerSecond))
             let endTime = min(duration, Double((scrollX + size.width) / pointsPerSecond))
-            let endpointLabel = Self.label(for: duration, step: step)
-            var lastLabelMaxX = -CGFloat.greatestFiniteMagnitude
 
             func x(for time: Double) -> CGFloat {
                 CGFloat(time) * pointsPerSecond - scrollX
             }
 
-            /// `anchorX` is the tick position; `trailing` right-aligns the
-            /// label onto it instead of centering, which is how the endpoint
-            /// label stays inside the viewport.
-            func drawLabel(_ text: String, at anchorX: CGFloat, trailing: Bool = false) {
-                let label = context.resolve(
-                    Text(text)
-                        .font(.system(size: 9, weight: .medium).monospacedDigit())
-                        .foregroundStyle(Color.secondary)
+            // Minor ticks first, so a major line covers the one it lands on.
+            var minorIndex = max(0, Int(floor(startTime / minorStep)))
+            while true {
+                let time = Double(minorIndex) * minorStep
+                minorIndex += 1
+                guard time <= endTime else { break }
+                context.fill(
+                    Path(CGRect(
+                        x: x(for: time) - 0.5,
+                        y: size.height - 1 - Self.minorTickHeight,
+                        width: 1,
+                        height: Self.minorTickHeight
+                    )),
+                    with: .color(.primary.opacity(0.14))
                 )
-                let labelSize = label.measure(in: size)
-                let labelX = trailing ? anchorX - labelSize.width : anchorX - labelSize.width / 2
-                let clampedX = min(max(labelX, 0), max(0, size.width - labelSize.width))
-                guard clampedX >= lastLabelMaxX + 8 else { return }
-                context.draw(label, in: CGRect(
-                    x: clampedX,
-                    y: size.height - 5 - labelSize.height,
-                    width: labelSize.width,
-                    height: labelSize.height
-                ))
-                lastLabelMaxX = clampedX + labelSize.width
             }
 
             var index = max(0, Int(floor(startTime / step)))
@@ -799,48 +923,27 @@ private struct StudioTimelineRuler: View {
                 index += 1
                 guard time <= duration else { break }
                 let tickX = x(for: time)
-
                 context.fill(
-                    Path(CGRect(x: tickX - 0.5, y: size.height - 4, width: 1, height: 4)),
-                    with: .color(.primary.opacity(0.30))
+                    Path(CGRect(x: tickX - 0.5, y: 0, width: 1, height: size.height)),
+                    with: .color(Palette.hairline)
                 )
 
-                let minorTime = time + step / 2
-                if minorTime < duration {
-                    context.fill(
-                        Path(CGRect(
-                            x: x(for: minorTime) - 0.5,
-                            y: size.height - 2.5,
-                            width: 1,
-                            height: 2.5
-                        )),
-                        with: .color(.primary.opacity(0.16))
-                    )
-                }
-
-                // A final whole-second tick can format identically to a
-                // fractional endpoint (for example 4.2 -> 00:04). Let the
-                // actual endpoint own that label.
-                let timeLabel = Self.label(for: time, step: step)
-                if time == 0 || timeLabel != endpointLabel {
-                    drawLabel(timeLabel, at: tickX)
-                }
-            }
-
-            // The end of the recording always gets a tick, right-aligned when
-            // it lands at the trailing edge of the viewport.
-            let endpointX = x(for: duration)
-            if endpointX >= -1, endpointX <= size.width + 1 {
-                context.fill(
-                    Path(CGRect(
-                        x: min(endpointX, size.width - 0.5) - 0.5,
-                        y: size.height - 4,
-                        width: 1,
-                        height: 4
-                    )),
-                    with: .color(.primary.opacity(0.30))
+                let label = context.resolve(
+                    Text(Self.label(for: time, step: step))
+                        .font(.system(size: 9.5, weight: .regular, design: .monospaced))
+                        .foregroundStyle(Palette.tertiaryLabel)
                 )
-                drawLabel(endpointLabel, at: endpointX, trailing: true)
+                let labelSize = label.measure(in: size)
+                let labelX = tickX + Self.labelInset.x
+                // A label that would run off the trailing edge is left out
+                // rather than squeezed against the tick before it.
+                guard labelX + labelSize.width <= size.width else { continue }
+                context.draw(label, in: CGRect(
+                    x: labelX,
+                    y: Self.labelInset.y,
+                    width: labelSize.width,
+                    height: labelSize.height
+                ))
             }
         }
     }
@@ -852,10 +955,16 @@ private struct StudioTimelineRuler: View {
         let candidates: [Double] = [
             0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800
         ]
-        for candidate in candidates where CGFloat(candidate) * pointsPerSecond >= 64 {
+        for candidate in candidates where CGFloat(candidate) * pointsPerSecond >= 72 {
             return candidate
         }
         return candidates.last ?? 60
+    }
+
+    /// Fifths of a step that divides into them evenly, quarters otherwise.
+    private static func minorStep(for step: Double) -> Double {
+        let isFifths = step >= 1 && step.truncatingRemainder(dividingBy: 5) == 0
+        return step / (isFifths ? 5 : 4)
     }
 
     private static func label(for time: Double, step: Double) -> String {
@@ -881,31 +990,27 @@ func studioPreciseTimecode(_ seconds: Double) -> String {
     return String(format: "%02d:%04.1f", totalMinutes, remaining)
 }
 
-/// Frame around the zoom lane. It stays pinned to the viewport while the cue
-/// blocks scroll inside it, so the lane reads as a fixed track no matter how
-/// far the timeline is zoomed.
-/// Frame around the zoom lane. It stays pinned to the viewport while the cue
-/// blocks scroll inside it, so the lane reads as a fixed track no matter how
-/// far the timeline is zoomed.
-private struct StudioZoomLaneBackground: View {
-    /// An empty lane explains itself instead of reading as dead space.
-    var showsHint = false
+/// The flat, full-width ground a track sits on. It stays pinned to the
+/// viewport while the track's blocks scroll over it, so the row reads as a
+/// fixed track no matter how far the timeline is zoomed. An empty track
+/// names what it is for at its leading edge.
+private struct StudioTrackGround: View {
+    let hint: String?
 
     var body: some View {
-        RoundedRectangle(
-            cornerRadius: StudioZoomLaneMetrics.laneCornerRadius,
-            style: .continuous
-        )
-            .fill(Color.primary.opacity(0.055))
-            .overlay {
-                if showsHint {
-                    Label("Drag across this lane to add a zoom", systemImage: "plus.magnifyingglass")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                        .transition(AnyTransition(.blurReplace))
+        Rectangle()
+            .fill(Color.primary.opacity(0.04))
+            .overlay(alignment: .leading) {
+                if let hint {
+                    Text(hint)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.tertiaryLabel)
+                        .lineLimit(1)
+                        .padding(.leading, 10)
+                        .transition(.opacity)
                 }
             }
-            .motion(.morph, value: showsHint)
+            .animation(.easeOut(duration: 0.15), value: hint)
             .allowsHitTesting(false)
     }
 }
@@ -1063,10 +1168,8 @@ private struct StudioZoomLane: View {
 }
 
 private enum StudioZoomLaneMetrics {
-    static let laneHeight = StudioTimelineMetrics.zoomLaneHeight
-    static let laneInset: CGFloat = 4
+    static let laneHeight = StudioTrack.zooms.height
     static let blockCornerRadius: CGFloat = 7
-    static let laneCornerRadius = blockCornerRadius + laneInset
     static let blockInset: CGFloat = 4
     static let blockHeight = laneHeight - blockInset * 2
     static let handleWidth: CGFloat = 10
@@ -1405,29 +1508,6 @@ private extension ZoomAnchorMode {
 }
 
 // MARK: - Layout lane
-
-/// Frame around the layout lane, pinned to the viewport like the zoom lane's.
-private struct StudioLayoutLaneBackground: View {
-    var showsHint = false
-
-    var body: some View {
-        RoundedRectangle(
-            cornerRadius: StudioZoomLaneMetrics.laneCornerRadius,
-            style: .continuous
-        )
-            .fill(Color.primary.opacity(0.055))
-            .overlay {
-                if showsHint {
-                    Label("Drag across this lane to change the camera layout", systemImage: "rectangle.inset.bottomright.filled")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                        .transition(AnyTransition(.blurReplace))
-                }
-            }
-            .motion(.morph, value: showsHint)
-            .allowsHitTesting(false)
-    }
-}
 
 /// Camera layout cues. Dragging across empty lane creates one over the
 /// dragged range; a click scrubs, as on the zoom lane.
