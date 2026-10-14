@@ -46,6 +46,8 @@ private enum StudioInspectorContent: Hashable {
     case layout(UUID)
     case text(UUID)
     case redaction(UUID)
+    case image(UUID)
+    case audio(UUID)
 }
 
 struct StudioInspector: View {
@@ -80,6 +82,14 @@ struct StudioInspector: View {
                 case .redaction:
                     if let redaction = model.selectedRedaction {
                         selectedRedactionPage(for: redaction)
+                    }
+                case .image:
+                    if let image = model.selectedImage {
+                        selectedImagePage(for: image)
+                    }
+                case .audio:
+                    if let clip = model.selectedAudioClip {
+                        selectedAudioPage(for: clip)
                     }
                 }
             }
@@ -126,6 +136,8 @@ struct StudioInspector: View {
         if let cue = model.selectedLayoutCue { return .layout(cue.id) }
         if let text = model.selectedText { return .text(text.id) }
         if let redaction = model.selectedRedaction { return .redaction(redaction.id) }
+        if let image = model.selectedImage { return .image(image.id) }
+        if let clip = model.selectedAudioClip { return .audio(clip.id) }
         if let page, availablePages.contains(page) { return .page(page) }
         return .look
     }
@@ -623,6 +635,44 @@ struct StudioInspector: View {
 
             pageBody {
                 StudioRedactionInspectorControls(model: model, redaction: redaction)
+            }
+        }
+    }
+
+    private func selectedImagePage(for image: RecordingImageOverlay) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            pageHeader(
+                image.isAnimated ? "GIF" : "Image",
+                systemImage: image.isAnimated ? "photo.stack" : "photo",
+                backTitle: page?.title ?? "Look",
+                onBack: { model.selectedImageID = nil }
+            ) {
+                InspectorIconButton(systemName: "trash", help: "Remove Image") {
+                    withAnimation(.morphIfAllowed) { model.removeImage(id: image.id) }
+                }
+            }
+
+            pageBody {
+                StudioImageInspectorControls(model: model, image: image)
+            }
+        }
+    }
+
+    private func selectedAudioPage(for clip: RecordingAudioClip) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            pageHeader(
+                clip.displayName,
+                systemImage: "music.note",
+                backTitle: page?.title ?? "Look",
+                onBack: { model.selectedAudioClipID = nil }
+            ) {
+                InspectorIconButton(systemName: "trash", help: "Remove Audio") {
+                    withAnimation(.morphIfAllowed) { model.removeAudioClip(id: clip.id) }
+                }
+            }
+
+            pageBody {
+                StudioAudioClipInspectorControls(model: model, clip: clip)
             }
         }
     }

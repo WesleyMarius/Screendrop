@@ -121,6 +121,10 @@ private struct RecordingStudioContent: View {
             withAnimation(.morphIfAllowed) {
                 if let textID = model.selectedTextID {
                     model.removeText(id: textID)
+                } else if let imageID = model.selectedImageID {
+                    model.removeImage(id: imageID)
+                } else if let audioClipID = model.selectedAudioClipID {
+                    model.removeAudioClip(id: audioClipID)
                 } else if let redactionID = model.selectedRedactionID {
                     model.removeRedaction(id: redactionID)
                 } else if let selectedCueID = model.selectedCueID {
@@ -573,12 +577,14 @@ private struct StudioCanvasComposition: View {
                     .opacity(layout.cameraOpacity)
                 }
 
-                // Text sits on the canvas above the camera and under the
-                // subtitles, as in the export.
+                // Images and text sit on the canvas above the camera and
+                // under the subtitles, as in the export.
                 if !isEditingVideoCrop {
                     let texts = model.texts(atEditorTime: model.displayTime)
-                    if !texts.isEmpty {
-                        StudioTextOverlayCanvas(
+                    let images = overlayImages
+                    if !texts.isEmpty || !images.isEmpty {
+                        StudioCanvasOverlayLayer(
+                            images: images,
                             texts: texts,
                             sourceTime: model.sourceTime(atEditorTime: model.displayTime),
                             canvasSize: canvasSize
@@ -617,6 +623,10 @@ private struct StudioCanvasComposition: View {
                                 canvasSize: canvasSize
                             )
                         }
+                    }
+                    let images = model.images(atEditorTime: model.displayTime)
+                    if !images.isEmpty {
+                        StudioImageEditingLayer(model: model, images: images, canvasSize: canvasSize)
                     }
                     let texts = model.texts(atEditorTime: model.displayTime)
                     if !texts.isEmpty {
@@ -734,6 +744,17 @@ private struct StudioCanvasComposition: View {
                 y: min(canvasSize.width, canvasSize.height) * 0.016 * model.style.shadow
             )
             .position(x: layout.cardRect.midX, y: layout.cardRect.midY)
+    }
+
+    /// The showing images whose files have been decoded. Reading the
+    /// revision redraws the canvas as decoding finishes.
+    private var overlayImages: [(overlay: RecordingImageOverlay, image: RecordingOverlayImage)] {
+        _ = model.overlayImageRevision
+        return model.images(atEditorTime: model.displayTime).compactMap { overlay in
+            guard let url = model.overlayImageURL(for: overlay),
+                  let image = model.overlayImages.cachedImage(at: url) else { return nil }
+            return (overlay, image)
+        }
     }
 
     /// The selected zoom, shown as a target on the paused canvas.

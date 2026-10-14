@@ -55,6 +55,9 @@ enum Palette {
     /// that move the camera; both carry white marks.
     static let textCue = Color(nsColor: .systemPurple)
     static let effectCue = Color(nsColor: .systemGray)
+    /// Images and GIFs, and audio clips, on the timeline.
+    static let imageCue = Color(nsColor: .systemTeal)
+    static let audioCue = Color(nsColor: .systemIndigo)
     /// Recording, and actions that remove something.
     static let record = Color(nsColor: .systemRed)
     static let success = Color(nsColor: .systemGreen)

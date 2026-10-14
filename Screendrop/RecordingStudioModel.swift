@@ -210,6 +210,22 @@ final class RecordingStudioModel {
     var selectedRedactionID: UUID?
     /// What the screen player's composition filters each frame through.
     let redactionPreview = RecordingRedactionPreviewSource()
+    /// Images and GIFs over the canvas, on the source clock, drawn above
+    /// the camera and below text.
+    private(set) var imageOverlays: [RecordingImageOverlay] = []
+    var selectedImageID: UUID?
+    /// Music and sound under the video, on the edited video's clock.
+    private(set) var audioClips: [RecordingAudioClip] = []
+    var selectedAudioClipID: UUID?
+    /// Decoded overlay images, shared with the canvas.
+    let overlayImages = RecordingOverlayImageStore()
+    /// Moves on when an overlay image finishes decoding, so the canvas
+    /// draws it.
+    private(set) var overlayImageRevision = 0
+    /// Waveform outlines of the audio files, by file name.
+    private(set) var audioPeaks: [String: [Float]] = [:]
+    /// Why the last media import was turned down, if it was.
+    var mediaImportError: String?
     private(set) var clipTimeline = RecordingClipTimeline(segments: []) {
         didSet {
             if clipTimeline != oldValue {
@@ -259,8 +275,15 @@ final class RecordingStudioModel {
 
     private func updatePlaybackVolume() {
         guard let item = screenPlayer.currentItem else { return }
-        item.audioMix = RecordingAudioGain.makeMix(
-            tracks: item.asset.tracks(withMediaType: .audio), volume: Double(audioVolume)
+        // The recording's gain applies to its own tracks; added audio
+        // carries its own volume and fades.
+        let clipTrackIDs = Set(playbackClipTrackIDs.values)
+        let recordingTracks = item.asset.tracks(withMediaType: .audio).filter { !clipTrackIDs.contains($0.trackID) }
+        item.audioMix = RecordingAudioClipMixer.mix(
+            recordingTracks: recordingTracks,
+            recordingVolume: Double(audioVolume),
+            clips: audioClips,
+            trackIDs: playbackClipTrackIDs
         )
     }
 
@@ -303,6 +326,17 @@ final class RecordingStudioModel {
     /// sweep or a run of typing undoes as one step.
     private var textCoalesceTask: Task<Void, Never>?
     private var redactionCoalesceTask: Task<Void, Never>?
+    private var imageEditSnapshot: [RecordingImageOverlay]?
+    private var audioEditSnapshot: [RecordingAudioClip]?
+    private var imageCoalesceTask: Task<Void, Never>?
+    private var audioCoalesceTask: Task<Void, Never>?
+    /// Each audio file's track, resolved once so the player item can be
+    /// rebuilt synchronously.
+    private var audioTracksByFile: [String: RecordingAudioFileTrack] = [:]
+    /// The playback composition's track for each audio clip.
+    private var playbackClipTrackIDs: [UUID: CMPersistentTrackID] = [:]
+    private var audioPlaybackRebuildTask: Task<Void, Never>?
+    private var mediaLoadTask: Task<Void, Never>?
     /// The document as of the last explicit save. Everything the user does
     /// after that lives in memory and in the autosaved draft until they save
     /// again, which is what makes the close prompt meaningful.
@@ -519,6 +553,9 @@ final class RecordingStudioModel {
         cameraLayoutCues = (document.cameraLayoutCues ?? []).sorted { $0.start < $1.start }
         textOverlays = document.textOverlays ?? []
         redactions = document.redactions ?? []
+        imageOverlays = document.imageOverlays ?? []
+        audioClips = document.audioClips ?? []
+        loadOverlayMedia()
         redactionPreview.update(redactions: redactions, clipTimeline: clipTimeline)
         // A project that never chose its own settings inherits whatever
         // was picked last, so "export as MP4" sticks across recordings.
@@ -593,6 +630,12 @@ final class RecordingStudioModel {
         redactionRefreshTask = nil
         textCoalesceTask?.cancel()
         redactionCoalesceTask?.cancel()
+        imageCoalesceTask?.cancel()
+        audioCoalesceTask?.cancel()
+        audioPlaybackRebuildTask?.cancel()
+        mediaLoadTask?.cancel()
+        imageEditSnapshot = nil
+        audioEditSnapshot = nil
         lastSavedDocument = nil
         pointerCapture = PointerCaptureFile()
         pointerTimeline = .empty
@@ -605,6 +648,10 @@ final class RecordingStudioModel {
         cameraLayoutCues.removeAll()
         textOverlays.removeAll()
         redactions.removeAll()
+        imageOverlays.removeAll()
+        audioClips.removeAll()
+        audioTracksByFile.removeAll()
+        overlayImages.removeAll()
         subtitleCues.removeAll()
         transcriptWords.removeAll()
         subtitleTimeline = .empty
@@ -763,29 +810,20 @@ final class RecordingStudioModel {
 
     func selectClip(id: UUID) {
         guard clipTimeline.segments.contains(where: { $0.id == id }) else { return }
+        clearTimelineSelection()
         selectedClipID = id
-        selectedCueID = nil
-        selectedLayoutCueID = nil
-        selectedTextID = nil
-        selectedRedactionID = nil
     }
 
     func selectZoomCue(id: UUID) {
         guard zoomCues.contains(where: { $0.id == id }) else { return }
+        clearTimelineSelection()
         selectedCueID = id
-        selectedClipID = nil
-        selectedLayoutCueID = nil
-        selectedTextID = nil
-        selectedRedactionID = nil
     }
 
     func selectLayoutCue(id: UUID) {
         guard cameraLayoutCues.contains(where: { $0.id == id }) else { return }
+        clearTimelineSelection()
         selectedLayoutCueID = id
-        selectedCueID = nil
-        selectedClipID = nil
-        selectedTextID = nil
-        selectedRedactionID = nil
     }
 
     /// Lets go of whatever is selected on the timeline, like clicking
@@ -796,6 +834,8 @@ final class RecordingStudioModel {
         selectedLayoutCueID = nil
         selectedTextID = nil
         selectedRedactionID = nil
+        selectedImageID = nil
+        selectedAudioClipID = nil
     }
 
     func undo() {
@@ -949,12 +989,14 @@ final class RecordingStudioModel {
             )
         }
 
-        let item = AVPlayerItem(asset: playbackAsset)
+        // Added music sits on its own tracks beside the recording's audio.
+        let composedAsset = try addingAudioClips(to: playbackAsset)
+        let item = AVPlayerItem(asset: composedAsset)
         // Regions are filtered into the picture before the card draws it,
         // so the preview's zoom and crop carry them exactly as the export's.
         redactionPreview.update(redactions: redactions, clipTimeline: clipTimeline)
         if !redactions.isEmpty {
-            item.videoComposition = redactionPreview.makeVideoComposition(for: playbackAsset)
+            item.videoComposition = redactionPreview.makeVideoComposition(for: composedAsset)
         }
         screenPlayer.replaceCurrentItem(with: item)
         updatePlaybackVolume()
@@ -1146,11 +1188,8 @@ final class RecordingStudioModel {
         var cues = zoomCues
         cues.append(cue)
         applyZoomCues(cues, actionName: "Add Zoom")
+        clearTimelineSelection()
         selectedCueID = cue.id
-        selectedClipID = nil
-        selectedLayoutCueID = nil
-        selectedTextID = nil
-        selectedRedactionID = nil
     }
 
     func removeZoomCue(id: UUID) {
@@ -1663,6 +1702,369 @@ final class RecordingStudioModel {
         }
     }
 
+    // MARK: - Media
+
+    /// Where imported images and audio are copied; nil for a bare movie,
+    /// which has no project folder to keep them in.
+    var mediaDirectoryURL: URL? {
+        session?.directoryURL.appendingPathComponent("media", isDirectory: true)
+    }
+
+    var canImportMedia: Bool { mediaDirectoryURL != nil && isLoaded }
+
+    /// Copies picked images, GIFs and audio into the project and places
+    /// them from `time`: images on the Images & Effects track, audio on the
+    /// Audio track, several of a kind one after another.
+    func importMedia(_ urls: [URL], atEditorTime time: TimeInterval) {
+        guard let directory = mediaDirectoryURL else { return }
+        mediaImportError = nil
+        Task { [weak self] in
+            var imageTime = time
+            var audioTime = time
+            var rejected: [String] = []
+            for url in urls {
+                guard let self, !self.isTornDown else { return }
+                if RecordingOverlayImage.canImport(url) {
+                    if let placed = await self.importImage(url, into: directory, atEditorTime: imageTime) {
+                        imageTime = placed
+                    } else {
+                        rejected.append(url.lastPathComponent)
+                    }
+                } else if RecordingAudioClip.canImport(url) {
+                    if let placed = await self.importAudio(url, into: directory, atEditorTime: audioTime) {
+                        audioTime = placed
+                    } else {
+                        rejected.append(url.lastPathComponent)
+                    }
+                } else {
+                    rejected.append(url.lastPathComponent)
+                }
+            }
+            if !rejected.isEmpty {
+                self?.mediaImportError = "Couldn't add \(rejected.joined(separator: ", ")). Images, GIFs and audio files can be added."
+            }
+        }
+    }
+
+    private func copyIntoProject(_ url: URL, directory: URL) -> String? {
+        let fileName = UUID().uuidString + (url.pathExtension.isEmpty ? "" : ".\(url.pathExtension.lowercased())")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            try FileManager.default.copyItem(at: url, to: directory.appendingPathComponent(fileName))
+            return fileName
+        } catch {
+            return nil
+        }
+    }
+
+    /// Adds one image at an editor time. Returns where the next one goes.
+    private func importImage(_ url: URL, into directory: URL, atEditorTime time: TimeInterval) async -> TimeInterval? {
+        guard let fileName = copyIntoProject(url, directory: directory) else { return nil }
+        let storedURL = directory.appendingPathComponent(fileName)
+        let store = overlayImages
+        let decoded = await Task.detached(priority: .userInitiated) { store.image(at: storedURL) }.value
+        guard let decoded, !isTornDown,
+              let range = sourceRange(startingAt: time, length: RecordingImageOverlay.defaultDuration,
+                                      minimum: RecordingImageOverlay.minimumDuration) else {
+            try? FileManager.default.removeItem(at: storedURL)
+            return nil
+        }
+        var overlay = RecordingImageOverlay(
+            fileName: fileName,
+            displayName: url.deletingPathExtension().lastPathComponent,
+            start: range.lowerBound,
+            end: range.upperBound
+        )
+        overlay.aspect = decoded.aspect
+        overlay.isAnimated = decoded.isAnimated
+        // At most 40% of the canvas wide and half of it tall.
+        let canvas = basePreviewCanvasSize
+        let heightLimitedWidth = canvas.width > 0 ? 0.5 * canvas.height * decoded.aspect / canvas.width : 0.4
+        overlay.width = min(0.4, heightLimitedWidth)
+        overlayImageRevision &+= 1
+        applyImages(imageOverlays + [overlay], actionName: "Add Image")
+        selectImage(id: overlay.id)
+        return clipTimeline.editorTime(forSourceTime: range.upperBound) ?? time + RecordingImageOverlay.defaultDuration
+    }
+
+    /// Adds one audio file at an editor time. Returns where the next one goes.
+    private func importAudio(_ url: URL, into directory: URL, atEditorTime time: TimeInterval) async -> TimeInterval? {
+        guard let fileName = copyIntoProject(url, directory: directory) else { return nil }
+        let storedURL = directory.appendingPathComponent(fileName)
+        guard let file = await RecordingAudioFileTrack.load(url: storedURL),
+              let fileDuration = try? await file.asset.load(.duration).seconds,
+              fileDuration.isFinite, fileDuration >= RecordingAudioClip.minimumDuration, !isTornDown else {
+            try? FileManager.default.removeItem(at: storedURL)
+            return nil
+        }
+        audioTracksByFile[fileName] = file
+        loadPeaks(for: fileName, url: storedURL)
+        // A file dropped right at the end starts from the top instead of
+        // landing past everything.
+        let start = time > duration - 0.5 ? 0 : max(0, time)
+        var clip = RecordingAudioClip(
+            fileName: fileName,
+            displayName: url.deletingPathExtension().lastPathComponent,
+            start: start,
+            fileDuration: fileDuration
+        )
+        clip.trimEnd = min(fileDuration, max(RecordingAudioClip.minimumDuration, duration - start))
+        applyAudioClips(audioClips + [clip], actionName: "Add Audio")
+        selectAudioClip(id: clip.id)
+        return clip.end
+    }
+
+    private func loadPeaks(for fileName: String, url: URL) {
+        guard audioPeaks[fileName] == nil else { return }
+        Task { [weak self] in
+            let peaks = await Task.detached(priority: .utility) { await RecordingAudioPeaks.load(url: url) }.value
+            self?.audioPeaks[fileName] = peaks
+        }
+    }
+
+    /// Decodes a project's overlay images and resolves its audio files in
+    /// the background after it opens; the canvas and player pick them up as
+    /// they arrive.
+    private func loadOverlayMedia() {
+        mediaLoadTask?.cancel()
+        guard let directory = mediaDirectoryURL, !imageOverlays.isEmpty || !audioClips.isEmpty else { return }
+        let imageFiles = Set(imageOverlays.map(\.fileName))
+        let audioFiles = Set(audioClips.map(\.fileName)).subtracting(audioTracksByFile.keys)
+        let store = overlayImages
+        mediaLoadTask = Task { [weak self] in
+            await Task.detached(priority: .userInitiated) {
+                for name in imageFiles {
+                    _ = store.image(at: directory.appendingPathComponent(name))
+                }
+            }.value
+            guard let self, !Task.isCancelled else { return }
+            self.overlayImageRevision &+= 1
+            var resolvedAny = false
+            for name in audioFiles {
+                let url = directory.appendingPathComponent(name)
+                if let file = await RecordingAudioFileTrack.load(url: url) {
+                    guard !Task.isCancelled else { return }
+                    self.audioTracksByFile[name] = file
+                    resolvedAny = true
+                }
+                self.loadPeaks(for: name, url: url)
+            }
+            if resolvedAny, self.isLoaded {
+                try? self.rebuildScreenPlayerItem(preserving: self.currentTime)
+            }
+        }
+    }
+
+    /// The playback asset with every resolved audio clip on its own track.
+    private func addingAudioClips(to asset: AVAsset) throws -> AVAsset {
+        playbackClipTrackIDs = [:]
+        let sources = audioClips.compactMap { clip in
+            audioTracksByFile[clip.fileName].map { RecordingAudioClipSource(clip: clip, file: $0) }
+        }
+        guard !sources.isEmpty else { return asset }
+        let composition: AVMutableComposition
+        if let existing = asset as? AVMutableComposition {
+            composition = existing
+        } else {
+            // The unedited recording plays as-is; music needs a composition
+            // to sit in.
+            composition = AVMutableComposition()
+            try composition.insertTimeRange(
+                CMTimeRange(start: .zero, duration: CMTime(seconds: sourceDuration, preferredTimescale: 600)),
+                of: asset,
+                at: .zero
+            )
+        }
+        playbackClipTrackIDs = RecordingAudioClipMixer.insert(sources, into: composition, videoDuration: duration)
+        return composition
+    }
+
+    // MARK: - Images
+
+    var selectedImage: RecordingImageOverlay? {
+        imageOverlays.first { $0.id == selectedImageID }
+    }
+
+    var imageTimelineBlocks: [RecordingOverlayTimelineBlock<RecordingImageOverlay>] {
+        RecordingOverlayTimelineBlock.blocks(for: imageOverlays, clipTimeline: clipTimeline) {
+            ($0.start, $0.end)
+        }
+    }
+
+    /// The images showing at an editor time, bottom to top.
+    func images(atEditorTime time: TimeInterval) -> [RecordingImageOverlay] {
+        guard !imageOverlays.isEmpty, clipTimeline.location(at: time) != nil else { return [] }
+        let sourceTime = clipTimeline.sourceTime(at: time)
+        return imageOverlays.filter { $0.isActive(atSourceTime: sourceTime) }
+    }
+
+    func overlayImageURL(for overlay: RecordingImageOverlay) -> URL? {
+        mediaDirectoryURL?.appendingPathComponent(overlay.fileName)
+    }
+
+    func selectImage(id: UUID) {
+        guard imageOverlays.contains(where: { $0.id == id }) else { return }
+        clearTimelineSelection()
+        selectedImageID = id
+    }
+
+    func removeImage(id: UUID) {
+        applyImages(imageOverlays.filter { $0.id != id }, actionName: "Remove Image")
+        if selectedImageID == id { selectedImageID = nil }
+    }
+
+    func beginImageEdit() {
+        if imageEditSnapshot == nil { imageEditSnapshot = imageOverlays }
+    }
+
+    func endImageEdit(actionName: String = "Edit Image") {
+        guard let previous = imageEditSnapshot else { return }
+        imageEditSnapshot = nil
+        guard previous != imageOverlays else { return }
+        registerUndo(actionName) { target in
+            target.applyImages(previous, actionName: actionName)
+        }
+    }
+
+    func setImage(_ overlay: RecordingImageOverlay) {
+        guard let index = imageOverlays.firstIndex(where: { $0.id == overlay.id }) else { return }
+        var updated = overlay
+        let range = clampedSourceRange(start: overlay.start, end: overlay.end, minimum: RecordingImageOverlay.minimumDuration)
+        updated.start = range.lowerBound
+        updated.end = range.upperBound
+        updated.width = min(max(updated.width, RecordingImageOverlay.widthRange.lowerBound),
+                            RecordingImageOverlay.widthRange.upperBound)
+        updated.center = CGPoint(x: min(max(updated.center.x, 0), 1), y: min(max(updated.center.y, 0), 1))
+        updated.opacity = min(max(updated.opacity, 0), 1)
+        var all = imageOverlays
+        all[index] = updated
+        imageOverlays = all
+        scheduleProjectSave()
+    }
+
+    func editImage(_ overlay: RecordingImageOverlay, actionName: String) {
+        beginImageEdit()
+        setImage(overlay)
+        imageCoalesceTask?.cancel()
+        imageCoalesceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            self?.endImageEdit(actionName: actionName)
+        }
+    }
+
+    private func applyImages(_ all: [RecordingImageOverlay], actionName: String) {
+        guard all != imageOverlays else { return }
+        let previous = imageOverlays
+        registerUndo(actionName) { target in
+            target.applyImages(previous, actionName: actionName)
+        }
+        imageOverlays = all
+        scheduleProjectSave()
+        if let selectedImageID, !all.contains(where: { $0.id == selectedImageID }) {
+            self.selectedImageID = nil
+        }
+    }
+
+    // MARK: - Audio
+
+    var selectedAudioClip: RecordingAudioClip? {
+        audioClips.first { $0.id == selectedAudioClipID }
+    }
+
+    func selectAudioClip(id: UUID) {
+        guard audioClips.contains(where: { $0.id == id }) else { return }
+        clearTimelineSelection()
+        selectedAudioClipID = id
+    }
+
+    func removeAudioClip(id: UUID) {
+        applyAudioClips(audioClips.filter { $0.id != id }, actionName: "Remove Audio")
+        if selectedAudioClipID == id { selectedAudioClipID = nil }
+    }
+
+    func beginAudioClipEdit() {
+        if audioEditSnapshot == nil { audioEditSnapshot = audioClips }
+    }
+
+    func endAudioClipEdit(actionName: String = "Edit Audio") {
+        guard let previous = audioEditSnapshot else { return }
+        audioEditSnapshot = nil
+        guard previous != audioClips else { return }
+        registerUndo(actionName) { target in
+            target.applyAudioClips(previous, actionName: actionName)
+        }
+    }
+
+    /// Applies an edited clip, keeping its trim inside the file.
+    func setAudioClip(_ clip: RecordingAudioClip) {
+        guard let index = audioClips.firstIndex(where: { $0.id == clip.id }) else { return }
+        var updated = clip
+        let minimum = RecordingAudioClip.minimumDuration
+        updated.trimStart = min(max(0, updated.trimStart), max(0, updated.fileDuration - minimum))
+        updated.trimEnd = min(max(updated.trimEnd, updated.trimStart + minimum), updated.fileDuration)
+        updated.start = max(0, updated.start)
+        updated.volume = min(max(updated.volume, 0), 1)
+        var all = audioClips
+        all[index] = updated
+        replaceAudioClips(all)
+    }
+
+    func editAudioClip(_ clip: RecordingAudioClip, actionName: String) {
+        beginAudioClipEdit()
+        setAudioClip(clip)
+        audioCoalesceTask?.cancel()
+        audioCoalesceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            self?.endAudioClipEdit(actionName: actionName)
+        }
+    }
+
+    private func replaceAudioClips(_ all: [RecordingAudioClip]) {
+        let previous = audioClips
+        audioClips = all
+        scheduleProjectSave()
+        // Volume and fades only change the mix; anything that moves audio
+        // in time needs the composition rebuilt.
+        let placement: (RecordingAudioClip) -> [Double] = { [$0.start, $0.trimStart, $0.trimEnd] }
+        let movedAudio = previous.map(\.id) != all.map(\.id)
+            || zip(previous, all).contains { placement($0) != placement($1) || $0.fileName != $1.fileName }
+        if movedAudio {
+            scheduleAudioPlaybackRebuild()
+        } else {
+            updatePlaybackVolume()
+        }
+    }
+
+    /// A drag reports many moves; the player item is rebuilt once they
+    /// settle.
+    private func scheduleAudioPlaybackRebuild() {
+        audioPlaybackRebuildTask?.cancel()
+        audioPlaybackRebuildTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard let self, !Task.isCancelled, self.isLoaded else { return }
+            let wasPlaying = self.isPlaying
+            self.pause()
+            try? self.rebuildScreenPlayerItem(preserving: self.currentTime)
+            if wasPlaying { self.play() }
+        }
+    }
+
+    private func applyAudioClips(_ all: [RecordingAudioClip], actionName: String) {
+        guard all != audioClips else { return }
+        let previous = audioClips
+        registerUndo(actionName) { target in
+            target.applyAudioClips(previous, actionName: actionName)
+        }
+        replaceAudioClips(all)
+        if let selectedAudioClipID, !all.contains(where: { $0.id == selectedAudioClipID }) {
+            self.selectedAudioClipID = nil
+        }
+    }
+
     // MARK: - Overlay ranges
 
     /// A source range `length` long from the recording moment under an
@@ -1779,6 +2181,8 @@ final class RecordingStudioModel {
             cameraLayoutCues: cameraLayoutCues.isEmpty ? nil : cameraLayoutCues,
             textOverlays: textOverlays.isEmpty ? nil : textOverlays,
             redactions: redactions.isEmpty ? nil : redactions,
+            imageOverlays: imageOverlays.isEmpty ? nil : imageOverlays,
+            audioClips: audioClips.isEmpty ? nil : audioClips,
             clipTimeline: clipTimeline,
             exportSettings: exportSettings,
             showsClickEffects: showsClickEffects,
@@ -2440,7 +2844,10 @@ final class RecordingStudioModel {
             usesUniformPadding: exportAspect == .original,
             motionTimeline: makeMotionTimeline(reframe: reframe),
             textOverlays: textOverlays,
-            redactions: redactions
+            redactions: redactions,
+            imageOverlays: imageOverlays,
+            audioClips: audioClips,
+            mediaDirectory: mediaDirectoryURL
         )
     }
 

@@ -80,6 +80,12 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         var textOverlays: [RecordingTextOverlay] = []
         /// Regions of the recorded picture to pixelate or blur.
         var redactions: [RecordingRedaction] = []
+        /// Images and GIFs over the canvas, on the source clock.
+        var imageOverlays: [RecordingImageOverlay] = []
+        /// Music and sound under the video, on the edited clock.
+        var audioClips: [RecordingAudioClip] = []
+        /// The project's media folder, holding both kinds' files.
+        var mediaDirectory: URL?
 
         init(
             screenURL: URL,
@@ -109,7 +115,10 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             usesUniformPadding: Bool = false,
             motionTimeline: RecordingStudioMotionTimeline = .none,
             textOverlays: [RecordingTextOverlay] = [],
-            redactions: [RecordingRedaction] = []
+            redactions: [RecordingRedaction] = [],
+            imageOverlays: [RecordingImageOverlay] = [],
+            audioClips: [RecordingAudioClip] = [],
+            mediaDirectory: URL? = nil
         ) {
             self.screenURL = screenURL
             self.cameraURL = cameraURL
@@ -139,6 +148,9 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             self.motionTimeline = motionTimeline
             self.textOverlays = textOverlays
             self.redactions = redactions
+            self.imageOverlays = imageOverlays
+            self.audioClips = audioClips
+            self.mediaDirectory = mediaDirectory
         }
     }
 
@@ -247,8 +259,32 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         // while the screen reader stays on the composed video.
         var audioOutput: AVAssetReaderAudioMixOutput?
         var replacementReader: AVAssetReader?
+        // Held for the whole export: the clips' tracks need their assets
+        // alive while the audio is read.
+        var clipSources: [RecordingAudioClipSource] = []
         if !configuration.exportSettings.removeAudio {
-            if let replacementURL = configuration.audioReplacementURL {
+            if let directory = configuration.mediaDirectory {
+                for clip in configuration.audioClips {
+                    if let source = await RecordingAudioClipSource.load(clip, in: directory) {
+                        clipSources.append(source)
+                    }
+                }
+            }
+            // Added audio mixes with the soundtrack on a reader of its own,
+            // over a composition of the cut's audio and each clip.
+            let mixed: (reader: AVAssetReader, output: AVAssetReaderAudioMixOutput)? = clipSources.isEmpty
+                ? nil
+                : try await Self.makeMixedAudio(
+                    recordingTracks: audioTracks,
+                    replacementURL: configuration.audioReplacementURL,
+                    clips: clipSources,
+                    timeRange: exportTimeRange,
+                    volume: configuration.audioVolume
+                )
+            if let mixed {
+                replacementReader = mixed.reader
+                audioOutput = mixed.output
+            } else if let replacementURL = configuration.audioReplacementURL {
                 let replacementAsset = AVURLAsset(url: replacementURL)
                 let replacementTracks = try await replacementAsset.loadTracks(withMediaType: .audio)
                 if !replacementTracks.isEmpty {
@@ -377,7 +413,9 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             fitContentAspect: configuration.fitContentAspect,
             usesUniformPadding: configuration.usesUniformPadding,
             motionTimeline: configuration.motionTimeline,
-            textOverlays: configuration.textOverlays
+            textOverlays: configuration.textOverlays,
+            imageOverlays: configuration.imageOverlays,
+            mediaDirectory: configuration.mediaDirectory
         )
 
         // A cutout's mattes are made ahead of the frames that show them, on
@@ -432,6 +470,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
 
         cameraFeed?.cancel()
         cutoutMattes?.cancel()
+        withExtendedLifetime(clipSources) {}
 
         await withCheckedContinuation { continuation in
             writer.finishWriting {
@@ -573,6 +612,54 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             try await finishAndAppend(previous.frame, at: previous.index)
         }
         input.markAsFinished()
+    }
+
+    /// The finished video's audio: the recording's cut audio (or the
+    /// imported soundtrack standing in for it) at the project's volume,
+    /// plus every added clip with its own volume and fades.
+    private static func makeMixedAudio(
+        recordingTracks: [AVAssetTrack],
+        replacementURL: URL?,
+        clips: [RecordingAudioClipSource],
+        timeRange: CMTimeRange,
+        volume: Double
+    ) async throws -> (reader: AVAssetReader, output: AVAssetReaderAudioMixOutput)? {
+        let composition = AVMutableComposition()
+        var recordingTrackIDs: [CMPersistentTrackID] = []
+        if let replacementURL {
+            let replacement = AVURLAsset(url: replacementURL)
+            if let track = try await replacement.loadTracks(withMediaType: .audio).first {
+                let length = min(try await replacement.load(.duration), timeRange.duration)
+                if let added = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
+                    try added.insertTimeRange(CMTimeRange(start: .zero, duration: length), of: track, at: .zero)
+                    recordingTrackIDs.append(added.trackID)
+                }
+            }
+        } else {
+            for track in recordingTracks {
+                guard let added = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
+                let available = try await track.load(.timeRange)
+                let range = CMTimeRangeGetIntersection(timeRange, otherRange: available)
+                guard range.duration > .zero else { continue }
+                try added.insertTimeRange(range, of: track, at: range.start)
+                recordingTrackIDs.append(added.trackID)
+            }
+        }
+        let clipTrackIDs = RecordingAudioClipMixer.insert(clips, into: composition, videoDuration: timeRange.duration.seconds)
+        let tracks = composition.tracks(withMediaType: .audio)
+        guard !tracks.isEmpty else { return nil }
+        let reader = try AVAssetReader(asset: composition)
+        reader.timeRange = timeRange
+        let output = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: nil)
+        output.audioMix = RecordingAudioClipMixer.mix(
+            recordingTracks: tracks.filter { recordingTrackIDs.contains($0.trackID) },
+            recordingVolume: volume,
+            clips: clips.map(\.clip),
+            trackIDs: clipTrackIDs
+        )
+        output.alwaysCopiesSampleData = false
+        reader.add(output)
+        return (reader, output)
     }
 
     private func pumpAudio(
@@ -808,6 +895,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let reframe: ReframeTrack?
     private let motionTimeline: RecordingStudioMotionTimeline
     private let textOverlays: [RecordingTextOverlay]
+    private let imageOverlays: [RecordingImageOverlay]
+    private let mediaDirectory: URL?
+    private let overlayImages = RecordingOverlayImageStore()
     private var artworkImageCache: [String: CGImage] = [:]
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
@@ -853,10 +943,14 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         fitContentAspect: CGFloat? = nil,
         usesUniformPadding: Bool = false,
         motionTimeline: RecordingStudioMotionTimeline = .none,
-        textOverlays: [RecordingTextOverlay] = []
+        textOverlays: [RecordingTextOverlay] = [],
+        imageOverlays: [RecordingImageOverlay] = [],
+        mediaDirectory: URL? = nil
     ) {
         self.canvasSize = canvasSize
         self.textOverlays = textOverlays
+        self.imageOverlays = mediaDirectory == nil ? [] : imageOverlays
+        self.mediaDirectory = mediaDirectory
         self.videoCropRect = RecordingVideoCropGeometry.normalized(videoCropRect)
         self.style = style
         let baseLayout = RecordingStudioLayout.make(
@@ -1000,7 +1094,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         guard !bypassFrameCache, settled != nil, sampleRects.count <= 1 else { return nil }
         // Text animates on its own clock, so a frame showing any is drawn
         // fresh rather than matched against the last one.
-        guard !textOverlays.contains(where: { $0.isActive(atSourceTime: sourceTime) }) else { return nil }
+        guard !textOverlays.contains(where: { $0.isActive(atSourceTime: sourceTime) }),
+              !imageOverlays.contains(where: { $0.isActive(atSourceTime: sourceTime) }) else { return nil }
         let showsScreen = layout.screenOpacity > 0.001
         let showsCamera = layout.cameraOpacity > 0.001 && layout.bubbleRect.width > 0
         let subtitle = subtitleTimeline?.text(at: sourceTime)
@@ -1279,12 +1374,28 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             }
         }
 
-        // Text sits on the canvas above the camera, under the subtitles.
+        // Images, then text, sit on the canvas above the camera and under
+        // the subtitles.
+        drawImageOverlays(at: sourceTime, in: context)
         drawTextOverlays(at: sourceTime, in: context)
 
         // The subtitle bar lives in canvas space - over the background too,
         // not just the card - and above everything else, camera included.
         drawSubtitleBar(at: sourceTime, in: context)
+    }
+
+    private func drawImageOverlays(at sourceTime: TimeInterval, in context: CGContext) {
+        guard let mediaDirectory else { return }
+        let active = imageOverlays.filter { $0.isActive(atSourceTime: sourceTime) }
+        guard !active.isEmpty else { return }
+        context.saveGState()
+        context.translateBy(x: 0, y: canvasSize.height)
+        context.scaleBy(x: 1, y: -1)
+        for overlay in active {
+            guard let image = overlayImages.image(at: mediaDirectory.appendingPathComponent(overlay.fileName)) else { continue }
+            RecordingImageOverlayRenderer.draw(overlay, image: image, atSourceTime: sourceTime, canvasSize: canvasSize, in: context)
+        }
+        context.restoreGState()
     }
 
     private func drawTextOverlays(at sourceTime: TimeInterval, in context: CGContext) {

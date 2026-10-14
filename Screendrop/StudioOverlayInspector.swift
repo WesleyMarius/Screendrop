@@ -486,3 +486,178 @@ struct StudioRedactionInspectorControls: View {
         )
     }
 }
+
+// MARK: - Image
+
+struct StudioImageInspectorControls: View {
+    @Bindable var model: RecordingStudioModel
+    let image: RecordingImageOverlay
+
+    private static let spots: [(title: String, point: CGPoint)] = [
+        ("Top Left", CGPoint(x: 0.15, y: 0.15)),
+        ("Top Right", CGPoint(x: 0.85, y: 0.15)),
+        ("Center", CGPoint(x: 0.5, y: 0.5)),
+        ("Bottom Left", CGPoint(x: 0.15, y: 0.85)),
+        ("Bottom Right", CGPoint(x: 0.85, y: 0.85))
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
+            VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+                InspectorFieldPair {
+                    InspectorSlider(
+                        "Size",
+                        value: value(\.width, action: "Resize Image"),
+                        range: CGFloat(RecordingImageOverlay.widthRange.lowerBound)...CGFloat(RecordingImageOverlay.widthRange.upperBound),
+                        format: .percent()
+                    )
+                    .help("Width as a share of the video's width")
+                } trailing: {
+                    InspectorSlider("Opacity", value: value(\.opacity, action: "Change Image Opacity"), range: 0...1, format: .percent())
+                }
+                InspectorFieldPair {
+                    InspectorSlider(
+                        "Rotation",
+                        value: value(\.rotation, action: "Rotate Image"),
+                        range: -180...180,
+                        format: .degrees(signed: true)
+                    )
+                } trailing: {
+                    InspectorSlider(
+                        "Corners",
+                        value: value(\.cornerRadius, action: "Change Image Corners"),
+                        range: CGFloat(RecordingImageOverlay.cornerRadiusRange.lowerBound)...CGFloat(RecordingImageOverlay.cornerRadiusRange.upperBound),
+                        format: .pixels
+                    )
+                    .help("Corner radius, measured on a 1080p video")
+                }
+                InspectorFieldPair {
+                    InspectorSlider("Shadow", value: value(\.shadow, action: "Change Image Shadow"), range: 0...1, format: .percent())
+                } trailing: {
+                    Color.clear
+                }
+            }
+
+            VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+                InspectorGroupLabel("Fades")
+                InspectorFieldPair {
+                    InspectorSlider(
+                        "In",
+                        value: value(\.fadeIn, action: "Change Image Fade"),
+                        range: CGFloat(RecordingImageOverlay.fadeRange.lowerBound)...CGFloat(RecordingImageOverlay.fadeRange.upperBound),
+                        format: .seconds
+                    )
+                } trailing: {
+                    InspectorSlider(
+                        "Out",
+                        value: value(\.fadeOut, action: "Change Image Fade"),
+                        range: CGFloat(RecordingImageOverlay.fadeRange.lowerBound)...CGFloat(RecordingImageOverlay.fadeRange.upperBound),
+                        format: .seconds
+                    )
+                }
+            }
+
+            VStack(alignment: .leading, spacing: InspectorMetrics.groupLabelSpacing) {
+                InspectorGroupLabel("Position")
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 5), spacing: 4) {
+                    ForEach(Self.spots, id: \.title) { spot in
+                        InspectorTile(
+                            title: spot.title,
+                            aspectRatio: 1.4,
+                            isSelected: abs(image.center.x - spot.point.x) < 0.005 && abs(image.center.y - spot.point.y) < 0.005
+                        ) {
+                            edit("Move Image") { $0.center = spot.point }
+                        } content: {
+                            Rectangle()
+                                .fill(Color.primary.opacity(0.05))
+                                .overlay {
+                                    GeometryReader { proxy in
+                                        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                                            .fill(Palette.secondaryLabel)
+                                            .frame(width: proxy.size.width * 0.28, height: proxy.size.height * 0.28)
+                                            .position(x: proxy.size.width * spot.point.x, y: proxy.size.height * spot.point.y)
+                                    }
+                                }
+                        }
+                    }
+                }
+                InspectorFieldPair {
+                    InspectorSlider("X", value: centerBinding(\.x), range: 0...1, format: .percent())
+                } trailing: {
+                    InspectorSlider("Y", value: centerBinding(\.y), range: 0...1, format: .percent())
+                }
+                InspectorHint(image.isAnimated
+                    ? "The GIF loops for as long as its block lasts. Drag it, or its corner, on the paused canvas."
+                    : "Drag the image, or its corner, on the paused canvas.")
+            }
+        }
+    }
+
+    private func edit(_ action: String, _ change: (inout RecordingImageOverlay) -> Void) {
+        var edited = image
+        change(&edited)
+        model.editImage(edited, actionName: action)
+    }
+
+    private func value(_ keyPath: WritableKeyPath<RecordingImageOverlay, Double>, action: String) -> Binding<CGFloat> {
+        Binding(
+            get: { CGFloat(image[keyPath: keyPath]) },
+            set: { value in edit(action) { $0[keyPath: keyPath] = Double(value) } }
+        )
+    }
+
+    private func centerBinding(_ axis: WritableKeyPath<CGPoint, CGFloat>) -> Binding<CGFloat> {
+        Binding(
+            get: { image.center[keyPath: axis] },
+            set: { value in edit("Move Image") { $0.center[keyPath: axis] = value } }
+        )
+    }
+}
+
+// MARK: - Audio
+
+struct StudioAudioClipInspectorControls: View {
+    @Bindable var model: RecordingStudioModel
+    let clip: RecordingAudioClip
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
+            VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+                InspectorSlider("Volume", value: value(\.volume, action: "Change Audio Volume"), range: 0...1, format: .percent())
+                InspectorFieldPair {
+                    InspectorSlider(
+                        "Fade In",
+                        value: value(\.fadeIn, action: "Change Audio Fade"),
+                        range: CGFloat(RecordingAudioClip.fadeRange.lowerBound)...CGFloat(RecordingAudioClip.fadeRange.upperBound),
+                        format: .seconds
+                    )
+                } trailing: {
+                    InspectorSlider(
+                        "Fade Out",
+                        value: value(\.fadeOut, action: "Change Audio Fade"),
+                        range: CGFloat(RecordingAudioClip.fadeRange.lowerBound)...CGFloat(RecordingAudioClip.fadeRange.upperBound),
+                        format: .seconds
+                    )
+                }
+            }
+
+            InspectorHint("Plays \(Self.clock(clip.duration)) of \(Self.clock(clip.fileDuration)) from \(Self.clock(clip.start)) in the video. Drag its edges on the timeline to trim it. It stays put when the recording is cut.")
+        }
+    }
+
+    private static func clock(_ seconds: TimeInterval) -> String {
+        let total = max(0, seconds)
+        return total < 60 ? String(format: "%.1fs", total) : String(format: "%d:%04.1f", Int(total) / 60, total.truncatingRemainder(dividingBy: 60))
+    }
+
+    private func value(_ keyPath: WritableKeyPath<RecordingAudioClip, Double>, action: String) -> Binding<CGFloat> {
+        Binding(
+            get: { CGFloat(clip[keyPath: keyPath]) },
+            set: { value in
+                var edited = clip
+                edited[keyPath: keyPath] = Double(value)
+                model.editAudioClip(edited, actionName: action)
+            }
+        )
+    }
+}

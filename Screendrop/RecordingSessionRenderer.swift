@@ -212,7 +212,10 @@ enum RecordingSessionRenderer {
             usesUniformPadding: aspect == .original,
             motionTimeline: motionTimeline,
             textOverlays: document?.textOverlays ?? [],
-            redactions: document?.redactions ?? []
+            redactions: document?.redactions ?? [],
+            imageOverlays: document?.imageOverlays ?? [],
+            audioClips: document?.audioClips ?? [],
+            mediaDirectory: session.directoryURL.appendingPathComponent("media", isDirectory: true)
         )
     }
 

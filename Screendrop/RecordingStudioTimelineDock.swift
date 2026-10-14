@@ -18,6 +18,7 @@
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct StudioTimelineDock: View {
     @Bindable var model: RecordingStudioModel
@@ -123,6 +124,17 @@ struct StudioTimelineDock: View {
                 }
                 .disabled(!model.isLoaded)
                 .glassEffectID("pixelate", in: glass)
+
+                GlassIconButton(
+                    systemImage: "photo.badge.plus",
+                    help: model.mediaDirectoryURL == nil
+                        ? "Save this recording as a project to add images and audio"
+                        : "Add Images, GIFs or Audio at Playhead"
+                ) {
+                    pickMedia()
+                }
+                .disabled(!model.canImportMedia)
+                .glassEffectID("media", in: glass)
 
                 if canDeleteSelection {
                     GlassIconButton(systemImage: "trash", help: "Delete Selection (⌫)") {
@@ -340,8 +352,25 @@ struct StudioTimelineDock: View {
                 viewportWidth = max(width, 1)
                 clampZoom()
             }
+            // Images and audio dropped from Finder land where they're let go.
+            .dropDestination(for: URL.self) { urls, location in
+                guard model.canImportMedia else { return false }
+                model.importMedia(urls, atEditorTime: scale.time(forX: location.x + scrollX))
+                return true
+            }
         }
         .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks))
+        .alert(
+            "Some files weren't added",
+            isPresented: Binding(
+                get: { model.mediaImportError != nil },
+                set: { if !$0 { model.mediaImportError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { model.mediaImportError = nil }
+        } message: {
+            Text(model.mediaImportError ?? "")
+        }
         .onChange(of: model.duration) { _, _ in clampZoom() }
         .onChange(of: model.currentTime) { _, time in followPlayhead(to: time) }
     }
@@ -440,11 +469,12 @@ struct StudioTimelineDock: View {
                 onScrubbing: { isScrubbing = $0 }
             )
         case .audio:
-            // Nothing lives on this track yet; a press scrubs, as on the
-            // ruler, and lets go of whatever was selected.
-            Color.clear
-                .contentShape(Rectangle())
-                .gesture(scrubGesture(scale: scale, scrollX: 0, deselects: true))
+            StudioAudioLane(
+                model: model,
+                scale: scale,
+                visibleRange: scale.visibleRange(scrollX: scrollX),
+                onScrubbing: { isScrubbing = $0 }
+            )
         }
     }
 
@@ -459,8 +489,12 @@ struct StudioTimelineDock: View {
         case .text:
             model.textOverlays.isEmpty ? "Drag across to add text" : nil
         case .overlay:
-            model.redactions.isEmpty ? "Pixelate part of the picture from the toolbar" : nil
-        case .clips, .audio:
+            model.redactions.isEmpty && model.imageOverlays.isEmpty
+                ? "Add images and GIFs, or pixelate part of the picture, from the toolbar"
+                : nil
+        case .audio:
+            model.audioClips.isEmpty ? "Drop music or sound here, or add it from the toolbar" : nil
+        case .clips:
             nil
         }
     }
@@ -573,9 +607,24 @@ struct StudioTimelineDock: View {
         return scale.time(forX: scrollX + viewportWidth / 2)
     }
 
+    /// Images, GIFs and audio to place at the playhead.
+    private func pickMedia() {
+        model.pause()
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.image, .audio]
+        panel.prompt = "Add"
+        panel.message = "Images and GIFs go over the video; audio plays under it."
+        let time = model.currentTime
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        model.importMedia(panel.urls, atEditorTime: time)
+    }
+
     private var canDeleteSelection: Bool {
         model.selectedCueID != nil || model.selectedLayoutCueID != nil
             || model.selectedTextID != nil || model.selectedRedactionID != nil
+            || model.selectedImageID != nil || model.selectedAudioClipID != nil
             || model.canDeleteSelectedClip
     }
 
@@ -583,6 +632,10 @@ struct StudioTimelineDock: View {
         withAnimation(.morphIfAllowed) {
             if let textID = model.selectedTextID {
                 model.removeText(id: textID)
+            } else if let imageID = model.selectedImageID {
+                model.removeImage(id: imageID)
+            } else if let audioClipID = model.selectedAudioClipID {
+                model.removeAudioClip(id: audioClipID)
             } else if let redactionID = model.selectedRedactionID {
                 model.removeRedaction(id: redactionID)
             } else if let cueID = model.selectedCueID {
@@ -1965,8 +2018,8 @@ private struct StudioTextLane: View {
     }
 }
 
-/// Pixelate and blur blocks, on the Images and Effects track. A click on
-/// empty track scrubs.
+/// Images, GIFs, and pixelate and blur blocks, on the Images and Effects
+/// track. A click on empty track scrubs.
 private struct StudioRedactionLane: View {
     @Bindable var model: RecordingStudioModel
     let scale: StudioTimelineScale
@@ -1995,6 +2048,40 @@ private struct StudioRedactionLane: View {
                             onScrubbing(false)
                         }
                 )
+
+            ForEach(visibleImageBlocks) { block in
+                let overlay = block.item
+                StudioOverlayBlock(
+                    block: block,
+                    scale: scale,
+                    isSelected: model.selectedImageID == overlay.id,
+                    tint: Palette.imageCue,
+                    systemImage: overlay.isAnimated ? "photo.stack" : "photo",
+                    title: overlay.isAnimated ? "\(overlay.displayName) · GIF" : overlay.displayName,
+                    isHatched: false,
+                    onSelect: { model.selectImage(id: overlay.id) },
+                    onBegin: {
+                        model.selectImage(id: overlay.id)
+                        model.beginImageEdit()
+                    },
+                    onEdit: { base, start, end in
+                        var edited = base
+                        edited.start = start
+                        edited.end = end
+                        model.setImage(edited)
+                    },
+                    onEnd: { kind in
+                        model.endImageEdit(actionName: kind == .move ? "Move Image" : "Resize Image")
+                    },
+                    sourceRange: { ($0.start, $0.end) },
+                    model: model
+                ) {
+                    Button("Delete Image", systemImage: "trash", role: .destructive) {
+                        withAnimation(.morphIfAllowed) { model.removeImage(id: overlay.id) }
+                    }
+                }
+                .transition(.blurPop)
+            }
 
             ForEach(visibleBlocks) { block in
                 let redaction = block.item
@@ -2050,6 +2137,12 @@ private struct StudioRedactionLane: View {
             Button("Blur at Playhead", systemImage: "drop.halffull") {
                 withAnimation(.morphIfAllowed) { model.addRedaction(atEditorTime: model.currentTime, style: .blur) }
             }
+        }
+    }
+
+    private var visibleImageBlocks: [RecordingOverlayTimelineBlock<RecordingImageOverlay>] {
+        model.imageTimelineBlocks.filter {
+            $0.editorEnd >= visibleRange.lowerBound && $0.editorStart <= visibleRange.upperBound
         }
     }
 
@@ -2258,5 +2351,231 @@ private struct StudioOverlayBlock<Item: Identifiable & Sendable, MenuContent: Vi
             .contentShape(Rectangle())
             .pointerStyle(.frameResize(position: edge == .leading ? .leading : .trailing))
             .gesture(dragGesture(edge == .leading ? .leading : .trailing))
+    }
+}
+
+// MARK: - Audio track
+
+/// Music and sound under the video. Blocks sit on the edited video's clock;
+/// a click on empty track scrubs.
+private struct StudioAudioLane: View {
+    @Bindable var model: RecordingStudioModel
+    let scale: StudioTimelineScale
+    let visibleRange: ClosedRange<TimeInterval>
+    let onScrubbing: (Bool) -> Void
+
+    @State private var isScrubbing = false
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            if !isScrubbing {
+                                isScrubbing = true
+                                onScrubbing(true)
+                                model.pause()
+                                model.clearTimelineSelection()
+                            }
+                            model.seek(to: scale.time(forX: value.location.x))
+                        }
+                        .onEnded { _ in
+                            isScrubbing = false
+                            onScrubbing(false)
+                        }
+                )
+
+            ForEach(visibleClips) { clip in
+                StudioAudioClipBlock(model: model, clip: clip, scale: scale)
+                    .transition(.blurPop)
+            }
+        }
+    }
+
+    private var visibleClips: [RecordingAudioClip] {
+        model.audioClips.filter { $0.end >= visibleRange.lowerBound && $0.start <= visibleRange.upperBound }
+    }
+}
+
+/// One audio clip: its name over a waveform of the stretch that plays.
+/// The body moves it along the video; the edges trim the file.
+private struct StudioAudioClipBlock: View {
+    @Bindable var model: RecordingStudioModel
+    let clip: RecordingAudioClip
+    let scale: StudioTimelineScale
+
+    private enum EditKind { case move, leading, trailing }
+
+    @State private var dragBase: RecordingAudioClip?
+    @State private var isHovering = false
+
+    private static let height = StudioTrack.audio.height - StudioZoomLaneMetrics.blockInset * 2
+
+    private var isSelected: Bool { model.selectedAudioClipID == clip.id }
+    private var showsHandles: Bool { isSelected || isHovering || dragBase != nil }
+
+    var body: some View {
+        if scale.pointsPerSecond > 0 {
+            content
+        }
+    }
+
+    private var content: some View {
+        let x = scale.x(for: clip.start)
+        // A clip may run past the video's end; only what fits is drawn.
+        let width = max(16, min(CGFloat(clip.duration) * scale.pointsPerSecond, scale.contentWidth - x))
+        let shape = RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+        let peaks = model.audioPeaks[clip.fileName] ?? []
+
+        return ZStack(alignment: .topLeading) {
+            StudioWaveform(
+                peaks: peaks,
+                from: clip.trimStart,
+                to: clip.trimStart + Double(width / scale.pointsPerSecond)
+            )
+            .padding(.top, 13)
+            .padding(.bottom, 3)
+            .padding(.horizontal, 2)
+
+            if width >= 40 {
+                HStack(spacing: 4) {
+                    Image(systemName: "music.note")
+                        .font(.system(size: 9, weight: .bold))
+                        .opacity(0.8)
+                    Text(clip.displayName)
+                        .font(.system(size: 10, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, StudioZoomLaneMetrics.handleWidth)
+                .padding(.top, 2)
+                .frame(maxWidth: width, alignment: .leading)
+                .allowsHitTesting(false)
+            }
+        }
+        .frame(width: width, height: Self.height, alignment: .topLeading)
+        .background { shape.fill(Palette.audioCue.opacity(isSelected ? 1 : 0.86)) }
+        .clipShape(shape)
+        .overlay {
+            shape
+                .strokeBorder(
+                    LinearGradient(colors: [.white.opacity(0.32), .white.opacity(0.04)], startPoint: .top, endPoint: .bottom),
+                    lineWidth: 1
+                )
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .leading) {
+            if showsHandles { resizeHandle(.leading).transition(.opacity) }
+        }
+        .overlay(alignment: .trailing) {
+            if showsHandles { resizeHandle(.trailing).transition(.opacity) }
+        }
+        .overlay {
+            if isSelected {
+                shape
+                    .strokeBorder(Color.white.opacity(0.95), lineWidth: 2)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+        }
+        .contentShape(shape)
+        .brightness(isHovering && !isSelected ? 0.05 : 0)
+        .onHover { isHovering = $0 }
+        .motion(.morphQuick, value: showsHandles)
+        .motion(.morphQuick, value: isSelected)
+        .offset(x: x, y: StudioZoomLaneMetrics.blockInset)
+        .gesture(dragGesture(.move))
+        .onTapGesture { model.selectAudioClip(id: clip.id) }
+        .contextMenu {
+            Button("Delete Audio", systemImage: "trash", role: .destructive) {
+                withAnimation(.morphIfAllowed) { model.removeAudioClip(id: clip.id) }
+            }
+        }
+        .help("\(clip.displayName). Drag to move, drag an edge to trim, right-click for options.")
+    }
+
+    private func dragGesture(_ kind: EditKind) -> some Gesture {
+        DragGesture(minimumDistance: kind == .move ? 2 : 0, coordinateSpace: .global)
+            .onChanged { value in
+                if dragBase == nil {
+                    dragBase = clip
+                    model.pause()
+                    model.selectAudioClip(id: clip.id)
+                    model.beginAudioClipEdit()
+                }
+                guard let base = dragBase else { return }
+                let delta = Double(value.translation.width) * scale.secondsPerPoint
+                let minimum = RecordingAudioClip.minimumDuration
+                var edited = base
+                switch kind {
+                case .move:
+                    edited.start = max(0, base.start + delta)
+                case .leading:
+                    let shift = min(max(delta, -base.trimStart, -base.start), base.duration - minimum)
+                    edited.start = base.start + shift
+                    edited.trimStart = base.trimStart + shift
+                case .trailing:
+                    edited.trimEnd = min(max(base.trimEnd + delta, base.trimStart + minimum), base.fileDuration)
+                }
+                model.setAudioClip(edited)
+            }
+            .onEnded { _ in
+                dragBase = nil
+                model.endAudioClipEdit(actionName: kind == .move ? "Move Audio" : "Trim Audio")
+            }
+    }
+
+    private func resizeHandle(_ edge: HorizontalEdge) -> some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.001))
+            .frame(width: StudioZoomLaneMetrics.handleWidth, height: Self.height)
+            .overlay {
+                Capsule()
+                    .fill(Color.white.opacity(0.95))
+                    .frame(width: 3, height: 14)
+                    .shadow(color: .black.opacity(0.25), radius: 1)
+            }
+            .contentShape(Rectangle())
+            .pointerStyle(.frameResize(position: edge == .leading ? .leading : .trailing))
+            .gesture(dragGesture(edge == .leading ? .leading : .trailing))
+    }
+}
+
+/// Rounded bars of an audio file's loudness between two file times.
+private struct StudioWaveform: View {
+    let peaks: [Float]
+    let from: TimeInterval
+    let to: TimeInterval
+
+    var body: some View {
+        Canvas { context, size in
+            guard !peaks.isEmpty, to > from, size.width > 4 else { return }
+            let perSecond = Double(RecordingAudioPeaks.peaksPerSecond)
+            let bar: CGFloat = 2
+            let gap: CGFloat = 2
+            var path = Path()
+            var x: CGFloat = gap
+            while x < size.width - bar {
+                let t0 = from + Double(x / size.width) * (to - from)
+                let t1 = from + Double((x + bar) / size.width) * (to - from)
+                let i0 = max(0, Int(t0 * perSecond))
+                let i1 = min(peaks.count, max(i0 + 1, Int(t1 * perSecond)))
+                var value: Float = 0
+                if i0 < i1 {
+                    for index in i0..<i1 { value = max(value, peaks[index]) }
+                }
+                let height = max(bar, CGFloat(value) * size.height)
+                path.addRoundedRect(
+                    in: CGRect(x: x, y: (size.height - height) / 2, width: bar, height: height),
+                    cornerSize: CGSize(width: bar / 2, height: bar / 2)
+                )
+                x += bar + gap
+            }
+            context.fill(path, with: .color(.white.opacity(0.8)))
+        }
+        .allowsHitTesting(false)
     }
 }

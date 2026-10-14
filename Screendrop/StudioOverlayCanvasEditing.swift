@@ -11,8 +11,10 @@
 
 import SwiftUI
 
-/// The texts showing at a moment, drawn exactly as the export draws them.
-struct StudioTextOverlayCanvas: View {
+/// The images and texts showing at a moment, drawn exactly as the export
+/// draws them: images first, text on top.
+struct StudioCanvasOverlayLayer: View {
+    let images: [(overlay: RecordingImageOverlay, image: RecordingOverlayImage)]
     let texts: [RecordingTextOverlay]
     let sourceTime: TimeInterval
     let canvasSize: CGSize
@@ -20,6 +22,11 @@ struct StudioTextOverlayCanvas: View {
     var body: some View {
         Canvas { context, size in
             context.withCGContext { cgContext in
+                for (overlay, image) in images {
+                    RecordingImageOverlayRenderer.draw(
+                        overlay, image: image, atSourceTime: sourceTime, canvasSize: size, in: cgContext
+                    )
+                }
                 for overlay in texts {
                     RecordingTextOverlayRenderer.draw(
                         overlay,
@@ -32,6 +39,108 @@ struct StudioTextOverlayCanvas: View {
         }
         .frame(width: canvasSize.width, height: canvasSize.height)
         .allowsHitTesting(false)
+    }
+}
+
+/// Hit targets over the showing images. A click picks one, a drag moves
+/// it, and the selected one's corner handle scales it about its centre.
+struct StudioImageEditingLayer: View {
+    @Bindable var model: RecordingStudioModel
+    let images: [RecordingImageOverlay]
+    let canvasSize: CGSize
+
+    @State private var dragBase: RecordingImageOverlay?
+    @State private var hoveredID: UUID?
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(images) { overlay in
+                let rect = overlay.rect(canvasSize: canvasSize)
+                let isSelected = model.selectedImageID == overlay.id
+                Rectangle()
+                    .fill(Color.white.opacity(0.001))
+                    .overlay {
+                        if isSelected || hoveredID == overlay.id {
+                            Rectangle()
+                                .strokeBorder(
+                                    isSelected ? Palette.highlight : Color.white.opacity(0.7),
+                                    lineWidth: isSelected ? 1.5 : 1
+                                )
+                                .shadow(color: .black.opacity(0.3), radius: 1)
+                        }
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if isSelected {
+                            StudioRegionHandle(isCorner: true, isHorizontal: false)
+                                .offset(x: 11, y: 11)
+                                .gesture(scaleGesture(for: overlay, rect: rect))
+                        }
+                    }
+                    .frame(width: max(rect.width, 8), height: max(rect.height, 8))
+                    .rotationEffect(.degrees(overlay.rotation))
+                    .position(x: rect.midX, y: rect.midY)
+                    .onHover { isHovering in
+                        if isHovering {
+                            hoveredID = overlay.id
+                        } else if hoveredID == overlay.id {
+                            hoveredID = nil
+                        }
+                    }
+                    .onTapGesture { model.selectImage(id: overlay.id) }
+                    .gesture(moveGesture(for: overlay))
+            }
+        }
+        .frame(width: canvasSize.width, height: canvasSize.height, alignment: .topLeading)
+    }
+
+    private func begin(_ overlay: RecordingImageOverlay) {
+        guard dragBase?.id != overlay.id else { return }
+        dragBase = overlay
+        model.selectImage(id: overlay.id)
+        model.beginImageEdit()
+    }
+
+    private func moveGesture(for overlay: RecordingImageOverlay) -> some Gesture {
+        DragGesture(minimumDistance: 2, coordinateSpace: .global)
+            .onChanged { value in
+                begin(overlay)
+                guard let dragBase, canvasSize.width > 0, canvasSize.height > 0 else { return }
+                var moved = dragBase
+                moved.center = CGPoint(
+                    x: dragBase.center.x + value.translation.width / canvasSize.width,
+                    y: dragBase.center.y + value.translation.height / canvasSize.height
+                )
+                model.setImage(moved)
+            }
+            .onEnded { _ in
+                dragBase = nil
+                model.endImageEdit(actionName: "Move Image")
+            }
+    }
+
+    /// Scales by how far the handle travels along the line from the centre
+    /// to the corner it started at, which holds however the image is turned.
+    private func scaleGesture(for overlay: RecordingImageOverlay, rect: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+            .onChanged { value in
+                begin(overlay)
+                guard let dragBase else { return }
+                let angle = dragBase.rotation * .pi / 180
+                let half = CGSize(width: rect.width / 2, height: rect.height / 2)
+                let corner = CGPoint(
+                    x: half.width * cos(angle) - half.height * sin(angle),
+                    y: half.width * sin(angle) + half.height * cos(angle)
+                )
+                let length = max(hypot(corner.x, corner.y), 1)
+                let along = (value.translation.width * corner.x + value.translation.height * corner.y) / length
+                var scaled = dragBase
+                scaled.width = dragBase.width * Double(max(0.05, (length + along) / length))
+                model.setImage(scaled)
+            }
+            .onEnded { _ in
+                dragBase = nil
+                model.endImageEdit(actionName: "Resize Image")
+            }
     }
 }
 

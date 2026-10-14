@@ -40,6 +40,11 @@ struct RecordingEditDocument: Codable, Equatable {
     /// source clock. Optional so older projects decode with none.
     var textOverlays: [RecordingTextOverlay]?
     var redactions: [RecordingRedaction]?
+    /// Images and GIFs over the canvas (source clock) and audio clips
+    /// under the video (edited clock); their files live in the project's
+    /// media folder.
+    var imageOverlays: [RecordingImageOverlay]?
+    var audioClips: [RecordingAudioClip]?
     /// Ordered source ranges that make up the edited movie. Optional so v1
     /// projects continue to decode through their single trim range.
     var clips: [RecordingClipSegment]?
@@ -90,6 +95,8 @@ struct RecordingEditDocument: Codable, Equatable {
         case cameraLayoutCues
         case textOverlays
         case redactions
+        case imageOverlays
+        case audioClips
         case clips
         case trimStart
         case trimEnd
@@ -124,6 +131,8 @@ struct RecordingEditDocument: Codable, Equatable {
         cameraLayoutCues: [RecordingCameraLayoutCue]? = nil,
         textOverlays: [RecordingTextOverlay]? = nil,
         redactions: [RecordingRedaction]? = nil,
+        imageOverlays: [RecordingImageOverlay]? = nil,
+        audioClips: [RecordingAudioClip]? = nil,
         clipTimeline: RecordingClipTimeline? = nil,
         trimSelection: VideoTrimSelection? = nil,
         exportSettings: VideoCompressionSettings? = nil,
@@ -150,6 +159,8 @@ struct RecordingEditDocument: Codable, Equatable {
         self.cameraLayoutCues = cameraLayoutCues
         self.textOverlays = textOverlays
         self.redactions = redactions
+        self.imageOverlays = imageOverlays
+        self.audioClips = audioClips
         clips = clipTimeline?.segments
         if let clip = clipTimeline?.segments.only {
             // Keep the legacy envelope populated for older Screendrop builds.
@@ -227,6 +238,8 @@ struct RecordingEditDocument: Codable, Equatable {
         )
         textOverlays = try container.decodeIfPresent([RecordingTextOverlay].self, forKey: .textOverlays)
         redactions = try container.decodeIfPresent([RecordingRedaction].self, forKey: .redactions)
+        imageOverlays = try container.decodeIfPresent([RecordingImageOverlay].self, forKey: .imageOverlays)
+        audioClips = try container.decodeIfPresent([RecordingAudioClip].self, forKey: .audioClips)
         clips = try container.decodeIfPresent([RecordingClipSegment].self, forKey: .clips)
         trimStart = try container.decodeIfPresent(TimeInterval.self, forKey: .trimStart)
         trimEnd = try container.decodeIfPresent(TimeInterval.self, forKey: .trimEnd)
@@ -285,6 +298,8 @@ struct RecordingEditDocument: Codable, Equatable {
         try container.encodeIfPresent(cameraLayoutCues, forKey: .cameraLayoutCues)
         try container.encodeIfPresent(textOverlays, forKey: .textOverlays)
         try container.encodeIfPresent(redactions, forKey: .redactions)
+        try container.encodeIfPresent(imageOverlays, forKey: .imageOverlays)
+        try container.encodeIfPresent(audioClips, forKey: .audioClips)
         try container.encodeIfPresent(clips, forKey: .clips)
         try container.encodeIfPresent(trimStart, forKey: .trimStart)
         try container.encodeIfPresent(trimEnd, forKey: .trimEnd)
