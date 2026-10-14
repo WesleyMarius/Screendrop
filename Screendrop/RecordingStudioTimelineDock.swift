@@ -753,12 +753,12 @@ private enum StudioTrack: String, Identifiable {
 
     var systemImage: String {
         switch self {
-        case .text: "textformat"
+        case .text: "character.textbox"
         case .overlay: "square.3.layers.3d"
-        case .clips: "film"
+        case .clips: "movieclapper"
         case .zooms: "magnifyingglass"
-        case .layouts: "rectangle.inset.bottomright.filled"
-        case .audio: "music.note"
+        case .layouts: "inset.filled.rectangle.and.person.filled"
+        case .audio: "music.note.tv"
         }
     }
 
