@@ -107,10 +107,6 @@ struct StudioTextInspectorControls: View {
         var title: String { self == .enter ? "In" : "Out" }
     }
 
-    private static let positions: [(title: String, y: CGFloat)] = [
-        ("Top", 0.15), ("Middle", 0.5), ("Bottom", 0.85)
-    ]
-
     var body: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
             TextField("Type something…", text: binding(\.text, action: "Edit Text"), axis: .vertical)
@@ -173,28 +169,6 @@ struct StudioTextInspectorControls: View {
                     }
                     .transition(.opacity)
                 }
-            }
-
-            VStack(alignment: .leading, spacing: InspectorMetrics.groupLabelSpacing) {
-                InspectorGroupLabel("Position")
-                InspectorSegmented(
-                    options: Self.positions.map(\.title),
-                    isSelected: { title in
-                        guard let position = Self.positions.first(where: { $0.title == title }) else { return false }
-                        return abs(text.center.x - 0.5) < 0.005 && abs(text.center.y - position.y) < 0.005
-                    },
-                    onTap: { title in
-                        guard let position = Self.positions.first(where: { $0.title == title }) else { return }
-                        edit("Move Text") { $0.center = CGPoint(x: 0.5, y: position.y) }
-                    },
-                    label: { Text($0).font(.inspectorSegment) }
-                )
-                InspectorFieldPair {
-                    InspectorSlider("X", value: centerBinding(\.x), range: 0...1, format: .percent())
-                } trailing: {
-                    InspectorSlider("Y", value: centerBinding(\.y), range: 0...1, format: .percent())
-                }
-                InspectorHint("You can also drag the text on the paused canvas.")
             }
 
             animationControls
@@ -299,13 +273,6 @@ struct StudioTextInspectorControls: View {
         Binding(
             get: { text[keyPath: keyPath] },
             set: { value in edit(action) { $0[keyPath: keyPath] = value } }
-        )
-    }
-
-    private func centerBinding(_ axis: WritableKeyPath<CGPoint, CGFloat>) -> Binding<CGFloat> {
-        Binding(
-            get: { text.center[keyPath: axis] },
-            set: { value in edit("Move Text") { $0.center[keyPath: axis] = value } }
         )
     }
 
