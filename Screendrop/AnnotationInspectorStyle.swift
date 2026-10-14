@@ -607,9 +607,10 @@ struct InspectorRow<Content: View>: View {
 
 // MARK: - Segmented control
 
-/// One segmented control for every choice in the panel, in the look of
-/// Periscope's navigator tabs: a quiet capsule track with the selected option
-/// raised as a glass pill. The pill jumps to the new option rather than
+/// One segmented control for every choice in the panel. Its track is the
+/// same filled rounded rectangle as every field and slider, and the selected
+/// option rises as a glass chip inset concentrically inside it, after
+/// Periscope's navigator tabs. The chip jumps to the new option rather than
 /// sliding. It keeps the inspector's one control height so it lines up with
 /// sliders and fields.
 struct InspectorSegmented<Option: Hashable, Label: View>: View {
@@ -622,8 +623,21 @@ struct InspectorSegmented<Option: Hashable, Label: View>: View {
     var equalWidths: Bool = true
 
     @State private var hoveredOption: Option?
+    @Environment(\.colorScheme) private var colorScheme
 
     private static var inset: CGFloat { 3 }
+
+    private var trackShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: min(InspectorMetrics.fieldRadius, height / 2), style: .continuous)
+    }
+
+    /// Nested inside the track: its radius less the inset, never equal.
+    private var segmentShape: RoundedRectangle {
+        RoundedRectangle(
+            cornerRadius: max(0, min(InspectorMetrics.fieldRadius, height / 2) - Self.inset),
+            style: .continuous
+        )
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -633,7 +647,7 @@ struct InspectorSegmented<Option: Hashable, Label: View>: View {
         }
         .padding(Self.inset)
         .frame(height: height)
-        .background(Capsule().fill(Color.primary.opacity(0.06)))
+        .background(trackShape.fill(InspectorControlPalette.trackFill(for: colorScheme)))
     }
 
     private func segment(for option: Option) -> some View {
@@ -649,11 +663,11 @@ struct InspectorSegmented<Option: Hashable, Label: View>: View {
                 .padding(.horizontal, equalWidths ? 0 : 11)
                 .background {
                     if isHovering, !selected {
-                        Capsule().fill(InspectorControlPalette.hoverFill)
+                        segmentShape.fill(InspectorControlPalette.hoverFill)
                     }
                 }
-                .contentShape(Capsule())
-                .glassEffect(selected ? .regular.interactive() : .identity, in: Capsule())
+                .contentShape(segmentShape)
+                .glassEffect(selected ? .regular.interactive() : .identity, in: segmentShape)
         }
         .buttonStyle(.plain)
         .focusEffectDisabled()
