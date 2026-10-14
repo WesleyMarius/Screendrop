@@ -193,8 +193,6 @@ struct StudioInspector: View {
 
         featureSections
 
-        InspectorGroupBreak()
-
         audioSection
     }
 
@@ -202,8 +200,6 @@ struct StudioInspector: View {
     /// section's controls away, so what is off costs one line.
     @ViewBuilder
     private var featureSections: some View {
-        InspectorGroupBreak()
-
         if model.hasCameraVideo {
             InspectorSection("Camera", isOn: $model.style.camera.isVisible, toggleTitle: "Show camera") {
                 cameraControls
@@ -557,10 +553,6 @@ struct StudioInspector: View {
                     withAnimation(.morphQuickIfAllowed) { model.style.camera.layout = layout }
                 }
             }
-
-            if model.cameraLayoutCues.isEmpty {
-                InspectorHint("Drag across the Layout lane to change the layout for part of the video.")
-            }
         }
     }
 
@@ -699,23 +691,6 @@ struct StudioInspector: View {
                     withAnimation(.morphIfAllowed) { model.addZoomCue(at: model.currentTime) }
                 }
                 .help("Add a zoom at the playhead, or drag across the zoom lane")
-            }
-
-            if model.zoomCues.isEmpty {
-                InspectorHint(
-                    pressCount > 0
-                        ? "Auto Zoom turns your recorded clicks into camera moves."
-                        : "Drag across the zoom lane on the timeline to add a zoom."
-                )
-                .transition(AnyTransition(.blurReplace))
-            } else {
-                InspectorHint(
-                    model.zoomCues.count == 1
-                        ? "1 zoom on the timeline. Click it to fine-tune."
-                        : "\(model.zoomCues.count) zooms on the timeline. Click one to fine-tune."
-                )
-                .contentTransition(.numericText())
-                .transition(AnyTransition(.blurReplace))
             }
         }
     }
