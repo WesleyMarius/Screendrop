@@ -40,6 +40,9 @@ struct StudioTimelineDock: View {
     @State private var isAddOpen = false
     /// The track under the pointer, so a folded one can name itself.
     @State private var hoveredTrack: StudioTrack?
+    /// Files being dragged over the tracks: which tracks they'll land on,
+    /// and when.
+    @State private var mediaDrop: StudioMediaDrop?
     @Namespace private var glass
 
     /// Below this track width the opened + shows bare glyphs, so the edit
@@ -415,12 +418,19 @@ struct StudioTimelineDock: View {
                 viewportWidth = max(width, 1)
                 clampZoom()
             }
-            // Images and audio dropped from Finder land where they're let go.
-            .dropDestination(for: URL.self) { urls, location in
-                guard model.canImportMedia else { return false }
-                model.importMedia(urls, atEditorTime: scale.time(forX: location.x + scrollX))
-                return true
-            }
+            // Images and audio dropped from Finder land where they're let
+            // go; while they're dragged over, the track each kind will land
+            // on lights up with a mark at the drop point.
+            .onDrop(of: [.fileURL], delegate: StudioMediaDropDelegate(
+                canDrop: model.canImportMedia,
+                time: { scale.time(forX: $0.x + scrollX) },
+                onPreview: { preview in
+                    if preview != mediaDrop { mediaDrop = preview }
+                },
+                onDrop: { urls, time in
+                    model.importMedia(urls, atEditorTime: time)
+                }
+            ))
         }
         .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks))
         .animation(.fold, value: foldState)
@@ -469,8 +479,14 @@ struct StudioTimelineDock: View {
         ZStack(alignment: .topLeading) {
             VStack(spacing: StudioTimelineMetrics.trackSpacing) {
                 ForEach(tracks) { row in
-                    StudioTrackGround(hint: row.isFolded && hoveredTrack == row.track ? hint(for: row.track) : nil)
-                        .frame(height: row.height)
+                    let isDropTarget = mediaDrop?.tracks.contains(row.track) == true
+                    StudioTrackGround(
+                        hint: isDropTarget
+                            ? dropHint(for: row.track)
+                            : row.isFolded && hoveredTrack == row.track ? hint(for: row.track) : nil,
+                        dropX: isDropTarget ? mediaDrop.map { scale.x(for: $0.time) - scrollX } : nil
+                    )
+                    .frame(height: row.height)
                 }
                 Color.clear
                     .frame(height: StudioTimelineMetrics.scrollerGutter)
@@ -540,6 +556,15 @@ struct StudioTimelineDock: View {
                 visibleRange: scale.visibleRange(scrollX: scrollX),
                 onScrubbing: { isScrubbing = $0 }
             )
+        }
+    }
+
+    /// What a track says while files that will land on it are dragged over.
+    private func dropHint(for track: StudioTrack) -> String? {
+        switch track {
+        case .overlay: "Drop to add over the video"
+        case .audio: "Drop to add under the video"
+        default: nil
         }
     }
 
@@ -1178,22 +1203,94 @@ func studioPreciseTimecode(_ seconds: Double) -> String {
 /// names what it is for at its leading edge while hovered.
 private struct StudioTrackGround: View {
     let hint: String?
+    /// Where dragged files would land, in viewport points; set only on the
+    /// tracks they'll land on.
+    var dropX: CGFloat? = nil
 
     var body: some View {
         Rectangle()
-            .fill(Color.primary.opacity(0.04))
+            .fill(dropX == nil ? Color.primary.opacity(0.04) : Palette.highlight.opacity(0.12))
             .overlay(alignment: .leading) {
                 if let hint {
                     Text(hint)
                         .font(.system(size: 10))
-                        .foregroundStyle(Palette.tertiaryLabel)
+                        .foregroundStyle(dropX == nil ? Palette.tertiaryLabel : Palette.highlight)
                         .lineLimit(1)
                         .padding(.leading, 10)
                         .transition(.opacity)
                 }
             }
+            .overlay(alignment: .topLeading) {
+                if let dropX {
+                    GeometryReader { proxy in
+                        Capsule()
+                            .fill(Palette.highlight)
+                            .frame(width: 2, height: proxy.size.height)
+                            .offset(x: min(max(dropX, 0), proxy.size.width) - 1)
+                    }
+                }
+            }
             .animation(.easeOut(duration: 0.15), value: hint)
+            .animation(.easeOut(duration: 0.15), value: dropX == nil)
             .allowsHitTesting(false)
+    }
+}
+
+/// Files dragged over the tracks: the tracks their kinds land on, and the
+/// moment under the pointer.
+private struct StudioMediaDrop: Equatable {
+    var tracks: Set<StudioTrack>
+    var time: TimeInterval
+}
+
+/// Takes files from Finder. Images and GIFs land on the overlay track and
+/// audio on the audio track; when a drag doesn't say what it carries, both
+/// light up.
+private struct StudioMediaDropDelegate: DropDelegate {
+    let canDrop: Bool
+    let time: (CGPoint) -> TimeInterval
+    let onPreview: (StudioMediaDrop?) -> Void
+    let onDrop: ([URL], TimeInterval) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool {
+        canDrop && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard validateDrop(info: info) else {
+            onPreview(nil)
+            return DropProposal(operation: .forbidden)
+        }
+        var tracks: Set<StudioTrack> = []
+        if info.hasItemsConforming(to: [.image]) { tracks.insert(.overlay) }
+        if info.hasItemsConforming(to: [.audio]) { tracks.insert(.audio) }
+        if tracks.isEmpty { tracks = [.overlay, .audio] }
+        onPreview(StudioMediaDrop(tracks: tracks, time: time(info.location)))
+        return DropProposal(operation: .copy)
+    }
+
+    func dropExited(info: DropInfo) {
+        onPreview(nil)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        onPreview(nil)
+        guard canDrop else { return false }
+        let at = time(info.location)
+        let providers = info.itemProviders(for: [.fileURL])
+        Task { @MainActor in
+            var urls: [URL] = []
+            for provider in providers {
+                let url: URL? = await withCheckedContinuation { continuation in
+                    _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                        continuation.resume(returning: url)
+                    }
+                }
+                if let url { urls.append(url) }
+            }
+            if !urls.isEmpty { onDrop(urls, at) }
+        }
+        return true
     }
 }
 
