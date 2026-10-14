@@ -38,8 +38,6 @@ struct StudioTimelineDock: View {
     @State private var isScrubbing = false
     /// The + has opened into the things that can be added.
     @State private var isAddOpen = false
-    /// The track under the pointer, so a folded one can name itself.
-    @State private var hoveredTrack: StudioTrack?
     /// Files being dragged over the tracks: which tracks they'll land on,
     /// and when.
     @State private var mediaDrop: StudioMediaDrop?
@@ -295,36 +293,11 @@ struct StudioTimelineDock: View {
     /// The tracks top to bottom: what goes over the picture above the clips,
     /// what changes the camera below them, sound last. Layouts arrange the
     /// camera, so a recording without one has no layout track.
-    ///
-    /// A track with nothing on it folds to a slim strip, so the timeline
-    /// only gives room to what the video uses. It opens once something
-    /// lands on it, and names what it's for while the pointer is over it.
-    private var tracks: [StudioTrackRow] {
+    private var tracks: [StudioTrack] {
         var tracks: [StudioTrack] = [.text, .overlay, .clips, .zooms]
         if model.hasCameraVideo { tracks.append(.layouts) }
         tracks.append(.audio)
-        return tracks.map { StudioTrackRow(track: $0, isFolded: isEmpty($0)) }
-    }
-
-    private func isEmpty(_ track: StudioTrack) -> Bool {
-        switch track {
-        case .text: model.textOverlays.isEmpty
-        case .overlay: model.imageOverlays.isEmpty && model.redactions.isEmpty
-        case .clips: false
-        case .zooms: model.zoomTimelineBlocks.isEmpty
-        case .layouts: model.cameraLayoutCues.isEmpty
-        case .audio: model.audioClips.isEmpty
-        }
-    }
-
-    /// The track under a point in the lanes, measured from their top.
-    private func track(atY y: CGFloat) -> StudioTrack? {
-        var top = StudioTimelineMetrics.headerHeight + StudioTimelineMetrics.trackSpacing
-        for row in tracks {
-            if y >= top, y < top + row.height { return row.track }
-            top += row.height + StudioTimelineMetrics.trackSpacing
-        }
-        return nil
+        return tracks
     }
 
     /// One glyph per track beside its row, over a hairline that keeps the
@@ -333,20 +306,19 @@ struct StudioTimelineDock: View {
         VStack(spacing: StudioTimelineMetrics.trackSpacing) {
             Color.clear
                 .frame(height: StudioTimelineMetrics.headerHeight)
-            ForEach(tracks) { row in
-                Image(systemName: row.track.systemImage)
-                    .font(.system(size: row.isFolded ? 9 : 11.5, weight: .regular))
-                    .foregroundStyle(row.isFolded ? Palette.tertiaryLabel : Palette.secondaryLabel)
+            ForEach(tracks) { track in
+                Image(systemName: track.systemImage)
+                    .font(.system(size: 11.5, weight: .regular))
+                    .foregroundStyle(Palette.secondaryLabel)
                     .frame(maxWidth: .infinity)
-                    .frame(height: row.height)
+                    .frame(height: track.height)
                     .contentShape(Rectangle())
-                    .help(row.track.title)
-                    .accessibilityLabel(row.track.title)
+                    .help(track.title)
+                    .accessibilityLabel(track.title)
             }
         }
         .frame(width: StudioTimelineMetrics.gutterWidth)
         .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks), alignment: .top)
-        .animation(.fold, value: foldState)
         .overlay(alignment: .trailing) {
             Rectangle()
                 .fill(Palette.hairline)
@@ -389,14 +361,11 @@ struct StudioTimelineDock: View {
                 switch phase {
                 case .active(let location):
                     skimX = location.x
-                    let hovered = track(atY: location.y)
-                    if hovered != hoveredTrack { hoveredTrack = hovered }
                     let time = scale.time(forX: location.x + scrollX)
                     model.timelineHoverTime = time
                     model.hoverPreviewTime = time
                 case .ended:
                     skimX = nil
-                    hoveredTrack = nil
                     model.timelineHoverTime = nil
                     model.hoverPreviewTime = nil
                 }
@@ -433,7 +402,6 @@ struct StudioTimelineDock: View {
             ))
         }
         .frame(height: StudioTimelineMetrics.lanesHeight(tracks: tracks))
-        .animation(.fold, value: foldState)
         .alert(
             "Some files weren't added",
             isPresented: Binding(
@@ -478,15 +446,13 @@ struct StudioTimelineDock: View {
     private func scrollingLanes(scale: StudioTimelineScale) -> some View {
         ZStack(alignment: .topLeading) {
             VStack(spacing: StudioTimelineMetrics.trackSpacing) {
-                ForEach(tracks) { row in
-                    let isDropTarget = mediaDrop?.tracks.contains(row.track) == true
+                ForEach(tracks) { track in
+                    let isDropTarget = mediaDrop?.tracks.contains(track) == true
                     StudioTrackGround(
-                        hint: isDropTarget
-                            ? dropHint(for: row.track)
-                            : row.isFolded && hoveredTrack == row.track ? hint(for: row.track) : nil,
+                        hint: isDropTarget ? dropHint(for: track) : hint(for: track),
                         dropX: isDropTarget ? mediaDrop.map { scale.x(for: $0.time) - scrollX } : nil
                     )
-                    .frame(height: row.height)
+                    .frame(height: track.height)
                 }
                 Color.clear
                     .frame(height: StudioTimelineMetrics.scrollerGutter)
@@ -494,10 +460,9 @@ struct StudioTimelineDock: View {
 
             ScrollView(.horizontal) {
                 VStack(spacing: StudioTimelineMetrics.trackSpacing) {
-                    ForEach(tracks) { row in
-                        laneContent(for: row.track, scale: scale)
-                            .frame(width: scale.contentWidth, height: row.height)
-                            .environment(\.studioLaneHeight, row.height)
+                    ForEach(tracks) { track in
+                        laneContent(for: track, scale: scale)
+                            .frame(width: scale.contentWidth, height: track.height)
                     }
 
                     Color.clear
@@ -568,25 +533,22 @@ struct StudioTimelineDock: View {
         }
     }
 
-    /// Which tracks are folded, so their heights animate once per change.
-    private var foldState: [Bool] {
-        tracks.map(\.isFolded)
-    }
-
-    /// What a folded track is for, named at its leading edge while the
-    /// pointer is over it.
+    /// An empty track explains itself at its leading edge instead of
+    /// reading as dead space.
     private func hint(for track: StudioTrack) -> String? {
         switch track {
         case .zooms:
-            model.zoomEnabled ? "Zooms · drag across to add one" : "Zooms are off"
+            model.zoomEnabled && model.zoomTimelineBlocks.isEmpty ? "Drag across to add a zoom" : nil
         case .layouts:
-            "Camera layouts · drag across to change the layout"
+            model.cameraLayoutCues.isEmpty ? "Drag across to change the camera layout" : nil
         case .text:
-            "Text · drag across to add some"
+            model.textOverlays.isEmpty ? "Drag across to add text" : nil
         case .overlay:
-            "Images and effects · add them with +"
+            model.redactions.isEmpty && model.imageOverlays.isEmpty
+                ? "Add images and GIFs, or pixelate part of the picture, with +"
+                : nil
         case .audio:
-            "Audio · drop music or sound here"
+            model.audioClips.isEmpty ? "Drop music or sound here, or add it with +" : nil
         case .clips:
             nil
         }
@@ -759,31 +721,13 @@ private enum StudioTimelineMetrics {
     /// top of a zoom block.
     static let scrollerGutter: CGFloat = 8
 
-    static func scrollingLanesHeight(tracks: [StudioTrackRow]) -> CGFloat {
+    static func scrollingLanesHeight(tracks: [StudioTrack]) -> CGFloat {
         tracks.reduce(scrollerGutter) { $0 + $1.height + trackSpacing }
     }
 
-    static func lanesHeight(tracks: [StudioTrackRow]) -> CGFloat {
+    static func lanesHeight(tracks: [StudioTrack]) -> CGFloat {
         headerHeight + trackSpacing + scrollingLanesHeight(tracks: tracks)
     }
-}
-
-/// A track as laid out: open at its own height, or folded to a strip.
-private struct StudioTrackRow: Identifiable {
-    /// An empty track's strip: enough to aim a drag at, little else.
-    static let foldedHeight: CGFloat = 14
-
-    let track: StudioTrack
-    let isFolded: Bool
-
-    var id: StudioTrack.ID { track.id }
-    var height: CGFloat { isFolded ? Self.foldedHeight : track.height }
-}
-
-extension EnvironmentValues {
-    /// The height of the track a lane is drawn in, which a folded track
-    /// shrinks; marks drawn on an empty lane fit themselves to it.
-    @Entry fileprivate var studioLaneHeight: CGFloat = 30
 }
 
 /// A row of the timeline, named by its glyph in the gutter.
@@ -1199,8 +1143,8 @@ func studioPreciseTimecode(_ seconds: Double) -> String {
 
 /// The flat, full-width ground a track sits on. It stays pinned to the
 /// viewport while the track's blocks scroll over it, so the row reads as a
-/// fixed track no matter how far the timeline is zoomed. A folded track
-/// names what it is for at its leading edge while hovered.
+/// fixed track no matter how far the timeline is zoomed. An empty track
+/// names what it is for at its leading edge.
 private struct StudioTrackGround: View {
     let hint: String?
     /// Where dragged files would land, in viewport points; set only on the
@@ -1213,7 +1157,7 @@ private struct StudioTrackGround: View {
             .overlay(alignment: .leading) {
                 if let hint {
                     Text(hint)
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(dropX == nil ? Palette.tertiaryLabel : Palette.highlight)
                         .lineLimit(1)
                         .padding(.leading, 10)
@@ -1307,7 +1251,6 @@ private struct StudioZoomLane: View {
     /// reinterpret where the drag began.
     @State private var dragStartTime: TimeInterval?
     @State private var pendingZoomRange: ClosedRange<TimeInterval>?
-    @Environment(\.studioLaneHeight) private var laneHeight
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -1370,13 +1313,32 @@ private struct StudioZoomLane: View {
                     .frame(width: 3, height: 3)
                     .offset(
                         x: scale.x(for: pressTime) - 1.5,
-                        y: laneHeight - min(StudioZoomLaneMetrics.blockInset, laneHeight / 4) - 3
+                        y: StudioZoomLaneMetrics.laneHeight - StudioZoomLaneMetrics.blockInset - 3
                     )
                     .allowsHitTesting(false)
             }
 
             if let pendingZoomRange {
-                StudioPendingBlock(range: pendingZoomRange, scale: scale, tint: Palette.highlight)
+                let lowX = scale.x(for: pendingZoomRange.lowerBound)
+                let highX = scale.x(for: pendingZoomRange.upperBound)
+                RoundedRectangle(
+                    cornerRadius: StudioZoomLaneMetrics.blockCornerRadius,
+                    style: .continuous
+                )
+                    .fill(Palette.highlight.opacity(0.22))
+                    .overlay {
+                        RoundedRectangle(
+                            cornerRadius: StudioZoomLaneMetrics.blockCornerRadius,
+                            style: .continuous
+                        )
+                        .strokeBorder(
+                            Palette.highlight.opacity(0.8),
+                            style: StrokeStyle(lineWidth: 1.5, dash: [4, 3])
+                        )
+                    }
+                    .frame(width: max(2, highX - lowX), height: StudioZoomLaneMetrics.blockHeight)
+                    .offset(x: lowX, y: StudioZoomLaneMetrics.blockInset)
+                    .allowsHitTesting(false)
             }
 
             ForEach(visibleBlocks) { block in
@@ -1821,7 +1783,17 @@ private struct StudioLayoutLane: View {
                 )
 
             if let pendingRange {
-                StudioPendingBlock(range: pendingRange, scale: scale, tint: Palette.layoutCue)
+                let lowX = scale.x(for: pendingRange.lowerBound)
+                let highX = scale.x(for: pendingRange.upperBound)
+                RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+                    .fill(Palette.layoutCue.opacity(0.22))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
+                            .strokeBorder(Palette.layoutCue.opacity(0.9), style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                    }
+                    .frame(width: max(2, highX - lowX), height: StudioZoomLaneMetrics.blockHeight)
+                    .offset(x: lowX, y: StudioZoomLaneMetrics.blockInset)
+                    .allowsHitTesting(false)
             }
 
             ForEach(visibleBlocks) { block in
@@ -2288,27 +2260,23 @@ private struct StudioRedactionLane: View {
     }
 }
 
-/// The dashed block a drag across an empty track would create, fitted to
-/// the track's height so it also sits inside a folded strip.
+/// The dashed block a drag across an empty track would create.
 private struct StudioPendingBlock: View {
     let range: ClosedRange<TimeInterval>
     let scale: StudioTimelineScale
     let tint: Color
 
-    @Environment(\.studioLaneHeight) private var laneHeight
-
     var body: some View {
         let lowX = scale.x(for: range.lowerBound)
         let highX = scale.x(for: range.upperBound)
-        let height = min(StudioZoomLaneMetrics.blockHeight, laneHeight - 4)
-        let shape = RoundedRectangle(cornerRadius: min(StudioZoomLaneMetrics.blockCornerRadius, height / 2), style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: StudioZoomLaneMetrics.blockCornerRadius, style: .continuous)
         shape
             .fill(tint.opacity(0.22))
             .overlay {
                 shape.strokeBorder(tint.opacity(0.85), style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
             }
-            .frame(width: max(2, highX - lowX), height: height)
-            .offset(x: lowX, y: (laneHeight - height) / 2)
+            .frame(width: max(2, highX - lowX), height: StudioZoomLaneMetrics.blockHeight)
+            .offset(x: lowX, y: StudioZoomLaneMetrics.blockInset)
             .allowsHitTesting(false)
     }
 }
