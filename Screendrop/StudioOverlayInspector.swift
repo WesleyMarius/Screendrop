@@ -99,6 +99,7 @@ struct StudioTextInspectorControls: View {
     let text: RecordingTextOverlay
 
     @State private var side: Side = .enter
+    @State private var isAnimationExpanded = false
 
     private enum Side: Hashable, CaseIterable {
         case enter
@@ -183,7 +184,42 @@ struct StudioTextInspectorControls: View {
 
     private var animationControls: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
-            InspectorGroupLabel("Animation")
+            animationHeader
+
+            if isAnimationExpanded {
+                animationDetails
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    /// The section folded to one line naming both effects; a click opens
+    /// the pickers.
+    private var animationHeader: some View {
+        Button {
+            withAnimation(.fold) { isAnimationExpanded.toggle() }
+        } label: {
+            HStack(spacing: 6) {
+                InspectorGroupLabel("Animation")
+                Spacer(minLength: 8)
+                Text("In: \(text.animationIn.effect.title) · Out: \(text.animationOut.effect.title)")
+                    .font(.inspectorLabel)
+                    .foregroundStyle(Palette.secondaryLabel)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Palette.tertiaryLabel)
+                    .rotationEffect(.degrees(isAnimationExpanded ? 90 : 0))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isAnimationExpanded ? "Hide the animation settings" : "Show the animation settings")
+    }
+
+    private var animationDetails: some View {
+        VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
             InspectorSegmented(
                 options: Side.allCases,
                 isSelected: { $0 == side },
