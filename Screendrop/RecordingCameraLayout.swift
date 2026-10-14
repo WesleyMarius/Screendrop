@@ -122,18 +122,20 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
     var showsScreen: Bool { kind != .camera }
 
     /// The arrangement only: two layouts with the same preset differ only in
-    /// options the preset doesn't fix (corner, size, a split's side).
+    /// options the preset doesn't fix (corner, size, a split's side, and
+    /// whether a bubble is square or portrait).
     func matches(preset: RecordingCameraLayout) -> Bool {
         guard kind == preset.kind else { return false }
-        return kind != .pictureInPicture || shape == preset.shape
+        return kind != .pictureInPicture || (shape == .circle) == (preset.shape == .circle)
     }
 
     /// Applies a preset picked from the grid while keeping the options the
-    /// user already tuned (corner, size, split side and width).
+    /// user already tuned (corner, size, split side and width, a bubble's
+    /// shape).
     func adopting(_ preset: RecordingCameraLayout) -> RecordingCameraLayout {
         var next = self
         next.kind = preset.kind
-        if preset.kind == .pictureInPicture {
+        if preset.kind == .pictureInPicture, !matches(preset: preset) {
             next.shape = preset.shape
         }
         return next
@@ -192,13 +194,13 @@ nonisolated struct RecordingCameraLayout: Codable, Hashable, Sendable {
 }
 
 extension RecordingCameraLayout {
-    /// The layout grid, in reading order.
+    /// The layout grid, in reading order. A portrait camera is a bubble's
+    /// shape rather than a layout of its own.
     static let presets: [RecordingCameraLayout] = [
         .screenOnly,
         .cameraOnly,
         RecordingCameraLayout(kind: .pictureInPicture, shape: .square),
         RecordingCameraLayout(kind: .pictureInPicture, shape: .circle),
-        RecordingCameraLayout(kind: .pictureInPicture, shape: .portrait),
         RecordingCameraLayout(kind: .split),
         RecordingCameraLayout(kind: .cutout)
     ]
