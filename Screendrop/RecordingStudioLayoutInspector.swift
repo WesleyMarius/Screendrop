@@ -222,8 +222,8 @@ struct StudioCameraLayoutPicker: View {
 /// picked one sits a hair outside it, like every other picker tile in the
 /// inspector.
 ///
-/// When a tile is picked it replays the move the video is about to make,
-/// from the layout before into this one, on the video's own curve.
+/// When a choice it shows changes, such as the corner, the tile morphs
+/// from what it showed on the video's own curve.
 private struct StudioCameraLayoutTile: View {
     let preset: RecordingCameraLayout
     /// The layout in use, which the tile is either showing or not.
@@ -279,14 +279,12 @@ private struct StudioCameraLayoutTile: View {
         .onHover { isHovering = $0 }
         .animation(.easeOut(duration: 0.15), value: isHovering)
         .animation(.easeOut(duration: 0.2), value: isSelected)
-        .onChange(of: current) { old, new in
-            // Newly picked, the tile moves from the layout that was in use;
-            // otherwise only from what it showed itself, so a new corner
-            // slides every corner camera over and a slider moves nothing.
-            let source = !old.matches(preset: preset) && new.matches(preset: preset)
-                ? old.miniature
-                : old.adopting(preset).miniature
-            morph(from: source)
+        .onChange(of: current) { old, _ in
+            // Only from what the tile showed itself, so a new corner slides
+            // every corner camera over and a slider moves nothing. A newly
+            // picked tile keeps its picture: replaying the move from the
+            // layout before would first snap it to that layout's picture.
+            morph(from: old.adopting(preset).miniature)
         }
         .help(preset.detailedTitle)
         .accessibilityLabel(preset.title)
