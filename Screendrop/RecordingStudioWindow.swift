@@ -451,6 +451,11 @@ private struct StudioCanvasComposition: View {
     private static let editMorphDuration: TimeInterval = 0.45
 
     @State private var layoutMorph: LayoutMorph?
+    /// The layout timeline the canvas draws. An edit reaches the model a
+    /// pass before onChange can start its morph; drawing the edit's layout
+    /// for that pass would drop a cutout's layer, and its readiness with
+    /// it, so the framed camera would show in full all the way to a split.
+    @State private var shownTimeline: RecordingCameraLayoutTimeline?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var baseLayout: RecordingStudioLayout {
@@ -493,7 +498,7 @@ private struct StudioCanvasComposition: View {
         let resolver = resolver
 
         TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !model.isPlaying && layoutMorph == nil)) { context in
-            let target = targetFrame(resolver, timeline: model.cameraLayoutTimeline)
+            let target = targetFrame(resolver, timeline: shownTimeline ?? model.cameraLayoutTimeline)
             let frame = layoutMorph.map { morph in
                 RecordingCameraLayoutFrame.interpolate(
                     morph.from,
@@ -567,7 +572,9 @@ private struct StudioCanvasComposition: View {
             .transaction { $0.animation = nil }
         }
         .frame(width: canvasSize.width, height: canvasSize.height)
-        .onChange(of: model.cameraLayoutTimeline) { old, _ in
+        .onAppear { shownTimeline = model.cameraLayoutTimeline }
+        .onChange(of: model.cameraLayoutTimeline) { old, new in
+            shownTimeline = new
             morphFromEdit(previous: targetFrame(resolver, timeline: old), resolver: resolver)
         }
         .onChange(of: model.showsCameraLayer) { old, _ in
