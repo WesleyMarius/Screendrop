@@ -61,18 +61,21 @@ struct StudioTimelineDock: View {
     }
 
     var body: some View {
-        VStack(spacing: StudioTimelineMetrics.controlSpacing) {
+        VStack(spacing: 0) {
             controlRow
                 .padding(.horizontal, 16)
-            // The tracks run from the gutter at the leading edge to the
-            // trailing edge, like the web editor's.
+                .padding(.vertical, 8)
+            // As in the web editor, a hairline closes the tool row off from
+            // the tracks edge to edge, and the gutter's own line runs from
+            // it to the bottom of the dock.
+            Rectangle()
+                .fill(Palette.hairline)
+                .frame(height: 1)
             HStack(alignment: .top, spacing: 0) {
                 trackGutter
                 lanes
             }
         }
-        .padding(.top, 10)
-        .padding(.bottom, 14)
         .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .top) {
             Rectangle()
@@ -708,8 +711,6 @@ struct StudioTimelineDock: View {
 }
 
 private enum StudioTimelineMetrics {
-    /// Between the control row and the tracks.
-    static let controlSpacing: CGFloat = 8
     /// Between one track and the next, as in the web editor.
     static let trackSpacing: CGFloat = 4
     static let gutterWidth: CGFloat = 40
@@ -717,9 +718,10 @@ private enum StudioTimelineMetrics {
     static let rulerHeight: CGFloat = 20
     /// The playhead's lane and the ruler, above the first track.
     static let headerHeight = playheadLaneHeight + rulerHeight
-    /// Room under the lanes for the horizontal scroller, so it never sits on
-    /// top of a zoom block.
-    static let scrollerGutter: CGFloat = 8
+    /// Room under the last track - with the gap after it, about what the
+    /// web editor leaves - which the gutter's line runs through and the
+    /// horizontal scroller uses while scrolling.
+    static let scrollerGutter: CGFloat = 6
 
     static func scrollingLanesHeight(tracks: [StudioTrack]) -> CGFloat {
         tracks.reduce(scrollerGutter) { $0 + $1.height + trackSpacing }
