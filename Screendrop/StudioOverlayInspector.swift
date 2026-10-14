@@ -526,10 +526,8 @@ struct StudioImageInspectorControls: View {
                     )
                     .help("Corner radius, measured on a 1080p video")
                 }
-                InspectorFieldPair {
+                InspectorHalfField {
                     InspectorSlider("Shadow", value: value(\.shadow, action: "Change Image Shadow"), range: 0...1, format: .percent())
-                } trailing: {
-                    Color.clear
                 }
             }
 
@@ -577,7 +575,9 @@ struct StudioAudioClipInspectorControls: View {
     var body: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
             VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
-                InspectorSlider("Volume", value: value(\.volume, action: "Change Audio Volume"), range: 0...1, format: .percent())
+                InspectorHalfField {
+                    InspectorSlider("Volume", value: value(\.volume, action: "Change Audio Volume"), range: 0...1, format: .percent())
+                }
                 InspectorFieldPair {
                     InspectorSlider(
                         "Fade In",

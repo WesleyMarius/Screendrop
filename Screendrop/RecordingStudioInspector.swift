@@ -531,16 +531,18 @@ struct StudioInspector: View {
                 )
             }
 
-            InspectorSlider(
-                "Shadow",
-                value: $model.style.shadow,
-                range: 0...1,
-                format: .percent()
-            )
-            // The shadow falls on the background; with none there is
-            // nothing for it to fall on.
-            .disabled(model.style.background == .none)
-            .opacity(model.style.background == .none ? 0.4 : 1)
+            InspectorHalfField {
+                InspectorSlider(
+                    "Shadow",
+                    value: $model.style.shadow,
+                    range: 0...1,
+                    format: .percent()
+                )
+                // The shadow falls on the background; with none there is
+                // nothing for it to fall on.
+                .disabled(model.style.background == .none)
+                .opacity(model.style.background == .none ? 0.4 : 1)
+            }
         }
     }
 
@@ -720,12 +722,14 @@ struct StudioInspector: View {
 
     private var cursorControls: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
-            InspectorSlider(
-                "Size",
-                value: $model.style.cursorScale,
-                range: 1...4,
-                format: .magnification(fractionDigits: 1)
-            )
+            InspectorHalfField {
+                InspectorSlider(
+                    "Size",
+                    value: $model.style.cursorScale,
+                    range: 1...4,
+                    format: .magnification(fractionDigits: 1)
+                )
+            }
 
             if model.canShowPressEffects {
                 InspectorToggleRow("Click highlights", isOn: $model.showsClickEffects)
@@ -1161,7 +1165,9 @@ struct StudioInspector: View {
             // A silent recording has nothing to send out, but it can still
             // be given a soundtrack - so only the export half is withheld.
             if model.hasAudio {
-                InspectorSlider("Volume", value: $model.audioVolume, range: 0...2, format: .percent())
+                InspectorHalfField {
+                    InspectorSlider("Volume", value: $model.audioVolume, range: 0...2, format: .percent())
+                }
             }
 
             HStack(spacing: InspectorMetrics.rowSpacing) {

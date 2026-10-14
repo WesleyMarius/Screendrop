@@ -84,7 +84,9 @@ struct StudioCameraLayoutPicker: View {
                     .opacity(layout.shape == .circle ? 0.4 : 1)
                 }
 
-                zoomShrinkControls
+                InspectorHalfField {
+                    zoomShrinkSlider
+                }
             }
         case .cutout:
             VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
@@ -97,10 +99,12 @@ struct StudioCameraLayoutPicker: View {
                     )
                 }
 
-                slider("Size", \.cutoutSize, range: RecordingCameraLayout.cutoutSizeRange)
-                    .help("How tall the camera's picture stands, measured on the canvas's shorter side")
-
-                zoomShrinkControls
+                InspectorFieldPair {
+                    slider("Size", \.cutoutSize, range: RecordingCameraLayout.cutoutSizeRange)
+                        .help("How tall the camera's picture stands, measured on the canvas's shorter side")
+                } trailing: {
+                    zoomShrinkSlider
+                }
             }
         case .split:
             VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
@@ -151,30 +155,29 @@ struct StudioCameraLayoutPicker: View {
         }
     }
 
-    /// A camera over the screen steps back for zooms.
-    @ViewBuilder
-    private var zoomShrinkControls: some View {
-        InspectorToggleRow(
-            "Shrink during zooms",
-            isOn: Binding(
-                get: { model.style.camera.shrinksDuringZoom },
-                set: { isOn in
-                    withAnimation(.fold) { model.style.camera.shrinksDuringZoom = isOn }
+    /// A camera over the screen steps back for zooms: by how much, where
+    /// 0% leaves it where it is. One field rather than a switch and a field.
+    private var zoomShrinkSlider: some View {
+        InspectorSlider(
+            "Shrink",
+            value: Binding(
+                get: { model.style.camera.shrinksDuringZoom ? model.style.camera.zoomShrinkAmount : 0 },
+                set: { amount in
+                    if amount < 0.01 {
+                        model.style.camera.shrinksDuringZoom = false
+                    } else {
+                        model.style.camera.shrinksDuringZoom = true
+                        model.style.camera.zoomShrinkAmount = max(
+                            RecordingCameraBubbleSettings.zoomShrinkAmountRange.lowerBound,
+                            amount
+                        )
+                    }
                 }
-            )
+            ),
+            range: 0...RecordingCameraBubbleSettings.zoomShrinkAmountRange.upperBound,
+            format: .percent()
         )
-        .help("The camera steps back while the screen is zoomed in, and returns when it zooms out")
-
-        if model.style.camera.shrinksDuringZoom {
-            InspectorSlider(
-                "Shrink",
-                value: $model.style.camera.zoomShrinkAmount,
-                range: RecordingCameraBubbleSettings.zoomShrinkAmountRange,
-                format: .percent()
-            )
-            .help("How much smaller the camera gets once a zoom lands")
-            .transition(.opacity)
-        }
+        .help("How much smaller the camera gets while the screen is zoomed in. 0% keeps it full size.")
     }
 
     private var isPortraitCanvas: Bool {
