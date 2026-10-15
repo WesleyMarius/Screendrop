@@ -83,9 +83,14 @@ final class RecordingStudioModel {
             if oldValue.camera.isVisible != style.camera.isVisible {
                 updateCameraMatteCache()
             }
+            if oldValue.camera.beauty != style.camera.beauty {
+                updateCameraBeautyPreview()
+            }
+            var unchangedCamera = oldValue.camera
+            unchangedCamera.beauty = style.camera.beauty
             if oldValue.camera.layout != style.camera.layout {
                 rebuildCameraLayoutTimeline()
-            } else if oldValue.camera != style.camera || oldValue.padding != style.padding
+            } else if unchangedCamera != style.camera || oldValue.padding != style.padding
                 || oldValue.cornerRadius != style.cornerRadius {
                 rebuildMotionTimeline()
             }
@@ -210,6 +215,8 @@ final class RecordingStudioModel {
     var selectedRedactionID: UUID?
     /// What the screen player's composition filters each frame through.
     let redactionPreview = RecordingRedactionPreviewSource()
+    /// What the camera player's composition touches each frame up with.
+    let cameraBeautyPreview = StudioCameraBeautyPreviewSource()
     /// Images and GIFs over the canvas, on the source clock, drawn above
     /// the camera and below text.
     private(set) var imageOverlays: [RecordingImageOverlay] = []
@@ -322,6 +329,8 @@ final class RecordingStudioModel {
     /// Re-renders the paused frame after a region changes, at most once a
     /// display frame however fast a drag reports.
     private var redactionRefreshTask: Task<Void, Never>?
+    /// Re-renders the paused camera frame after a touch-up changes.
+    private var cameraBeautyRefreshTask: Task<Void, Never>?
     /// Ends an inspector edit once its control has rested, so a slider
     /// sweep or a run of typing undoes as one step.
     private var textCoalesceTask: Task<Void, Never>?
@@ -439,6 +448,7 @@ final class RecordingStudioModel {
             cameraPlayer.replaceCurrentItem(with: AVPlayerItem(url: session.cameraURL))
             cameraPlayer.actionAtItemEnd = .pause
             cameraPlayer.isMuted = true
+            updateCameraBeautyPreview()
         } else {
             style.camera.isVisible = false
         }
@@ -628,6 +638,8 @@ final class RecordingStudioModel {
         redactionEditSnapshot = nil
         redactionRefreshTask?.cancel()
         redactionRefreshTask = nil
+        cameraBeautyRefreshTask?.cancel()
+        cameraBeautyRefreshTask = nil
         textCoalesceTask?.cancel()
         redactionCoalesceTask?.cancel()
         imageCoalesceTask?.cancel()
@@ -1697,6 +1709,36 @@ final class RecordingStudioModel {
             guard !self.isPlaying, let item = self.screenPlayer.currentItem else { return }
             if !self.redactions.isEmpty {
                 item.videoComposition = self.redactionPreview.makeVideoComposition(for: item.asset)
+            }
+            self.movePlayers(to: self.displayTime)
+        }
+    }
+
+    /// The camera player runs a touch-up composition only while there's
+    /// something to touch up, so an untouched camera plays as recorded.
+    private func updateCameraBeautyPreview() {
+        let beauty = style.camera.beauty
+        cameraBeautyPreview.update(beauty)
+        guard let item = cameraPlayer.currentItem else { return }
+        if !beauty.isActive {
+            item.videoComposition = nil
+        } else if item.videoComposition == nil {
+            item.videoComposition = cameraBeautyPreview.makeVideoComposition(for: item.asset)
+        }
+        scheduleCameraBeautyRefresh()
+    }
+
+    /// Like a region edit, a touch-up changed while paused needs the
+    /// camera's frame drawn again.
+    private func scheduleCameraBeautyRefresh() {
+        guard !isPlaying, cameraBeautyRefreshTask == nil else { return }
+        cameraBeautyRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard let self, !Task.isCancelled else { return }
+            self.cameraBeautyRefreshTask = nil
+            guard !self.isPlaying, let item = self.cameraPlayer.currentItem else { return }
+            if self.style.camera.beauty.isActive {
+                item.videoComposition = self.cameraBeautyPreview.makeVideoComposition(for: item.asset)
             }
             self.movePlayers(to: self.displayTime)
         }

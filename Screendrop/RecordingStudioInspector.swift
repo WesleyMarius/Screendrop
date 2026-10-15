@@ -646,12 +646,33 @@ struct StudioInspector: View {
     /// The default layout. Cues on the timeline's Layout lane switch to
     /// another one for part of the video.
     private var cameraControls: some View {
-        VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+        VStack(alignment: .leading, spacing: InspectorMetrics.groupSpacing) {
             StudioCameraLayoutPicker(model: model, layout: model.style.camera.layout) { layout, isContinuous in
                 if isContinuous {
                     model.style.camera.layout = layout
                 } else {
                     withAnimation(.morphQuickIfAllowed) { model.style.camera.layout = layout }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: InspectorMetrics.groupLabelSpacing) {
+                InspectorGroupLabel("Touch up")
+                InspectorFieldPair {
+                    InspectorSlider(
+                        "Face light",
+                        value: $model.style.camera.beauty.faceLight,
+                        range: 0...1,
+                        format: .percent()
+                    )
+                    .help("Brightens the face's shadows and midtones, like a soft light in front of you")
+                } trailing: {
+                    InspectorSlider(
+                        "Smooth skin",
+                        value: $model.style.camera.beauty.skinSmoothing,
+                        range: 0...1,
+                        format: .percent()
+                    )
+                    .help("Evens out skin and softens blemishes, keeping eyes, brows and lips sharp")
                 }
             }
         }

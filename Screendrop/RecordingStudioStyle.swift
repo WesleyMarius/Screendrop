@@ -23,6 +23,8 @@ struct RecordingCameraBubbleSettings: Equatable {
     var shrinksDuringZoom = true
     /// How much smaller it gets once a zoom lands, as a fraction of its size.
     var zoomShrinkAmount: CGFloat = RecordingCameraBubbleSettings.defaultZoomShrinkAmount
+    /// Face light and skin smoothing, applied to the camera's picture.
+    var beauty = StudioCameraBeauty()
 
     static let defaultZoomShrinkAmount: CGFloat = 0.1
     static let zoomShrinkAmountRange: ClosedRange<CGFloat> = 0.05...0.4
@@ -355,6 +357,10 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
     /// Optional so projects saved before it decode with it on.
     var cameraShrinksDuringZoom: Bool?
     var cameraZoomShrinkAmount: Double?
+    /// Optional so projects saved before touch-ups decode with them off;
+    /// nil while off.
+    var cameraFaceLight: Double?
+    var cameraSkinSmoothing: Double?
 
     init(_ style: RecordingStudioStyle) {
         switch style.background {
@@ -383,6 +389,8 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
         cameraZoomShrinkAmount = style.camera.zoomShrinkAmount == RecordingCameraBubbleSettings.defaultZoomShrinkAmount
             ? nil
             : Double(style.camera.zoomShrinkAmount)
+        cameraFaceLight = style.camera.beauty.faceLight > 0 ? Double(style.camera.beauty.faceLight) : nil
+        cameraSkinSmoothing = style.camera.beauty.skinSmoothing > 0 ? Double(style.camera.beauty.skinSmoothing) : nil
     }
 
     var value: RecordingStudioStyle {
@@ -419,7 +427,11 @@ struct StoredRecordingStudioStyle: Codable, Equatable {
                 zoomShrinkAmount: cameraZoomShrinkAmount.map {
                     min(max(CGFloat($0), RecordingCameraBubbleSettings.zoomShrinkAmountRange.lowerBound),
                         RecordingCameraBubbleSettings.zoomShrinkAmountRange.upperBound)
-                } ?? RecordingCameraBubbleSettings.defaultZoomShrinkAmount
+                } ?? RecordingCameraBubbleSettings.defaultZoomShrinkAmount,
+                beauty: StudioCameraBeauty(
+                    faceLight: CGFloat(min(max(cameraFaceLight ?? 0, 0), 1)),
+                    skinSmoothing: CGFloat(min(max(cameraSkinSmoothing ?? 0, 0), 1))
+                )
             )
         )
     }

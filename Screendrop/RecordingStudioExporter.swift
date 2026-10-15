@@ -316,7 +316,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
 
         let cameraFeed = try await CameraFrameFeed(
             url: configuration.cameraURL,
-            offset: configuration.cameraOffset
+            offset: configuration.cameraOffset,
+            beauty: StudioCameraBeautyFrameFilter(beauty: configuration.style.camera.beauty)
         )
 
         // Writer
@@ -735,12 +736,15 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
     private let reader: AVAssetReader
     private let output: AVAssetReaderTrackOutput
     private let offset: TimeInterval
+    /// Touches up each frame once, as it becomes the current one.
+    private let beauty: StudioCameraBeautyFrameFilter?
     private var currentFrame: (buffer: CVPixelBuffer, time: TimeInterval)?
+    private var isCurrentTouchedUp = false
     /// Decoded frames after the current one, oldest first.
     private var ahead: [(buffer: CVPixelBuffer, time: TimeInterval)] = []
     private var isFinished = false
 
-    init?(url: URL?, offset: TimeInterval) async throws {
+    init?(url: URL?, offset: TimeInterval, beauty: StudioCameraBeautyFrameFilter? = nil) async throws {
         guard let url else { return nil }
         let asset = AVURLAsset(url: url)
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
@@ -766,6 +770,7 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
         self.reader = reader
         self.output = output
         self.offset = offset
+        self.beauty = beauty
     }
 
     /// `time` is the frame's own time on the screen's clock.
@@ -777,10 +782,16 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
                 // its first frame from t=0 beats the bubble popping in late.
                 guard next.time <= screenTime || currentFrame == nil else { break }
                 currentFrame = next
+                isCurrentTouchedUp = false
                 ahead.removeFirst()
             } else if !decodeNext() {
                 break
             }
+        }
+        // Only the frame shown is touched up, not those skipped past.
+        if let beauty, let frame = currentFrame, !isCurrentTouchedUp {
+            currentFrame = (beauty.apply(to: frame.buffer, time: frame.time), frame.time)
+            isCurrentTouchedUp = true
         }
         return currentFrame
     }
