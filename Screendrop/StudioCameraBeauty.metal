@@ -10,6 +10,8 @@ struct StudioFaceTouchUpParameters {
     // stops counting: wider smooths stronger blemishes away.
     float rangeSigma;
     float smoothing;
+    // The share of the finest texture put back over the smoothed skin.
+    float grain;
     float light;
 };
 
@@ -74,11 +76,11 @@ kernel void studioFaceTouchUp(texture2d<float, access::read> source [[texture(0)
         float spread = sqrt(max(lumaSquares / spatialSum - mean * mean, 0.0f));
         // Skin, blemishes and all, is calm next to stubble, lashes and
         // hair, which are left as they are.
-        smoothWeight *= 1.0f - smoothstep(0.06f, 0.12f, spread);
+        smoothWeight *= 1.0f - smoothstep(0.09f, 0.18f, spread);
 
         // The finest texture - pores, the camera's grain - is what makes
         // skin read as skin, and what the rest of the frame still has: put
-        // most of it back, so only blemishes and uneven tone smooth away.
+        // some of it back, so mostly blemishes and uneven tone smooth away.
         float3 local = 0;
         for (int y = -1; y <= 1; ++y) {
             for (int x = -1; x <= 1; ++x) {
@@ -86,7 +88,7 @@ kernel void studioFaceTouchUp(texture2d<float, access::read> source [[texture(0)
             }
         }
         float3 grain = original.rgb - local / 9.0f;
-        float3 smoothed = max(total / max(totalWeight, 1e-5f) + grain * 0.7f, 0.0f);
+        float3 smoothed = max(total / max(totalWeight, 1e-5f) + grain * parameters.grain, 0.0f);
         color = mix(color, smoothed, smoothWeight);
     }
 

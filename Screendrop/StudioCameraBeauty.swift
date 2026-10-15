@@ -185,15 +185,18 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
         // A blemish is a few hundredths of a face across.
         let step = max(1, faceWidth * 0.008)
         let smoothing = min(max(beauty.skinSmoothing, 0), 1)
+        // Eased, so the middle of the slider already does most of the work.
+        let blend = 1 - (1 - smoothing) * (1 - smoothing)
         guard let result = try? StudioFaceTouchUpKernel.apply(
             withExtent: frame,
             inputs: [normalized.clampedToExtent(), masks.skin.clampedToExtent(), masks.light.clampedToExtent()],
             arguments: [
                 "step": Float(step),
-                "rangeSigma": Float(0.035 + 0.06 * smoothing),
-                // Never all the way, so some of the skin's own texture
-                // stays and it doesn't read as plastic.
-                "smoothing": Float(0.9 * smoothing),
+                "rangeSigma": Float(0.04 + 0.08 * smoothing),
+                // Never all the way, and some fine texture always comes back,
+                // so the skin doesn't read as plastic.
+                "smoothing": Float(0.95 * blend),
+                "grain": Float(0.6 - 0.3 * smoothing),
                 "light": Float(min(max(beauty.faceLight, 0), 1)),
                 "pad": smoothing > 0.005 ? ceil(step * 3) + 1 : 0
             ]
@@ -310,6 +313,7 @@ nonisolated final class StudioFaceTouchUpKernel: CIImageProcessorKernel {
         var step: Float
         var rangeSigma: Float
         var smoothing: Float
+        var grain: Float
         var light: Float
     }
 
@@ -358,6 +362,7 @@ nonisolated final class StudioFaceTouchUpKernel: CIImageProcessorKernel {
             step: arguments?["step"] as? Float ?? 1,
             rangeSigma: arguments?["rangeSigma"] as? Float ?? 0.05,
             smoothing: arguments?["smoothing"] as? Float ?? 0,
+            grain: arguments?["grain"] as? Float ?? 0,
             light: arguments?["light"] as? Float ?? 0
         )
         encoder.setComputePipelineState(pipeline)
