@@ -215,8 +215,10 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
         guard faceWidth > 1 else { return nil }
 
         guard let skin = drawMask(width: width, height: height, draw: { context in
+            // Up to the hairline and out to the ears: the kernel itself
+            // leaves hair and stubble alone, so the mask needn't stop short.
             for face in faces {
-                fillEllipse(face, in: context, size: size, centerOffset: 0.08, radii: CGSize(width: 0.46, height: 0.62))
+                fillEllipse(face, in: context, size: size, centerOffset: 0.12, radii: CGSize(width: 0.5, height: 0.7))
             }
             context.setFillColor(gray: 0, alpha: 1)
             context.setStrokeColor(gray: 0, alpha: 1)
@@ -224,11 +226,13 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
             context.setLineCap(.round)
             for face in faces {
                 let width = face.box.width * size.width
+                // Tight around the eyes, so the skin under them - where
+                // smoothing is wanted most - is still smoothed.
                 for region in [StudioFaceShape.Region.leftEye, .rightEye] {
-                    trace(face.points(region), in: context, size: size, closed: true, lineWidth: width * 0.07)
+                    trace(face.points(region), in: context, size: size, closed: true, lineWidth: width * 0.03)
                 }
                 for region in [StudioFaceShape.Region.leftEyebrow, .rightEyebrow] {
-                    trace(face.points(region), in: context, size: size, closed: false, lineWidth: width * 0.07)
+                    trace(face.points(region), in: context, size: size, closed: false, lineWidth: width * 0.06)
                 }
                 trace(face.points(.outerLips), in: context, size: size, closed: true, lineWidth: width * 0.04)
             }
@@ -254,7 +258,7 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
                 .transformed(by: upscale)
                 .cropped(to: CGRect(origin: .zero, size: imageSize))
         }
-        return (soften(skin, sigma: faceWidth * 0.035), soften(light, sigma: faceWidth * 0.06))
+        return (soften(skin, sigma: faceWidth * 0.02), soften(light, sigma: faceWidth * 0.06))
     }
 
     private static func drawMask(width: Int, height: Int, draw: (CGContext) -> Void) -> CGImage? {

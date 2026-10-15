@@ -49,21 +49,45 @@ kernel void studioFaceTouchUp(texture2d<float, access::read> source [[texture(0)
         float inverseRange = 1.0f / (2.0f * parameters.rangeSigma * parameters.rangeSigma);
         float3 total = 0;
         float totalWeight = 0;
+        // The neighbourhood's brightness spread, from spatial weights alone.
+        float lumaSum = 0, lumaSquares = 0, spatialSum = 0;
         for (int y = -3; y <= 3; ++y) {
             for (int x = -3; x <= 3; ++x) {
                 float2 offset = float2(x, y) * parameters.step;
                 int2 tap = clamp(center + int2(round(offset)), int2(0), size - 1);
                 float3 neighbour = source.read(uint2(tap)).rgb;
-                float3 difference = sqrt(max(neighbour, 0.0f)) - reference;
+                float3 gamma = sqrt(max(neighbour, 0.0f));
+                float3 difference = gamma - reference;
                 // Spatial sigma of 1.5 taps.
                 float spatial = exp(-float(x * x + y * y) / 4.5f);
                 float range = exp(-dot(difference, difference) * inverseRange);
                 float w = spatial * range;
                 total += neighbour * w;
                 totalWeight += w;
+                float luma = dot(gamma, float3(0.2126f, 0.7152f, 0.0722f));
+                lumaSum += luma * spatial;
+                lumaSquares += luma * luma * spatial;
+                spatialSum += spatial;
             }
         }
-        color = mix(color, total / max(totalWeight, 1e-5f), smoothWeight);
+        float mean = lumaSum / spatialSum;
+        float spread = sqrt(max(lumaSquares / spatialSum - mean * mean, 0.0f));
+        // Skin, blemishes and all, is calm next to stubble, lashes and
+        // hair, which are left as they are.
+        smoothWeight *= 1.0f - smoothstep(0.06f, 0.12f, spread);
+
+        // The finest texture - pores, the camera's grain - is what makes
+        // skin read as skin, and what the rest of the frame still has: put
+        // most of it back, so only blemishes and uneven tone smooth away.
+        float3 local = 0;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                local += source.read(uint2(clamp(center + int2(x, y), int2(0), size - 1))).rgb;
+            }
+        }
+        float3 grain = original.rgb - local / 9.0f;
+        float3 smoothed = max(total / max(totalWeight, 1e-5f) + grain * 0.7f, 0.0f);
+        color = mix(color, smoothed, smoothWeight);
     }
 
     if (lightWeight >= 0.004f) {
