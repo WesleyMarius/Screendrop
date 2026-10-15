@@ -208,7 +208,7 @@ struct StudioInspector: View {
         if model.hasCameraVideo {
             InspectorSection(
                 "Camera",
-                summary: model.style.camera.isVisible ? model.style.camera.layout.detailedTitle : nil,
+                summary: model.style.camera.isVisible ? cameraSummary : nil,
                 isOn: $model.style.camera.isVisible,
                 toggleTitle: "Show camera",
                 isExpanded: expansion("Camera")
@@ -379,6 +379,16 @@ struct StudioInspector: View {
         let background = (model.previewBackground ?? model.style.background).displayTitle
         let padding = InspectorValueFormat.percent().displayString(for: model.style.padding)
         return "\(background) · \(padding)"
+    }
+
+    /// The default layout's name and where it puts the camera.
+    private var cameraSummary: String {
+        let layout = model.style.camera.layout
+        return switch layout.kind {
+        case .pictureInPicture: "\(layout.title) · \(layout.corner.title)"
+        case .cutout: "\(layout.title) · \(layout.placement.title)"
+        case .screen, .camera, .split: layout.title
+        }
     }
 
     private var zoomSummary: String {
