@@ -844,10 +844,10 @@ private enum StudioTrack: String, Identifiable {
         switch self {
         case .text: "character.textbox"
         case .overlay: "square.3.layers.3d"
-        case .clips: "movieclapper"
+        case .clips: "video"
         case .zooms: "magnifyingglass"
-        case .layouts: "inset.filled.rectangle.and.person.filled"
-        case .audio: "music.note.tv"
+        case .layouts: "person.crop.rectangle"
+        case .audio: "music.note"
         }
     }
 
