@@ -402,7 +402,7 @@ struct StudioInspector: View {
     }
 
     private func placementSummary(_ placement: RecordingKeystrokePlacement) -> String {
-        StudioPlacementPicker.name(of: placement)
+        StudioPlacementPad.name(of: placement)
     }
 
     private var audioSummary: String? {
@@ -1004,13 +1004,19 @@ struct StudioInspector: View {
     // MARK: Text
 
     private var keystrokeControls: some View {
-        StudioPlacementPicker(selection: $model.keystrokePlacement)
-            .help("Where the shortcuts you pressed while recording appear")
+        StudioPlacementPad(selection: $model.keystrokePlacement, canvasAspect: canvasAspect)
+            .help("Shortcuts you pressed while recording appear as a caption here")
     }
 
     private var speedBadgeControls: some View {
-        StudioPlacementPicker(selection: $model.speedBadgePlacement)
-            .help("Where sped-up clips carry their “2× ›››” badge")
+        StudioPlacementPad(selection: $model.speedBadgePlacement, canvasAspect: canvasAspect)
+            .help("Sped-up clips carry a “2× ›››” badge here while they play")
+    }
+
+    /// The video's width over its height, which the placement pads take.
+    private var canvasAspect: CGFloat {
+        let size = model.basePreviewCanvasSize
+        return size.height > 0 ? size.width / size.height : 16 / 9
     }
 
     @ViewBuilder
@@ -1696,77 +1702,97 @@ private struct StudioAudioExportOptions: View {
     }
 }
 
-/// Where a caption or badge sits on the video: the edge in one half of the
-/// row, the side along it in the other, both the inspector's own tabs so
-/// one of each is always chosen. The glyphs fill the part of the frame they
-/// name.
-private struct StudioPlacementPicker: View {
+/// Where a caption or badge sits on the video, picked on a miniature of it:
+/// six spots along the top and bottom edges of a tile shaped like the
+/// canvas. The chosen spot shows as a small caption-shaped bar, the rest as
+/// dots that brighten under the pointer, like the annotator's alignment
+/// pad. The spot's name reads beside it, and previews the hovered one.
+private struct StudioPlacementPad: View {
     @Binding var selection: RecordingKeystrokePlacement
+    let canvasAspect: CGFloat
 
-    private enum Column: CaseIterable {
-        case left, center, right
+    @State private var hovered: RecordingKeystrokePlacement?
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-        var title: String {
-            switch self {
-            case .left: "Left"
-            case .center: "Center"
-            case .right: "Right"
-            }
-        }
-
-        var systemImage: String {
-            switch self {
-            case .left: "rectangle.leadinghalf.inset.filled"
-            case .center: "rectangle.center.inset.filled"
-            case .right: "rectangle.trailinghalf.inset.filled"
-            }
-        }
-    }
-
-    private var column: Column {
-        switch selection {
-        case .topLeft, .bottomLeft: .left
-        case .topCenter, .bottomCenter: .center
-        case .topRight, .bottomRight: .right
-        }
-    }
-
-    private static func placement(isTop: Bool, column: Column) -> RecordingKeystrokePlacement {
-        switch (isTop, column) {
-        case (true, .left): .topLeft
-        case (true, .center): .topCenter
-        case (true, .right): .topRight
-        case (false, .left): .bottomLeft
-        case (false, .center): .bottomCenter
-        case (false, .right): .bottomRight
-        }
-    }
+    private static let height: CGFloat = 44
+    private static let rows: [[RecordingKeystrokePlacement]] = [
+        [.topLeft, .topCenter, .topRight],
+        [.bottomLeft, .bottomCenter, .bottomRight]
+    ]
 
     var body: some View {
-        InspectorFieldPair {
-            InspectorSegmented(
-                options: [true, false],
-                isSelected: { $0 == selection.isTop },
-                onTap: { isTop in selection = Self.placement(isTop: isTop, column: column) },
-                label: { isTop in
-                    Image(systemName: isTop ? "rectangle.tophalf.inset.filled" : "rectangle.bottomhalf.inset.filled")
-                        .font(.system(size: 11, weight: .medium))
-                        .help(isTop ? "Top" : "Bottom")
-                        .accessibilityLabel(isTop ? "Top" : "Bottom")
+        HStack(spacing: 10) {
+            pad
+            Text(Self.name(of: hovered ?? selection))
+                .font(.inspectorValue)
+                .foregroundStyle(hovered == nil || hovered == selection ? Palette.label : Palette.secondaryLabel)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var pad: some View {
+        // Never narrower than square, so a portrait canvas's spots still
+        // have room.
+        let width = min(max(Self.height * canvasAspect, Self.height), 92)
+        let shape = RoundedRectangle(cornerRadius: InspectorMetrics.fieldRadius, style: .continuous)
+        return VStack(spacing: 0) {
+            ForEach(Self.rows.indices, id: \.self) { row in
+                if row == 1 { Spacer(minLength: 0) }
+                HStack(spacing: 0) {
+                    ForEach(Self.rows[row], id: \.self) { placement in
+                        spot(placement)
+                    }
                 }
-            )
-        } trailing: {
-            InspectorSegmented(
-                options: Column.allCases,
-                isSelected: { $0 == column },
-                onTap: { column in selection = Self.placement(isTop: selection.isTop, column: column) },
-                label: { column in
-                    Image(systemName: column.systemImage)
-                        .font(.system(size: 11, weight: .medium))
-                        .help(column.title)
-                        .accessibilityLabel(column.title)
-                }
-            )
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, InspectorMetrics.controlInset)
+        .frame(width: width, height: Self.height)
+        .background(shape.fill(InspectorControlPalette.trackFill(for: colorScheme)))
+        .clipShape(shape)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Position")
+    }
+
+    private func spot(_ placement: RecordingKeystrokePlacement) -> some View {
+        let isSelected = placement == selection
+        return Button {
+            withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) { selection = placement }
+        } label: {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(fill(for: placement))
+                .frame(width: isSelected ? 10 : 5, height: 5)
+                .frame(maxWidth: .infinity, alignment: alignment(of: placement))
+                .frame(height: 14)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .help(Self.name(of: placement))
+        .onHover { isHovering in
+            if isHovering {
+                hovered = placement
+            } else if hovered == placement {
+                hovered = nil
+            }
+        }
+        .accessibilityLabel(Self.name(of: placement))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func fill(for placement: RecordingKeystrokePlacement) -> Color {
+        if placement == selection { return InspectorControlPalette.selectedForeground }
+        if placement == hovered { return Color.primary.opacity(0.48) }
+        return Color.primary.opacity(0.2)
+    }
+
+    private func alignment(of placement: RecordingKeystrokePlacement) -> Alignment {
+        switch placement {
+        case .topLeft, .bottomLeft: .leading
+        case .topCenter, .bottomCenter: .center
+        case .topRight, .bottomRight: .trailing
         }
     }
 
