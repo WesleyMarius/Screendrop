@@ -609,9 +609,9 @@ struct InspectorRow<Content: View>: View {
 
 /// One segmented control for every choice in the panel. Its track is the
 /// same filled rounded rectangle as every field and slider, and the selected
-/// option rises as a glass chip inset concentrically inside it, after
-/// Periscope's navigator tabs. The chip jumps to the new option rather than
-/// sliding. It keeps the inspector's one control height so it lines up with
+/// option sits on a plain chip inset concentrically inside it - white in
+/// light mode, a lighter grey in dark - like the selected tool cells. The
+/// chip jumps to the new option rather than sliding. It keeps the inspector's one control height so it lines up with
 /// sliders and fields.
 struct InspectorSegmented<Option: Hashable, Label: View>: View {
     let options: [Option]
@@ -662,12 +662,15 @@ struct InspectorSegmented<Option: Hashable, Label: View>: View {
                 .frame(maxHeight: .infinity)
                 .padding(.horizontal, equalWidths ? 0 : 11)
                 .background {
-                    if isHovering, !selected {
+                    if selected {
+                        segmentShape
+                            .fill(InspectorControlPalette.selectedChipFill(for: colorScheme))
+                            .shadow(color: InspectorControlPalette.selectedChipShadow(for: colorScheme), radius: 1, y: 0.5)
+                    } else if isHovering {
                         segmentShape.fill(InspectorControlPalette.hoverFill)
                     }
                 }
                 .contentShape(segmentShape)
-                .glassEffect(selected ? .regular.interactive() : .identity, in: segmentShape)
         }
         .buttonStyle(.plain)
         .focusEffectDisabled()
