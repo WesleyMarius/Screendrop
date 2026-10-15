@@ -993,14 +993,16 @@ struct StudioInspector: View {
 
     private var subtitleEditor: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
-            SegmentedTabs(
-                options: [("Captions", .captions), ("Edit Video", .edit)],
-                selection: Binding(
-                    get: { transcriptTab },
-                    set: { tab in
-                        withAnimation(.morphQuickIfAllowed) { transcriptTab = tab }
-                    }
-                )
+            InspectorSegmented(
+                options: [StudioTranscriptTab.captions, .edit],
+                isSelected: { $0 == transcriptTab },
+                onTap: { tab in
+                    withAnimation(.morphQuickIfAllowed) { transcriptTab = tab }
+                },
+                label: { tab in
+                    Text(tab == .captions ? "Captions" : "Edit Video")
+                        .font(.inspectorSegment)
+                }
             )
 
             ZStack(alignment: .top) {
