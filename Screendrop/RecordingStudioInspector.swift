@@ -252,7 +252,10 @@ struct StudioInspector: View {
             .transition(AnyTransition(.blurReplace).combined(with: .opacity))
         }
 
-        if let clip = model.selectedClip {
+        // Always the selected clip, or the one under the playhead, so the
+        // section never comes and goes - the clip lane selects on every
+        // scrub, and a section appearing would shove the list about.
+        if let clip = shownClip {
             InspectorSection("Clip", summary: clipSummary(for: clip)) {
                 clipControls(for: clip)
             }
@@ -319,6 +322,15 @@ struct StudioInspector: View {
     private var captionsToggle: Binding<Bool>? {
         guard model.hasSubtitles, case .idle = model.transcriptionState else { return nil }
         return $model.showsSubtitles
+    }
+
+    /// The selected clip, or else the one under the playhead.
+    private var shownClip: RecordingClipSegment? {
+        if let selected = model.selectedClip { return selected }
+        guard let location = model.clipTimeline.location(at: model.currentTime) else {
+            return model.clipTimeline.segments.first
+        }
+        return model.clipTimeline.segments.first { $0.id == location.segmentID }
     }
 
     private func clipSummary(for clip: RecordingClipSegment) -> String {
