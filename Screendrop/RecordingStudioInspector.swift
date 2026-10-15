@@ -402,7 +402,7 @@ struct StudioInspector: View {
     }
 
     private func placementSummary(_ placement: RecordingKeystrokePlacement) -> String {
-        "\(placement.isTop ? "Top" : "Bottom") \(placement.title.lowercased())"
+        StudioPlacementPad.name(of: placement)
     }
 
     private var audioSummary: String? {
@@ -1004,50 +1004,19 @@ struct StudioInspector: View {
     // MARK: Text
 
     private var keystrokeControls: some View {
-        VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
-            InspectorRow("Top") {
-                keystrokePlacementRow([.topLeft, .topCenter, .topRight])
-            }
-            InspectorRow("Bottom") {
-                keystrokePlacementRow([.bottomLeft, .bottomCenter, .bottomRight])
-            }
-        }
-        .help("Shortcuts you pressed while recording appear as a caption")
+        StudioPlacementPad(selection: $model.keystrokePlacement, canvasAspect: canvasAspect)
+            .help("Shortcuts you pressed while recording appear as a caption here")
     }
 
     private var speedBadgeControls: some View {
-        VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
-            InspectorRow("Top") {
-                placementRow([.topLeft, .topCenter, .topRight], selection: $model.speedBadgePlacement)
-            }
-            InspectorRow("Bottom") {
-                placementRow([.bottomLeft, .bottomCenter, .bottomRight], selection: $model.speedBadgePlacement)
-            }
-        }
-        .help("Sped-up clips carry a “2× ›››” badge while they play")
+        StudioPlacementPad(selection: $model.speedBadgePlacement, canvasAspect: canvasAspect)
+            .help("Sped-up clips carry a “2× ›››” badge here while they play")
     }
 
-    private func placementRow(
-        _ options: [RecordingKeystrokePlacement],
-        selection: Binding<RecordingKeystrokePlacement>
-    ) -> some View {
-        InspectorSegmented(
-            options: options,
-            isSelected: { $0 == selection.wrappedValue },
-            onTap: { selection.wrappedValue = $0 },
-            label: { Text($0.title).font(.inspectorSegment) }
-        )
-    }
-
-    private func keystrokePlacementRow(
-        _ options: [RecordingKeystrokePlacement]
-    ) -> some View {
-        InspectorSegmented(
-            options: options,
-            isSelected: { $0 == model.keystrokePlacement },
-            onTap: { model.keystrokePlacement = $0 },
-            label: { Text($0.title).font(.inspectorSegment) }
-        )
+    /// The video's width over its height, which the placement pads take.
+    private var canvasAspect: CGFloat {
+        let size = model.basePreviewCanvasSize
+        return size.height > 0 ? size.width / size.height : 16 / 9
     }
 
     @ViewBuilder
@@ -1730,5 +1699,104 @@ private struct StudioAudioExportOptions: View {
                 )
             }
         }
+    }
+}
+
+/// Where a caption or badge sits on the video, picked on a miniature of it:
+/// six spots along the top and bottom edges of a tile shaped like the
+/// canvas. The chosen spot shows as a small caption-shaped bar, the rest as
+/// dots that brighten under the pointer, like the annotator's alignment
+/// pad. The spot's name reads beside it, and previews the hovered one.
+private struct StudioPlacementPad: View {
+    @Binding var selection: RecordingKeystrokePlacement
+    let canvasAspect: CGFloat
+
+    @State private var hovered: RecordingKeystrokePlacement?
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static let height: CGFloat = 44
+    private static let rows: [[RecordingKeystrokePlacement]] = [
+        [.topLeft, .topCenter, .topRight],
+        [.bottomLeft, .bottomCenter, .bottomRight]
+    ]
+
+    var body: some View {
+        HStack(spacing: 10) {
+            pad
+            Text(Self.name(of: hovered ?? selection))
+                .font(.inspectorValue)
+                .foregroundStyle(hovered == nil || hovered == selection ? Palette.label : Palette.secondaryLabel)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var pad: some View {
+        // Never narrower than square, so a portrait canvas's spots still
+        // have room.
+        let width = min(max(Self.height * canvasAspect, Self.height), 92)
+        let shape = RoundedRectangle(cornerRadius: InspectorMetrics.fieldRadius, style: .continuous)
+        return VStack(spacing: 0) {
+            ForEach(Self.rows.indices, id: \.self) { row in
+                if row == 1 { Spacer(minLength: 0) }
+                HStack(spacing: 0) {
+                    ForEach(Self.rows[row], id: \.self) { placement in
+                        spot(placement)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, InspectorMetrics.controlInset)
+        .frame(width: width, height: Self.height)
+        .background(shape.fill(InspectorControlPalette.trackFill(for: colorScheme)))
+        .clipShape(shape)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Position")
+    }
+
+    private func spot(_ placement: RecordingKeystrokePlacement) -> some View {
+        let isSelected = placement == selection
+        return Button {
+            withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) { selection = placement }
+        } label: {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(fill(for: placement))
+                .frame(width: isSelected ? 10 : 5, height: 5)
+                .frame(maxWidth: .infinity, alignment: alignment(of: placement))
+                .frame(height: 14)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .help(Self.name(of: placement))
+        .onHover { isHovering in
+            if isHovering {
+                hovered = placement
+            } else if hovered == placement {
+                hovered = nil
+            }
+        }
+        .accessibilityLabel(Self.name(of: placement))
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func fill(for placement: RecordingKeystrokePlacement) -> Color {
+        if placement == selection { return InspectorControlPalette.selectedForeground }
+        if placement == hovered { return Color.primary.opacity(0.48) }
+        return Color.primary.opacity(0.2)
+    }
+
+    private func alignment(of placement: RecordingKeystrokePlacement) -> Alignment {
+        switch placement {
+        case .topLeft, .bottomLeft: .leading
+        case .topCenter, .bottomCenter: .center
+        case .topRight, .bottomRight: .trailing
+        }
+    }
+
+    static func name(of placement: RecordingKeystrokePlacement) -> String {
+        "\(placement.isTop ? "Top" : "Bottom") \(placement.title.lowercased())"
     }
 }
