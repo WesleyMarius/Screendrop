@@ -5,7 +5,7 @@
 //  Touch-ups for the talking head: a soft light on the face and smoother
 //  skin. Vision finds each face's landmarks; masks drawn from them steer
 //  a lift of the face's shadows and midtones, and an edge-preserving blur
-//  (the `studioSkinSmoothing` kernel) over the skin with the eyes, brows
+//  over the skin - one `studioFaceTouchUp` kernel - with the eyes, brows
 //  and lips cut out. The camera movie is never changed: the preview runs
 //  the touch-up as the camera player's video composition, the export on
 //  each decoded camera frame, through the same renderer.
@@ -180,48 +180,32 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
         let faces = lock.withLock { tracker.faces(in: normalized, time: time) }
         guard !faces.isEmpty, let masks = Self.masks(for: faces, imageSize: size) else { return image }
 
-        var result = normalized
         let frame = CGRect(origin: .zero, size: size)
-        if beauty.skinSmoothing > 0.005 {
-            let faceWidth = (faces.map(\.box.width).max() ?? 0) * size.width
-            // A blemish is a few hundredths of a face across.
-            let step = max(1, faceWidth * 0.008)
-            let smoothed = try? StudioSkinSmoothingKernel.apply(
-                withExtent: frame,
-                inputs: [result.clampedToExtent(), masks.skin.clampedToExtent()],
-                arguments: [
-                    "step": Float(step),
-                    "rangeSigma": Float(0.035 + 0.06 * beauty.skinSmoothing),
-                    // Never all the way, so some of the skin's own texture
-                    // stays and it doesn't read as plastic.
-                    "amount": Float(0.9 * min(beauty.skinSmoothing, 1)),
-                    "pad": ceil(step * 3) + 1
-                ]
-            )
-            if let smoothed { result = smoothed }
-        }
-        if beauty.faceLight > 0.005 {
-            let amount = beauty.faceLight
-            // Lift the face's shadows and midtones, then a touch of
-            // exposure, so the face reads as lit rather than washed out.
-            let lit = result
-                .applyingFilter("CIHighlightShadowAdjust", parameters: [
-                    "inputShadowAmount": 0.8 * amount,
-                    "inputHighlightAmount": 1
-                ])
-                .applyingFilter("CIExposureAdjust", parameters: ["inputEV": 0.4 * amount])
-            result = lit.applyingFilter("CIBlendWithMask", parameters: [
-                kCIInputBackgroundImageKey: result,
-                kCIInputMaskImageKey: masks.light
-            ])
-        }
+        let faceWidth = (faces.map(\.box.width).max() ?? 0) * size.width
+        // A blemish is a few hundredths of a face across.
+        let step = max(1, faceWidth * 0.008)
+        let smoothing = min(max(beauty.skinSmoothing, 0), 1)
+        guard let result = try? StudioFaceTouchUpKernel.apply(
+            withExtent: frame,
+            inputs: [normalized.clampedToExtent(), masks.skin.clampedToExtent(), masks.light.clampedToExtent()],
+            arguments: [
+                "step": Float(step),
+                "rangeSigma": Float(0.035 + 0.06 * smoothing),
+                // Never all the way, so some of the skin's own texture
+                // stays and it doesn't read as plastic.
+                "smoothing": Float(0.9 * smoothing),
+                "light": Float(min(max(beauty.faceLight, 0), 1)),
+                "pad": smoothing > 0.005 ? ceil(step * 3) + 1 : 0
+            ]
+        ) else { return image }
         return result
             .cropped(to: frame)
             .transformed(by: CGAffineTransform(translationX: origin.x, y: origin.y))
     }
 
     /// The skin mask - the face with its eyes, brows and lips cut out - and
-    /// the wider, softer light mask, both at `imageSize`.
+    /// the light mask - the face, fading down the neck so the two don't
+    /// part at the jaw - both at `imageSize`.
     private static func masks(for faces: [StudioFaceShape], imageSize: CGSize) -> (skin: CIImage, light: CIImage)? {
         let scale = min(1, maskHeight / imageSize.height)
         let width = max(1, Int((imageSize.width * scale).rounded()))
@@ -249,8 +233,14 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
                 trace(face.points(.outerLips), in: context, size: size, closed: true, lineWidth: width * 0.04)
             }
         }), let light = drawMask(width: width, height: height, draw: { context in
+            // Kept to the face, so the wall and shirt around it stay as lit
+            // as they were.
             for face in faces {
-                fillEllipse(face, in: context, size: size, centerOffset: -0.06, radii: CGSize(width: 0.6, height: 0.78))
+                fillEllipse(face, in: context, size: size, centerOffset: 0.04, radii: CGSize(width: 0.47, height: 0.64))
+            }
+            context.setFillColor(gray: 0.6, alpha: 1)
+            for face in faces {
+                fillEllipse(face, in: context, size: size, centerOffset: -0.72, radii: CGSize(width: 0.3, height: 0.32))
             }
         }) else { return nil }
 
@@ -264,7 +254,7 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
                 .transformed(by: upscale)
                 .cropped(to: CGRect(origin: .zero, size: imageSize))
         }
-        return (soften(skin, sigma: faceWidth * 0.035), soften(light, sigma: faceWidth * 0.14))
+        return (soften(skin, sigma: faceWidth * 0.035), soften(light, sigma: faceWidth * 0.06))
     }
 
     private static func drawMask(width: Int, height: Int, draw: (CGContext) -> Void) -> CGImage? {
@@ -308,14 +298,15 @@ nonisolated final class StudioCameraBeautyRenderer: @unchecked Sendable {
     }
 }
 
-/// The skin smoothing kernel run inside Core Image, so the touch-up stays
-/// one Core Image graph for both the player and the export.
-nonisolated final class StudioSkinSmoothingKernel: CIImageProcessorKernel {
+/// The touch-up kernel run inside Core Image, so the touch-up stays one
+/// Core Image graph for both the player and the export.
+nonisolated final class StudioFaceTouchUpKernel: CIImageProcessorKernel {
     private struct Parameters {
         var offset: SIMD2<Int32>
         var step: Float
         var rangeSigma: Float
-        var amount: Float
+        var smoothing: Float
+        var light: Float
     }
 
     enum KernelError: Error {
@@ -342,9 +333,10 @@ nonisolated final class StudioSkinSmoothingKernel: CIImageProcessorKernel {
         arguments: [String: Any]?,
         output: any CIImageProcessorOutput
     ) throws {
-        guard let inputs, inputs.count == 2,
+        guard let inputs, inputs.count == 3,
               let source = inputs[0].metalTexture,
-              let mask = inputs[1].metalTexture,
+              let skin = inputs[1].metalTexture,
+              let light = inputs[2].metalTexture,
               let destination = output.metalTexture,
               let commandBuffer = output.metalCommandBuffer,
               let pipeline = pipeline(for: commandBuffer.device),
@@ -361,12 +353,14 @@ nonisolated final class StudioSkinSmoothingKernel: CIImageProcessorKernel {
             ),
             step: arguments?["step"] as? Float ?? 1,
             rangeSigma: arguments?["rangeSigma"] as? Float ?? 0.05,
-            amount: arguments?["amount"] as? Float ?? 0
+            smoothing: arguments?["smoothing"] as? Float ?? 0,
+            light: arguments?["light"] as? Float ?? 0
         )
         encoder.setComputePipelineState(pipeline)
         encoder.setTexture(source, index: 0)
-        encoder.setTexture(mask, index: 1)
-        encoder.setTexture(destination, index: 2)
+        encoder.setTexture(skin, index: 1)
+        encoder.setTexture(light, index: 2)
+        encoder.setTexture(destination, index: 3)
         encoder.setBytes(&parameters, length: MemoryLayout<Parameters>.stride, index: 0)
         let threadWidth = pipeline.threadExecutionWidth
         let threadHeight = max(1, min(8, pipeline.maxTotalThreadsPerThreadgroup / threadWidth))
@@ -380,7 +374,7 @@ nonisolated final class StudioSkinSmoothingKernel: CIImageProcessorKernel {
     private static func pipeline(for device: MTLDevice) -> MTLComputePipelineState? {
         lock.withLock {
             if let pipeline = pipelines[device.registryID] { return pipeline }
-            guard let function = device.makeDefaultLibrary()?.makeFunction(name: "studioSkinSmoothing"),
+            guard let function = device.makeDefaultLibrary()?.makeFunction(name: "studioFaceTouchUp"),
                   let pipeline = try? device.makeComputePipelineState(function: function)
             else { return nil }
             pipelines[device.registryID] = pipeline
