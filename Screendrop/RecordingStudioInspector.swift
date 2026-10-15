@@ -57,6 +57,9 @@ struct StudioInspector: View {
     @State private var transcriptTab: StudioTranscriptTab = .captions
     @State private var isAudioExportOptionsPresented = false
     @State private var page: StudioInspectorPage?
+    /// Sections folded to their one-line summary, kept across projects and
+    /// launches. Comma-separated section names; everything else is open.
+    @AppStorage("StudioInspectorFoldedSections") private var foldedSectionNames = ""
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -166,6 +169,8 @@ struct StudioInspector: View {
 
         InspectorSection(
             "Frame",
+            summary: frameSummary,
+            isExpanded: expansion("Frame"),
             accessory: {
                 if !usesDefaultLayout {
                     InspectorResetButton(help: "Reset padding, corners and shadow") {
@@ -201,23 +206,37 @@ struct StudioInspector: View {
     @ViewBuilder
     private var featureSections: some View {
         if model.hasCameraVideo {
-            InspectorSection("Camera", isOn: $model.style.camera.isVisible, toggleTitle: "Show camera") {
+            InspectorSection(
+                "Camera",
+                summary: model.style.camera.isVisible ? model.style.camera.layout.detailedTitle : nil,
+                isOn: $model.style.camera.isVisible,
+                toggleTitle: "Show camera",
+                isExpanded: expansion("Camera")
+            ) {
                 cameraControls
             }
         }
 
-        InspectorSection("Zoom", isOn: $model.zoomEnabled, toggleTitle: "Enable zooms") {
+        InspectorSection(
+            "Zoom",
+            summary: model.zoomEnabled ? zoomSummary : nil,
+            isOn: $model.zoomEnabled,
+            toggleTitle: "Enable zooms",
+            isExpanded: expansion("Zoom")
+        ) {
             zoomControls
         }
 
         if model.pointerIsSynthesized {
             InspectorSection(
                 "Cursor",
+                summary: model.style.hidesCursor ? nil : cursorSummary,
                 isOn: Binding(
                     get: { !model.style.hidesCursor },
                     set: { model.style.hidesCursor = !$0 }
                 ),
                 toggleTitle: "Show mouse pointer",
+                isExpanded: expansion("Cursor"),
                 accessory: {
                     if model.style.cursorScale != RecordingStudioStyle.defaultCursorScale,
                        !model.style.hidesCursor {
@@ -239,14 +258,26 @@ struct StudioInspector: View {
         }
 
         if model.hasKeystrokes {
-            InspectorSection("Keystrokes", isOn: $model.showsKeystrokes, toggleTitle: "Show keystrokes") {
+            InspectorSection(
+                "Keystrokes",
+                summary: model.showsKeystrokes ? placementSummary(model.keystrokePlacement) : nil,
+                isOn: $model.showsKeystrokes,
+                toggleTitle: "Show keystrokes",
+                isExpanded: expansion("Keystrokes")
+            ) {
                 keystrokeControls
             }
         }
 
         // Only offered once some clip actually plays faster than recorded.
         if model.hasSpedUpClips {
-            InspectorSection("Speed Badge", isOn: $model.showsSpeedBadge, toggleTitle: "Show speed badge") {
+            InspectorSection(
+                "Speed Badge",
+                summary: model.showsSpeedBadge ? placementSummary(model.speedBadgePlacement) : nil,
+                isOn: $model.showsSpeedBadge,
+                toggleTitle: "Show speed badge",
+                isExpanded: expansion("Speed Badge")
+            ) {
                 speedBadgeControls
             }
             .transition(AnyTransition(.blurReplace).combined(with: .opacity))
@@ -256,7 +287,7 @@ struct StudioInspector: View {
         // section never comes and goes - the clip lane selects on every
         // scrub, and a section appearing would shove the list about.
         if let clip = shownClip {
-            InspectorSection("Clip", summary: clipSummary(for: clip)) {
+            InspectorSection("Clip", summary: clipSummary(for: clip), isExpanded: expansion("Clip")) {
                 clipControls(for: clip)
             }
         }
@@ -267,8 +298,10 @@ struct StudioInspector: View {
     private var captionsSection: some View {
         InspectorSection(
             "Captions",
+            summary: captionsToggle?.wrappedValue == false ? nil : captionsSummary,
             isOn: captionsToggle,
             toggleTitle: "Show subtitles",
+            isExpanded: expansion("Captions"),
             accessory: {
                 if model.transcriptionState.isTranscribing {
                     ProgressView()
@@ -322,6 +355,50 @@ struct StudioInspector: View {
     private var captionsToggle: Binding<Bool>? {
         guard model.hasSubtitles, case .idle = model.transcriptionState else { return nil }
         return $model.showsSubtitles
+    }
+
+    // MARK: Folding
+
+    private var foldedSections: Set<String> {
+        Set(foldedSectionNames.split(separator: ",").map(String.init))
+    }
+
+    /// Whether a section is open; folding one keeps it folded next time.
+    private func expansion(_ section: String) -> Binding<Bool> {
+        Binding(
+            get: { !foldedSections.contains(section) },
+            set: { isOpen in
+                var folded = foldedSections
+                if isOpen { folded.remove(section) } else { folded.insert(section) }
+                foldedSectionNames = folded.sorted().joined(separator: ",")
+            }
+        )
+    }
+
+    private var frameSummary: String {
+        let background = (model.previewBackground ?? model.style.background).displayTitle
+        let padding = InspectorValueFormat.percent().displayString(for: model.style.padding)
+        return "\(background) · \(padding)"
+    }
+
+    private var zoomSummary: String {
+        let count = model.zoomTimelineBlocks.count
+        return count == 0 ? "None yet" : count == 1 ? "1 zoom" : "\(count) zooms"
+    }
+
+    private var cursorSummary: String {
+        let size = InspectorValueFormat.magnification(fractionDigits: 1).displayString(for: model.style.cursorScale)
+        return model.canShowPressEffects && model.showsClickEffects ? "\(size) · Clicks" : size
+    }
+
+    private func placementSummary(_ placement: RecordingKeystrokePlacement) -> String {
+        "\(placement.isTop ? "Top" : "Bottom") \(placement.title.lowercased())"
+    }
+
+    private var audioSummary: String? {
+        if let replacement = model.replacementAudio { return replacement.displayName }
+        guard model.hasAudio else { return nil }
+        return InspectorValueFormat.percent().displayString(for: model.audioVolume)
     }
 
     /// The selected clip, or else the one under the playhead.
@@ -449,6 +526,8 @@ struct StudioInspector: View {
     private var audioSection: some View {
         InspectorSection(
             "Audio",
+            summary: audioSummary,
+            isExpanded: expansion("Audio"),
             accessory: {
                 if model.replacementAudio != nil {
                     Group {
