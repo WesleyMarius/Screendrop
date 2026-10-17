@@ -32,7 +32,7 @@ nonisolated enum CaptureCategory: String, Codable, CaseIterable, Identifiable, S
 
     var symbol: String {
         switch self {
-        case .code: "chevron.left.forwardslash.chevron.right"
+        case .code: "apple.terminal.fill"
         case .design: "paintpalette"
         case .website: "globe"
         case .document: "doc.text"
@@ -42,9 +42,9 @@ nonisolated enum CaptureCategory: String, Codable, CaseIterable, Identifiable, S
         case .error: "exclamationmark.triangle"
         case .receipt: "receipt"
         case .social: "person.2"
-        case .media: "photo"
+        case .media: "photo.on.rectangle.angled"
         case .settings: "gearshape"
-        case .other: "square.dashed"
+        case .other: "photo.stack"
         }
     }
 

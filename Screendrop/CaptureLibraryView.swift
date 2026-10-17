@@ -54,7 +54,7 @@ struct CaptureLibraryView: View {
                             LibrarySidebarRow(title: app.name, count: app.count) {
                                 Image(nsImage: LibraryAppIcons.icon(for: app.bundleIdentifier))
                                     .resizable()
-                                    .frame(width: 16, height: 16)
+                                    .frame(width: 20, height: 20)
                             }
                             .tag(CaptureLibraryScope.app(app.id))
                         }
@@ -66,14 +66,12 @@ struct CaptureLibraryView: View {
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 LibrarySidebarFooter()
             }
-            .modifier(LibrarySidebarSurface())
         } detail: {
             VStack(spacing: 0) {
                 browser
                 Divider()
                 statusBar
             }
-            .modifier(LibraryDetailCorners(showsSidebar: columnVisibility != .detailOnly))
             .navigationTitle(scopeTitle)
             .navigationSubtitle("Screendrop")
         }
@@ -276,18 +274,24 @@ private struct LibrarySidebarRow<Icon: View>: View {
     @ViewBuilder let icon: () -> Icon
 
     var body: some View {
-        Label {
-            HStack {
-                Text(title).lineLimit(1)
-                Spacer()
-                Text(count, format: .number)
-                    .foregroundStyle(.secondary)
-                    .font(.caption.monospacedDigit())
-                    .contentTransition(.numericText())
-            }
-        } icon: {
-            icon().frame(width: 20, alignment: .center)
+        // Not a Label: the sidebar tints Label icons with the accent. These
+        // stay a quiet, filled grey with room between glyph and title.
+        HStack(spacing: 12) {
+            icon()
+                .symbolVariant(.fill)
+                .foregroundStyle(.secondary)
+                .frame(width: 20, alignment: .center)
+            Text(title)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Text(count, format: .number)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .contentTransition(.numericText())
         }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 2)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -378,77 +382,5 @@ private struct LibrarySidebarFooter: View {
         .motion(.morphQuick, value: isHovering)
         .padding(.horizontal, 10)
         .padding(.bottom, 10)
-    }
-}
-
-/// Share one adaptive color between the sidebar and the detail's corner
-/// cutouts; separate visual-effect views can resolve to different tints.
-private struct LibrarySidebarSurface: ViewModifier {
-    static var background: Color { Color(nsColor: .underPageBackgroundColor) }
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if #available(macOS 27.0, *) {
-            content
-                .scrollContentBackground(.hidden)
-                .background {
-                    Self.background.ignoresSafeArea(.container)
-                }
-        } else {
-            content
-        }
-    }
-}
-
-/// Round the entire detail surface, including the native toolbar's safe area.
-/// The browser keeps its normal insets so content doesn't move under controls.
-private struct LibraryDetailCorners: ViewModifier {
-    let showsSidebar: Bool
-    @Environment(\.displayScale) private var displayScale
-
-    private var cornerRadius: CGFloat { showsSidebar ? 16 : 0 }
-
-    private var surface: UnevenRoundedRectangle {
-        UnevenRoundedRectangle(
-            topLeadingRadius: cornerRadius,
-            bottomLeadingRadius: cornerRadius,
-            style: .continuous
-        )
-    }
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if #available(macOS 27.0, *) {
-            content
-                // Only the lower corner intersects the body. The upper corner
-                // belongs to the background extended behind the toolbar below.
-                .clipShape(
-                    UnevenRoundedRectangle(
-                        bottomLeadingRadius: cornerRadius,
-                        style: .continuous
-                    )
-                )
-                .background {
-                    ZStack {
-                        LibrarySidebarSurface.background
-                        surface.fill(Color(nsColor: .controlBackgroundColor))
-                    }
-                    .ignoresSafeArea(.container, edges: .top)
-                }
-                .overlay {
-                    if showsSidebar {
-                        surface
-                            .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1 / displayScale)
-                            .mask(alignment: .leading) {
-                                Rectangle().frame(width: cornerRadius)
-                            }
-                            .ignoresSafeArea(.container, edges: .top)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
-        } else {
-            content
-        }
     }
 }
