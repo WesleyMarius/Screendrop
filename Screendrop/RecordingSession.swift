@@ -312,6 +312,8 @@ nonisolated struct CaptureManifest: Codable, Sendable, Equatable {
     /// whose pixels may already contain the configured mouse indicators.
     var pressEffectsBaked: Bool?
     var pressEffectsEnabled: Bool?
+    /// The app being recorded, for the Library. Nil in older manifests.
+    var source: CaptureSource?
 
     static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()

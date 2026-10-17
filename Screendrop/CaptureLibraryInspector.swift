@@ -9,8 +9,10 @@ struct CaptureLibraryInspector: View {
     @State private var byteCount: Int64?
     @State private var pendingCloudDelete: CaptureLibraryItem?
     @State private var pendingCloudUpload: CaptureLibraryItem?
+    @State private var similar: [CaptureLibraryItem] = []
     @Namespace private var glass
     private var items: [CaptureLibraryItem] { model.selectedItems }
+    private var index: CaptureLibraryIndex { .shared }
 
     var body: some View {
         Group {
@@ -28,6 +30,8 @@ struct CaptureLibraryInspector: View {
                             header(item)
                             InspectorGroupBreak()
                             information(item)
+                            recognizedText(item)
+                            similarCaptures(item)
                         } else {
                             multipleSelection
                         }
@@ -50,6 +54,12 @@ struct CaptureLibraryInspector: View {
         .motion(.morph, value: items.isEmpty)
         .onChange(of: items.map(\.id)) { _, _ in
             pendingCloudUpload = nil
+        }
+        .task(id: similarityKey) {
+            guard items.count == 1, let item = items.first else { similar = []; return }
+            let ids = await index.similar(to: item.id, among: model.items.map(\.id), limit: 9)
+            guard !Task.isCancelled else { return }
+            similar = ids.compactMap(model.item(id:))
         }
         .task(id: items.map(\.thumbnailKey)) {
             byteCount = nil
@@ -106,8 +116,18 @@ struct CaptureLibraryInspector: View {
                     .lineLimit(3)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
+                if let title = index.analyses[item.id]?.title {
+                    Text(title)
+                        .font(.dsCaption)
+                        .foregroundStyle(Palette.secondaryLabel)
+                        .lineLimit(2)
+                        .help("Described on this Mac by Apple Intelligence")
+                }
                 HStack(spacing: Space.s) {
                     Tag(text: item.kindTitle, systemImage: item.isVideo ? "film" : "photo")
+                    if let category = index.analyses[item.id]?.category, category != .other {
+                        Tag(text: category.title, systemImage: category.symbol)
+                    }
                     if item.hasDraft {
                         Tag(text: "Unsaved Edits", systemImage: "circle.lefthalf.filled", tint: Palette.warning)
                     } else if item.hasEdits {
@@ -125,6 +145,9 @@ struct CaptureLibraryInspector: View {
     private func information(_ item: CaptureLibraryItem) -> some View {
         InspectorSection("Information") {
             VStack(spacing: InspectorMetrics.rowSpacing) {
+                if let source = item.source {
+                    sourceRow(source)
+                }
                 detailRow("Dimensions", value: item.dimensions)
                 if item.isVideo { detailRow("Duration", value: item.durationText) }
                 detailRow("Size on disk", value: sizeText)
@@ -132,6 +155,104 @@ struct CaptureLibraryInspector: View {
                 detailRow("Modified", value: item.modifiedAt.formatted(date: .abbreviated, time: .shortened))
             }
         }
+    }
+
+    private func sourceRow(_ source: CaptureSource) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text("App")
+                .font(.inspectorLabel)
+                .foregroundStyle(Palette.secondaryLabel)
+                .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 0)
+            VStack(alignment: .trailing, spacing: 2) {
+                Button {
+                    model.searchText = ""
+                    model.scope = .app(source.appKey)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(nsImage: LibraryAppIcons.icon(for: source.bundleIdentifier))
+                            .resizable()
+                            .frame(width: 14, height: 14)
+                            .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 3 }
+                        Text(source.appName)
+                            .font(.inspectorValue)
+                            .foregroundStyle(Palette.label)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help("Show all captures from \(source.appName)")
+                if let window = source.windowTitle {
+                    Text(window)
+                        .font(.dsCaption)
+                        .foregroundStyle(Palette.secondaryLabel)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    /// The text Vision read in the capture, to read or copy without opening it.
+    @ViewBuilder
+    private func recognizedText(_ item: CaptureLibraryItem) -> some View {
+        if let analysis = index.analyses[item.id], analysis.version == CaptureAnalysis.currentVersion {
+            let text = analysis.text
+            if !text.isEmpty {
+                InspectorSection("Text") {
+                    InspectorIconButton(systemName: "doc.on.doc", help: "Copy Text") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                    }
+                } content: {
+                    Text(text)
+                        .font(.dsCaption)
+                        .foregroundStyle(Palette.label)
+                        .lineLimit(14)
+                        .lineSpacing(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+            }
+        } else if index.pendingCount > 0 {
+            InspectorSection("Text") {
+                HStack(spacing: Space.s) {
+                    ProgressView().controlSize(.mini)
+                    Text("Reading text…")
+                        .font(.dsCaption)
+                        .foregroundStyle(Palette.secondaryLabel)
+                }
+            }
+        }
+    }
+
+    /// Captures that look alike, by Vision feature print. Choosing one
+    /// selects it in the browser, widening the view if it's filtered out.
+    @ViewBuilder
+    private func similarCaptures(_ item: CaptureLibraryItem) -> some View {
+        if !similar.isEmpty {
+            InspectorSection("Similar") {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: Space.m), count: 3), spacing: Space.m) {
+                    ForEach(similar) { match in
+                        Button { model.reveal(match.id) } label: {
+                            CaptureLibraryThumbnail(item: match)
+                                .aspectRatio(1.3, contentMode: .fit)
+                                .clipShape(.rect(cornerRadius: Radius.tile, style: .continuous))
+                                .hairline(radius: Radius.tile, opacity: 0.08)
+                        }
+                        .buttonStyle(.plain)
+                        .help(match.name)
+                        .accessibilityLabel("Select \(match.name)")
+                    }
+                }
+            }
+        }
+    }
+
+    private var similarityKey: String {
+        guard items.count == 1, let item = items.first else { return "" }
+        return "\(item.id)|\(index.analyses[item.id]?.hasFeaturePrint == true)|\(model.items.count)"
     }
 
     private var multipleSelection: some View {
