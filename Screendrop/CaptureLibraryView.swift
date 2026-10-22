@@ -89,6 +89,7 @@ struct CaptureLibraryView: View {
         .onAppear {
             AppActivationPolicy.enter()
             CaptureLibraryIndex.shared.start()
+            UpdaterManager.shared.checkForUpdateInformation()
             model.sortOrder = savedSort
             model.refresh()
         }
@@ -350,36 +351,51 @@ enum LibraryAppIcons {
     }
 }
 
-/// Settings, plus a reminder of the shortcut that fills the Library.
+/// Settings, plus a blue download button while a newer release is waiting.
 private struct LibrarySidebarFooter: View {
+    @ObservedObject private var updater = UpdaterManager.shared
     @State private var isHovering = false
 
     var body: some View {
-        Button {
-            SettingsWindowController.show(tab: .general)
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .frame(width: 20)
-                Text("Settings")
-                    .font(.system(size: 13))
-                Spacer(minLength: 0)
-                KeyCaps(tokens: ["⌘", ","], isSmall: true)
-                    .opacity(isHovering ? 1 : 0)
+        HStack(spacing: GlassMetrics.gap) {
+            Button {
+                SettingsWindowController.show(tab: .general)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 20)
+                    Text("Settings")
+                        .font(.system(size: 13))
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(Palette.label)
+                .padding(.horizontal, 10)
+                .frame(height: 30)
+                .background(
+                    isHovering ? Palette.hoverFill : .clear,
+                    in: RoundedRectangle(cornerRadius: Radius.field, style: .continuous)
+                )
+                .contentShape(Rectangle())
             }
-            .foregroundStyle(Palette.label)
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .background(
-                isHovering ? Palette.hoverFill : .clear,
-                in: RoundedRectangle(cornerRadius: Radius.field, style: .continuous)
-            )
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .onHover { isHovering = $0 }
+            .help("Settings (⌘,)")
+
+            if let version = updater.availableUpdateVersion {
+                GlassIconButton(
+                    systemImage: "arrow.down",
+                    help: "Download Screendrop \(version)",
+                    size: 30,
+                    tint: .blue
+                ) {
+                    updater.checkForUpdates()
+                }
+                .transition(.blurPop)
+            }
         }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
         .motion(.morphQuick, value: isHovering)
+        .motion(.morph, value: updater.availableUpdateVersion)
         .padding(.horizontal, 10)
         .padding(.bottom, 10)
     }
