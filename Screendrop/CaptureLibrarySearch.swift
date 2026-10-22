@@ -67,3 +67,59 @@ nonisolated enum CaptureLibrarySearch {
         return rects
     }
 }
+
+/// Turns Vision's lines into something readable for the inspector. Vision
+/// reports each visual line on its own and orders them row by row, which
+/// interleaves columns and breaks prose mid-sentence. Here a line joins the
+/// paragraph whose last line sits directly above it, at the same left edge
+/// and text size, so wrapped prose reads as one paragraph and a sidebar
+/// stays apart from the content beside it. Stray fragments ("G", a lone
+/// line number) are left out; search still sees every line.
+nonisolated enum CaptureReadableText {
+    static func paragraphs(from lines: [CaptureTextLine]) -> [String] {
+        struct Paragraph {
+            var lines: [String]
+            var lastBox: CGRect?
+        }
+        var paragraphs: [Paragraph] = []
+        for line in lines where isMeaningful(line.text) {
+            if let box = line.box,
+               let index = paragraphs.lastIndex(where: { continues($0.lastBox, with: box) }) {
+                paragraphs[index].lines.append(line.text)
+                paragraphs[index].lastBox = box
+            } else {
+                paragraphs.append(Paragraph(lines: [line.text], lastBox: line.box))
+            }
+        }
+        return paragraphs.map { joined($0.lines) }
+    }
+
+    /// Prose rejoins into flowing text; code keeps its lines.
+    private static func joined(_ lines: [String]) -> String {
+        guard lines.count > 1 else { return lines.first ?? "" }
+        let codeMarks = ["{", "}", "()", "=>", "->", ";", "//", "let ", "var ", "func ", "const ", "return ", "import ", "def "]
+        let codeLines = lines.filter { line in codeMarks.contains { line.contains($0) } }.count
+        if codeLines * 3 >= lines.count { return lines.joined(separator: "\n") }
+        return lines.dropFirst().reduce(lines[0]) { text, line in
+            text.hasSuffix("-") ? String(text.dropLast()) + line : text + " " + line
+        }
+    }
+
+    /// `box` is the next line of the paragraph ending in `previous`.
+    private static func continues(_ previous: CGRect?, with box: CGRect) -> Bool {
+        guard let previous, previous.height > 0 else { return false }
+        let lineHeight = previous.height
+        return abs(box.minX - previous.minX) < 0.015
+            && abs(box.height - lineHeight) < lineHeight * 0.35
+            && box.minY > previous.minY + lineHeight * 0.5
+            && box.minY - previous.maxY < lineHeight * 0.9
+    }
+
+    /// At least two letters or digits, and a letter unless it's a longer
+    /// run such as a date or an amount.
+    private static func isMeaningful(_ text: String) -> Bool {
+        let alphanumerics = text.unicodeScalars.filter(CharacterSet.alphanumerics.contains)
+        guard alphanumerics.count >= 2 else { return false }
+        return alphanumerics.contains(where: CharacterSet.letters.contains) || text.count >= 5
+    }
+}
