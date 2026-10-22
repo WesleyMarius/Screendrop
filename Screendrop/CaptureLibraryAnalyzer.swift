@@ -9,11 +9,11 @@ import FoundationModels
 import ImageIO
 import Vision
 
-/// Looks at one capture, entirely on device: Vision reads its text and makes
-/// a feature print for finding similar captures, then Apple's language model
-/// files it into a category with a short title and keywords. When the model
-/// isn't available the rules in `CaptureCategoryRules` stand in, and the
-/// capture is classified again once it is.
+/// Looks at captures entirely on device, in two steps the index schedules
+/// separately. `read` is quick (~0.15s): Vision reads the text and makes a
+/// feature print for Similar, and the rules in `CaptureCategoryRules` give a
+/// first category. `sort` is slow (~1–2s): Apple's language model files the
+/// capture into a category with a short title and keywords.
 nonisolated enum CaptureLibraryAnalyzer {
     struct Result: Sendable {
         var analysis: CaptureAnalysis
@@ -28,7 +28,10 @@ nonisolated enum CaptureLibraryAnalyzer {
     private static let promptTextLimit = 1800
     private static let promptTranscriptLimit = 600
 
-    static func analyze(_ item: CaptureLibraryItem) async -> Result? {
+    /// `previous` is the capture's last analysis, if any: a model's sorting
+    /// carries over when an edit changes the pixels, rather than falling back
+    /// to the rules until it's sorted again.
+    static func read(_ item: CaptureLibraryItem, previous: CaptureAnalysis?) async -> Result? {
         let frames = await readFrames(item)
         guard let primary = frames.first else { return nil }
         guard !Task.isCancelled else { return nil }
@@ -50,13 +53,21 @@ nonisolated enum CaptureLibraryAnalyzer {
         analysis.lines = lines
         analysis.transcript = item.session.flatMap(transcript)
         analysis.hasFeaturePrint = featurePrint != nil
-        await classify(&analysis, item: item, image: primary)
+        if let previous, previous.classifier == .model {
+            analysis.category = previous.category
+            analysis.title = previous.title
+            analysis.keywords = previous.keywords
+            analysis.classifier = .model
+        } else {
+            analysis.category = CaptureCategoryRules.category(source: item.source, text: analysis.text, isVideo: item.isVideo)
+            analysis.classifier = .rules
+        }
         return Result(analysis: analysis, featurePrint: featurePrint)
     }
 
-    /// Re-runs only the classification, for captures the rules filed while
-    /// the model was unavailable. Text and the feature print are kept.
-    static func reclassify(_ analysis: CaptureAnalysis, item: CaptureLibraryItem) async -> CaptureAnalysis {
+    /// Asks the model to sort a capture that has already been read. Text and
+    /// the feature print are kept.
+    static func sort(_ analysis: CaptureAnalysis, item: CaptureLibraryItem) async -> CaptureAnalysis {
         var analysis = analysis
         let image = await readFrames(item, framesForVideo: 1).first
         await classify(&analysis, item: item, image: image)

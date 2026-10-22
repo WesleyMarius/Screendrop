@@ -14,8 +14,18 @@ struct CaptureLibraryView: View {
     @AppStorage("captureLibrary.sort") private var savedSort: CaptureLibrarySort = .newest
     @AppStorage("captureLibrary.categoriesExpanded") private var categoriesExpanded = true
     @AppStorage("captureLibrary.appsExpanded") private var appsExpanded = true
+    @AppStorage(ScreendropPreferences.libraryAnalyzeCapturesKey) private var analyzeCaptures = true
+    @AppStorage(ScreendropPreferences.librarySortExistingKey) private var sortExisting = false
+    @AppStorage(ScreendropPreferences.librarySortOfferDismissedKey) private var sortOfferDismissed = false
+
+    private static let sidebarFade: CGFloat = 28
 
     private var scope: CaptureLibraryScope { model.scope ?? .kind(.all) }
+
+    /// The one-time offer to sort older captures with the model.
+    private var showsSortOffer: Bool {
+        analyzeCaptures && !sortExisting && !sortOfferDismissed && index.unsortedExistingCount > 0
+    }
     private var activeFilter: CaptureLibraryFilter {
         if case .kind(let filter) = scope { filter } else { .all }
     }
@@ -29,45 +39,64 @@ struct CaptureLibraryView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            List(selection: $model.scope) {
-                Section("Library") {
-                    ForEach(CaptureLibraryFilter.allCases) { filter in
-                        LibrarySidebarRow(title: filter.title, count: model.count(for: filter)) {
-                            Image(systemName: filter.symbol)
-                        }
-                        .tag(CaptureLibraryScope.kind(filter))
-                    }
-                }
-                if !model.categoryFacets.isEmpty {
-                    Section("Categories", isExpanded: $categoriesExpanded) {
-                        ForEach(model.categoryFacets, id: \.category) { facet in
-                            LibrarySidebarRow(title: facet.category.title, count: facet.count) {
-                                Image(systemName: facet.category.symbol)
+            VStack(spacing: 0) {
+                List(selection: $model.scope) {
+                    Section("Library") {
+                        ForEach(CaptureLibraryFilter.allCases) { filter in
+                            LibrarySidebarRow(title: filter.title, count: model.count(for: filter)) {
+                                Image(systemName: filter.symbol)
                             }
-                            .tag(CaptureLibraryScope.category(facet.category))
+                            .tag(CaptureLibraryScope.kind(filter))
                         }
                     }
-                }
-                if !model.appFacets.isEmpty {
-                    Section("Apps", isExpanded: $appsExpanded) {
-                        ForEach(model.appFacets) { app in
-                            LibrarySidebarRow(title: app.name, count: app.count) {
-                                Image(nsImage: LibraryAppIcons.icon(for: app.bundleIdentifier))
-                                    .resizable()
-                                    .frame(width: 20, height: 20)
+                    if analyzeCaptures, !model.categoryFacets.isEmpty {
+                        Section("Categories", isExpanded: $categoriesExpanded) {
+                            ForEach(model.categoryFacets, id: \.category) { facet in
+                                LibrarySidebarRow(title: facet.category.title, count: facet.count) {
+                                    Image(systemName: facet.category.symbol)
+                                }
+                                .tag(CaptureLibraryScope.category(facet.category))
                             }
-                            .tag(CaptureLibraryScope.app(app.id))
+                        }
+                    }
+                    if !model.appFacets.isEmpty {
+                        Section("Apps", isExpanded: $appsExpanded) {
+                            ForEach(model.appFacets) { app in
+                                LibrarySidebarRow(title: app.name, count: app.count) {
+                                    Image(nsImage: LibraryAppIcons.icon(for: app.bundleIdentifier))
+                                        .resizable()
+                                        .frame(width: 20, height: 20)
+                                }
+                                .tag(CaptureLibraryScope.app(app.id))
+                            }
                         }
                     }
                 }
-            }
-            .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 280)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
+                .listStyle(.sidebar)
+                // A long list fades out above Settings rather than ending at a
+                // hard edge; the margin lets the last row scroll clear of it.
+                .contentMargins(.bottom, Self.sidebarFade, for: .scrollContent)
+                .mask {
+                    VStack(spacing: 0) {
+                        Rectangle()
+                        LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
+                            .frame(height: Self.sidebarFade)
+                    }
+                }
                 LibrarySidebarFooter()
             }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 280)
         } detail: {
             VStack(spacing: 0) {
+                if showsSortOffer {
+                    LibrarySortOffer(count: index.unsortedExistingCount) {
+                        index.sortExistingCaptures()
+                    } onDismiss: {
+                        sortOfferDismissed = true
+                    }
+                    .transition(.opacity)
+                    Divider()
+                }
                 browser
                 Divider()
                 statusBar
@@ -104,6 +133,10 @@ struct CaptureLibraryView: View {
         .onChange(of: history.items) { _, _ in model.refresh() }
         .onChange(of: projects.projects) { _, _ in model.refresh() }
         .onChange(of: model.sortOrder) { _, value in savedSort = value }
+        .onChange(of: analyzeCaptures) { _, enabled in
+            if !enabled, case .category = scope { model.scope = .kind(.all) }
+        }
+        .animation(.morphIfAllowed, value: showsSortOffer)
         .alert("Rename Capture", isPresented: Binding(
             get: { model.renamingItem != nil },
             set: { if !$0 { model.renamingItem = nil } }
@@ -206,9 +239,13 @@ struct CaptureLibraryView: View {
             if index.pendingCount > 0 {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
-                    Text("Reading \(index.pendingCount) \(index.pendingCount == 1 ? "capture" : "captures")")
+                    if index.readingCount > 0 {
+                        Text("Reading text in \(index.readingCount) \(index.readingCount == 1 ? "capture" : "captures")")
+                    } else {
+                        Text("Sorting \(index.sortingCount) \(index.sortingCount == 1 ? "capture" : "captures")")
+                    }
                 }
-                .help("Screendrop reads the text in each capture and sorts it, on this Mac, so you can search inside them.")
+                .help("Screendrop reads the text in each capture so search can find it, then sorts it into a category. All on this Mac.")
             } else if model.isLoading {
                 ProgressView().controlSize(.mini).help("Refreshing Library")
             }
@@ -348,6 +385,48 @@ enum LibraryAppIcons {
             ?? NSWorkspace.shared.icon(for: .application)
         cache[key] = icon
         return icon
+    }
+}
+
+/// Offers, once, to sort captures made before sorting existed. It can take
+/// an hour or more, so it waits for a yes; Settings has the same switch.
+/// Never let its text size the bar (no `fixedSize`): see `frame(height:)`.
+private struct LibrarySortOffer: View {
+    let count: Int
+    let onAccept: () -> Void
+    let onDismiss: () -> Void
+
+    /// The model takes about 1.3s a capture on Apple silicon.
+    private var estimate: String {
+        let minutes = max(5, (Double(count) * 1.3 / 60 / 5).rounded() * 5)
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = minutes >= 60 ? [.hour, .minute] : [.minute]
+        formatter.unitsStyle = .full
+        return formatter.string(from: minutes * 60) ?? "a while"
+    }
+
+    var body: some View {
+        HStack(spacing: Space.l) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Palette.secondaryLabel)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Sort your existing captures?")
+                    .font(.dsHeadline)
+                    .foregroundStyle(Palette.label)
+                Text("Apple Intelligence can sort \(count.formatted()) older \(count == 1 ? "capture" : "captures") into categories, with titles and keywords for search. About \(estimate), on this Mac. New captures are sorted as you take them.")
+                    .font(.dsCallout)
+                    .foregroundStyle(Palette.secondaryLabel)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: Space.l)
+            GlassCapsuleButton(title: "Not Now", action: onDismiss)
+            GlassCapsuleButton(title: "Sort Captures", isProminent: true, action: onAccept)
+        }
+        .padding(.horizontal, Space.xl)
+        // A fixed height: a bar whose height follows its wrapped text sends
+        // the split view's constraint passes into a loop and AppKit aborts.
+        .frame(height: 64)
     }
 }
 

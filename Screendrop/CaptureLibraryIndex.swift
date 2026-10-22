@@ -10,9 +10,12 @@ import Vision
 
 /// Keeps an analysis for every capture: the text inside it, a category and
 /// a feature print for similarity. Work runs one capture at a time at
-/// background priority, newest first, and pauses while recording, in Low
-/// Power Mode, or when the Mac runs hot. Results land in small batches so
-/// the Library re-filters a few times a second at most, not per capture.
+/// background priority and pauses while recording, in Low Power Mode, or
+/// when the Mac runs hot. It runs in two passes, newest first: every capture
+/// is read (quick) before any is sorted by the model (slow), so search works
+/// across the whole Library within minutes. Captures made before the feature
+/// arrived are sorted only once the user opts in. Results land in small
+/// batches so the Library re-filters a few times a second at most.
 @MainActor
 @Observable
 final class CaptureLibraryIndex {
@@ -21,16 +24,22 @@ final class CaptureLibraryIndex {
     private(set) var analyses: [String: CaptureAnalysis] = [:]
     /// Bumped once per published batch.
     private(set) var revision = 0
-    /// Captures waiting to be read, for the status bar.
-    private(set) var pendingCount = 0
+    /// Captures waiting to be read, then to be sorted, for the status bar.
+    private(set) var readingCount = 0
+    private(set) var sortingCount = 0
+    /// Older captures the model could sort if the user opts in.
+    private(set) var unsortedExistingCount = 0
+
+    var pendingCount: Int { readingCount + sortingCount }
 
     @ObservationIgnored private let store = CaptureLibraryIndexStore(
         directory: ScreenshotHistoryStore.applicationSupportDirectory.appendingPathComponent("Library Index", isDirectory: true)
     )
     @ObservationIgnored private var isLoaded = false
     @ObservationIgnored private var latestItems: [CaptureLibraryItem]?
-    @ObservationIgnored private var queue: [CaptureLibraryItem] = []
-    /// The capture being read right now, kept out of re-syncs meanwhile.
+    @ObservationIgnored private var readQueue: [CaptureLibraryItem] = []
+    @ObservationIgnored private var sortQueue: [CaptureLibraryItem] = []
+    /// The capture being worked on right now, kept out of re-syncs meanwhile.
     @ObservationIgnored private var inFlight: CaptureLibraryItem?
     /// Fingerprints that couldn't be read this session, so an unreadable
     /// file isn't retried on every refresh.
@@ -58,12 +67,22 @@ final class CaptureLibraryIndex {
         }
     }
 
-    /// Queues every capture whose analysis is missing or stale, and forgets
-    /// captures that are gone.
+    /// Re-plans the work after the Library settings change.
+    func settingsDidChange() {
+        if let latestItems { sync(latestItems) }
+    }
+
+    /// Opts older captures in to sorting by the model.
+    func sortExistingCaptures() {
+        UserDefaults.standard.set(true, forKey: ScreendropPreferences.librarySortExistingKey)
+        settingsDidChange()
+    }
+
+    /// Queues every capture whose reading is missing or stale, then every
+    /// capture due for the model, and forgets captures that are gone.
     func sync(_ items: [CaptureLibraryItem]) {
         latestItems = items
         guard isLoaded else { return }
-        let modelAvailable = CaptureLibraryAnalyzer.isModelAvailable
         let live = Set(items.lazy.map(\.id))
         // An empty scan more likely means History failed to load than that
         // every capture was deleted; keep the index rather than wipe it.
@@ -75,17 +94,39 @@ final class CaptureLibraryIndex {
                 Task { await store.remove(ids: gone) }
             }
         }
-        queue = items
-            .filter { item in
-                guard item != inFlight, !unreadable.contains(item.thumbnailKey) else { return false }
-                guard let analysis = analyses[item.id] ?? unpublished[item.id] else { return true }
-                return analysis.version < CaptureAnalysis.currentVersion
-                    || analysis.fingerprint != item.thumbnailKey
-                    || (modelAvailable && analysis.classifier != .model && !analysis.modelDeclined)
+        guard ScreendropPreferences.libraryAnalyzeCaptures else {
+            readQueue = []
+            sortQueue = []
+            unsortedExistingCount = 0
+            updateCounts()
+            return
+        }
+        let modelAvailable = CaptureLibraryAnalyzer.isModelAvailable
+        let sortExisting = ScreendropPreferences.librarySortExisting
+        let autoSortSince = ScreendropPreferences.libraryAutoSortSince
+        var reads: [CaptureLibraryItem] = []
+        var sorts: [CaptureLibraryItem] = []
+        var unsortedExisting = 0
+        for item in items where item != inFlight && !unreadable.contains(item.thumbnailKey) {
+            let analysis = analyses[item.id] ?? unpublished[item.id]
+            guard let analysis,
+                  analysis.version == CaptureAnalysis.currentVersion,
+                  analysis.fingerprint == item.thumbnailKey else {
+                reads.append(item)
+                continue
             }
-            .sorted { $0.createdAt > $1.createdAt }
-        pendingCount = queue.count
-        if !queue.isEmpty, runner == nil { runner = Task { await drain() } }
+            guard modelAvailable, analysis.classifier != .model, !analysis.modelDeclined else { continue }
+            if sortExisting || item.createdAt >= autoSortSince {
+                sorts.append(item)
+            } else {
+                unsortedExisting += 1
+            }
+        }
+        readQueue = reads.sorted { $0.createdAt > $1.createdAt }
+        sortQueue = sorts.sorted { $0.createdAt > $1.createdAt }
+        unsortedExistingCount = unsortedExisting
+        updateCounts()
+        if pendingCount > 0, runner == nil { runner = Task { await drain() } }
     }
 
     /// Captures that look most like `id`, nearest first.
@@ -99,34 +140,47 @@ final class CaptureLibraryIndex {
 
     private func drain() async {
         defer { runner = nil }
-        while let item = queue.first {
+        while ScreendropPreferences.libraryAnalyzeCaptures {
             if shouldPause {
                 try? await Task.sleep(for: .seconds(10))
                 continue
             }
-            queue.removeFirst()
+            // Every capture is read before any is sorted.
+            let isReading = !readQueue.isEmpty
+            guard let item = isReading ? readQueue.first : sortQueue.first else { break }
+            if isReading { readQueue.removeFirst() } else { sortQueue.removeFirst() }
             inFlight = item
             defer { inFlight = nil }
-            // A current reading only needs the model's second look.
-            let existing = (analyses[item.id] ?? unpublished[item.id]).flatMap {
-                $0.version == CaptureAnalysis.currentVersion && $0.fingerprint == item.thumbnailKey ? $0 : nil
-            }
+            let previous = analyses[item.id] ?? unpublished[item.id]
             let work = Task.detached(priority: .background) { () -> CaptureLibraryAnalyzer.Result? in
-                if let existing {
-                    return .init(analysis: await CaptureLibraryAnalyzer.reclassify(existing, item: item), featurePrint: nil)
+                if !isReading, let previous {
+                    return .init(analysis: await CaptureLibraryAnalyzer.sort(previous, item: item), featurePrint: nil)
                 }
-                return await CaptureLibraryAnalyzer.analyze(item)
+                return await CaptureLibraryAnalyzer.read(item, previous: previous)
             }
             if let result = await work.value {
                 await store.save(result.analysis, featurePrint: result.featurePrint)
                 unpublished[item.id] = result.analysis
                 schedulePublish()
+                // A freshly read capture may be due for sorting next.
+                if isReading, result.analysis.classifier != .model, CaptureLibraryAnalyzer.isModelAvailable {
+                    if isDueForSorting(item) { sortQueue.append(item) } else { unsortedExistingCount += 1 }
+                }
             } else {
                 unreadable.insert(item.thumbnailKey)
             }
-            pendingCount = queue.count
+            updateCounts()
         }
         publish()
+    }
+
+    private func isDueForSorting(_ item: CaptureLibraryItem) -> Bool {
+        ScreendropPreferences.librarySortExisting || item.createdAt >= ScreendropPreferences.libraryAutoSortSince
+    }
+
+    private func updateCounts() {
+        if readingCount != readQueue.count { readingCount = readQueue.count }
+        if sortingCount != sortQueue.count { sortingCount = sortQueue.count }
     }
 
     /// Recording, Low Power Mode and a hot Mac all come before indexing.
