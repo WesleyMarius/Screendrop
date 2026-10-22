@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 
 enum CaptureLibraryAction: String {
+    /// Double-click: Edit for a video, Quick Look for anything else.
+    case open = "Open"
     case preview = "Quick Look"
     case edit = "Edit"
     case rename = "Rename…"
@@ -175,7 +177,7 @@ final class LibraryCollectionView: NSCollectionView {
 
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
-        if event.clickCount == 2, !selectionIndexPaths.isEmpty { command?(.preview) }
+        if event.clickCount == 2, !selectionIndexPaths.isEmpty { command?(.open) }
     }
 
     override func keyDown(with event: NSEvent) {
