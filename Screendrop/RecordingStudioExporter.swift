@@ -524,10 +524,17 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         var previousClipID: UUID?
         var renderSeconds = 0.0
         var writerWaitSeconds = 0.0
+        var cameraSeconds = 0.0
         var renderedFrames = 0
         defer {
-            Self.logger.info("Export frames=\(renderedFrames) fps=\(timing.framesPerSecond) motionBlur=\(timing.motionBlurEnabled) Metal blur frames=\(compositor.metalFrameCount) reusedScreenFrames=\(compositor.reusedScreenFrameCount) reusedComposedFrames=\(compositor.reusedComposedFrameCount) renderSeconds=\(renderSeconds) metalSeconds=\(compositor.metalSeconds) cutoutWaitSeconds=\(compositor.cutoutWaitSeconds) decodeSeconds=\(decodeSeconds) writerWaitSeconds=\(writerWaitSeconds)")
+            Self.logger.info("Export frames=\(renderedFrames) fps=\(timing.framesPerSecond) motionBlur=\(timing.motionBlurEnabled) Metal blur frames=\(compositor.metalFrameCount) reusedScreenFrames=\(compositor.reusedScreenFrameCount) reusedComposedFrames=\(compositor.reusedComposedFrameCount) renderSeconds=\(renderSeconds) metalSeconds=\(compositor.metalSeconds) cutoutWaitSeconds=\(compositor.cutoutWaitSeconds) decodeSeconds=\(decodeSeconds) cameraSeconds=\(cameraSeconds) writerWaitSeconds=\(writerWaitSeconds)")
         }
+
+        // The adaptor's pool appears shortly after writing starts and then
+        // stays fixed, but reading it takes the compression session's lock,
+        // which the encoder holds while it works. Asked for every frame,
+        // that stalled rendering for as long as the encoder was busy.
+        var cachedPool: CVPixelBufferPool?
 
         var inFlight: (frame: StudioFrameCompositor.PendingFrame, index: Int)?
         func finishAndAppend(_ begun: StudioFrameCompositor.PendingFrame, at index: Int) async throws {
@@ -581,10 +588,13 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             // filtered in before the frame is laid out on the canvas.
             let sourceBuffer = redactionFilter?.apply(to: decodedBuffer, atSourceTime: sourceTime) ?? decodedBuffer
 
-            guard let pool = adaptor.pixelBufferPool else {
+            if cachedPool == nil { cachedPool = adaptor.pixelBufferPool }
+            guard let pool = cachedPool else {
                 throw ExportError.writerFailed(nil)
             }
+            let cameraStart = CFAbsoluteTimeGetCurrent()
             let camera = cameraFeed?.latestFrame(at: sourceTime)
+            cameraSeconds += CFAbsoluteTimeGetCurrent() - cameraStart
             let nextTime = timing.time(forFrame: frame + 1)
             let sourceRepeats = (pending == nil || pending!.time > nextTime)
                 && clipTimeline.location(at: nextTime)?.segmentID == location.segmentID
