@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 enum CaptureLibraryAction: String {
-    /// Double-click: Edit for a video, Quick Look for anything else.
+    /// Double-click or Space: Edit for a video, Quick Look for anything else.
     case open = "Open"
     case preview = "Quick Look"
     case edit = "Edit"
@@ -185,7 +185,7 @@ final class LibraryCollectionView: NSCollectionView {
         if flags.contains(.command), event.charactersIgnoringModifiers == "c" { command?(.copy); return }
         if flags.contains(.command), event.keyCode == 51 { command?(.trash); return }
         if !flags.contains(.command), !flags.contains(.control), !flags.contains(.option) {
-            if event.keyCode == 49 { command?(.preview); return }
+            if event.keyCode == 49 { command?(.open); return }
             if event.keyCode == 36 { command?(.rename); return }
         }
         super.keyDown(with: event)
