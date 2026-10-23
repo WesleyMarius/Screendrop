@@ -10,10 +10,19 @@ nonisolated enum RecordingAudioGain {
     }
 
     static func makeMix(tracks: [AVAssetTrack], volume: Double) -> AVAudioMix? {
-        let gain = Float(normalized(volume))
-        guard gain != 1, !tracks.isEmpty else { return nil }
+        let parameters = inputParameters(tracks: tracks, volume: volume)
+        guard !parameters.isEmpty else { return nil }
         let mix = AVMutableAudioMix()
-        mix.inputParameters = tracks.map { track in
+        mix.inputParameters = parameters
+        return mix
+    }
+
+    /// The parameters that apply `volume` to each track; empty at unity,
+    /// which needs none. Shared with mixes that carry other tracks too.
+    static func inputParameters(tracks: [AVAssetTrack], volume: Double) -> [AVMutableAudioMixInputParameters] {
+        let gain = Float(normalized(volume))
+        guard gain != 1 else { return [] }
+        return tracks.map { track in
             let parameters = AVMutableAudioMixInputParameters(track: track)
             if gain <= 1 {
                 parameters.setVolume(gain, at: .zero)
@@ -22,7 +31,6 @@ nonisolated enum RecordingAudioGain {
             }
             return parameters
         }
-        return mix
     }
 
     private final class State {
